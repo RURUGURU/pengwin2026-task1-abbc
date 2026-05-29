@@ -1,0 +1,46 @@
+================================================================
+Grand Challenge - "Create Algorithm for Challenge" form fill
+PENGWIN 2026 Task 1 Preliminary Submission
+================================================================
+
+[Title] (단일 라인, method 식별용)
+----------------------------------------------------------------
+Per-Anatomy ABBC nnU-Net with Core-Seed Watershed (PENGWIN-Auto)
+----------------------------------------------------------------
+(64 chars, 의미 명확, "test/debug" 단어 미포함, 향후 컨테이너 교체 후에도 그대로 사용 가능)
+
+대안 (더 짧게):
+- ABBC nnU-Net for Pelvic Fracture Instance Segmentation  (54 chars)
+- Per-Anatomy ABBC nnU-Net (PENGWIN-Auto)                 (40 chars)
+
+
+[Description] (max 1024 chars)
+----------------------------------------------------------------
+Pelvic and femoral fracture fragment instance segmentation in CT.
+
+Pipeline:
+1. Anatomy routing — the official spacing-based rule classifies each case as pelvic or femoral and crops per-anatomy ROIs (Sacrum, Left/Right Hipbone, Femur).
+2. Per-anatomy semantic segmentation — nnU-Net v2 ResEnc-L trained with an Adaptive Border / Boundary / Core (ABBC) 4-class representation (background / border / boundary / core). A boundary-class weight on the CE+Dice loss biases the network toward sharper inter-fragment separation.
+3. Instance decoding — core-seeded watershed converts the 4-class softmax into instance masks. Connected components below ~1 cm^3 are pruned per case spacing; an anatomy-size-ratio filter merges spurious tiny fragments.
+
+Output: integer label map per PENGWIN convention (0 background; 1-50 sacrum; 51-100 left hipbone; 101-150 right hipbone; 151-200 femur). Sacrum and hipbone are modeled by the current network; femur extension is in progress.
+
+GPU: T4 16 GiB. Inference patch 224x160x192 (~11 GiB peak).
+----------------------------------------------------------------
+(약 990 chars, 한도 1024 이내)
+
+
+[Job requires gpu type]
+----------------------------------------------------------------
+NVIDIA T4 Tensor Core GPU (16 GiB VRAM)  -- 그대로 유지 (기본값 맞음)
+
+이유: V291 ABBC 모델 inference 시 patch_size 224x160x192 + ResEnc-L 백본
+      → 약 11 GiB VRAM 사용. T4 16 GiB로 충분 (마진 ~5 GiB).
+      더 큰 GPU는 비용 증가만 발생.
+
+
+================================================================
+참고: 이 알고리즘은 한 번 등록 후 향후 V1/V2... 컨테이너로 교체 가능.
+      Title/Description은 method 자체를 표현하므로 V0 pipeline test
+      이후에도 그대로 사용. 단일 알고리즘 슬롯 권고.
+================================================================
