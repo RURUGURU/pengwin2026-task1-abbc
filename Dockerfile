@@ -51,5 +51,13 @@ ENV PENGWIN_ROOT=/opt/ml/model \
     nnUNet_raw=/opt/ml/model/nnunet/raw \
     PYTHONPATH=/opt/app:/opt/app/code_task1
 
+# Grand Challenge security policy: container must not run as root.
+# Create a service user with no shell, no password, no home write permissions
+# other than the default. /opt/app is owned by root but world-readable from
+# the COPY layers above, so the user only needs execute access to read code.
+RUN groupadd -r user && useradd --no-log-init -r -g user user
+
+USER user:user
+
 # Grand Challenge runs the container with --network none, no extra args.
 ENTRYPOINT ["python", "/opt/app/inference/inference.py"]
