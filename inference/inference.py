@@ -117,19 +117,39 @@ def output_path(input_path: Path) -> Path:
 
 
 def write_label_map(label_arr: np.ndarray, ref_img: sitk.Image, out_path: Path) -> None:
-    """Write a label MHA preserving the reference image's spatial metadata."""
-    if label_arr.dtype != np.uint16:
-        label_arr = label_arr.astype(np.uint16, copy=False)
+    """Write a label MHA preserving the reference image's spatial metadata.
+
+    Defensive choices vs. GC segmentation validator failures observed on
+    submission 3dd1fa69 ("Image segments could not be determined"):
+      - Clip label values to [0, 200] (the PENGWIN label range) so the
+        validator never sees out-of-range ids.
+      - Cast to uint8: the full PENGWIN label range fits in a single byte,
+        which is the most portable label dtype for SimpleITK readers.
+      - Disable compression: validators sometimes choke on compressed MHA
+        because the raw element scalar type tag is harder to recover.
+      - Preserve ref_img spatial metadata (Spacing/Origin/Direction).
+    """
+    if label_arr.ndim != 3:
+        raise ValueError(f"expected [Z, Y, X] label map, got {label_arr.shape}")
+    # Clip to PENGWIN label range then cast to uint8 in one go.
+    label_arr = np.clip(label_arr, 0, 200).astype(np.uint8, copy=False)
     out_img = sitk.GetImageFromArray(label_arr)
     out_img.SetSpacing(ref_img.GetSpacing())
     out_img.SetOrigin(ref_img.GetOrigin())
     out_img.SetDirection(ref_img.GetDirection())
-    sitk.WriteImage(out_img, str(out_path), useCompression=True)
+    # Log unique label histogram before writing so the GC log can confirm
+    # the file we wrote actually has the segments we expect.
+    uniq = np.unique(label_arr)
+    log(
+        f"write_label_map: dtype={label_arr.dtype} shape={label_arr.shape} "
+        f"n_unique={len(uniq)} unique_head={uniq[:10].tolist()} -> {out_path}"
+    )
+    sitk.WriteImage(out_img, str(out_path), useCompression=False)
 
 
 def write_zero_output(input_path: Path, ref_img: sitk.Image, reason: str) -> None:
     out_path = output_path(input_path)
-    zero = np.zeros(sitk.GetArrayFromImage(ref_img).shape, dtype=np.uint16)
+    zero = np.zeros(sitk.GetArrayFromImage(ref_img).shape, dtype=np.uint8)
     write_label_map(zero, ref_img, out_path)
     log(f"wrote ALL-ZERO output ({reason}) -> {out_path}")
 
