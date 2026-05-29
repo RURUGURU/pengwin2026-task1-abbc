@@ -36,20 +36,40 @@ RUN pip install --upgrade pip && \
 # --- App code --------------------------------------------------------------
 # Entrypoint is self-contained: the ABBC decoder + sliding-window export are
 # inlined into inference.py (lifted from code_task1/eval.py for V0). We still
-# ship code_task1/ for offline debugging / regression alignment.
+# ship code_task1/ for offline debugging / regression alignment AND for the
+# trainer-discovery shim to import from.
 COPY inference /opt/app/inference
 COPY code_task1 /opt/app/code_task1
+
+# --- nnUNet trainer-discovery shim -----------------------------------------
+# nnUNet v2 discovers trainer classes by walking
+# `nnunetv2/training/nnUNetTrainer/`. Our PengwinTrainer*ABBCV291 lives in
+# /opt/app/code_task1/core.py which is OUTSIDE that walk -> we copy a tiny
+# shim into the nnUNet dir that re-exports our trainer classes by name. The
+# site-packages path is base-image dependent, so we discover it at build
+# time. This MUST run before USER drop because site-packages is root-only.
+RUN NN_TR_DIR="$(python -c 'import nnunetv2.training.nnUNetTrainer as m; print(m.__path__[0])')" \
+    && cp /opt/app/inference/pengwin_trainers_shim.py "$NN_TR_DIR/pengwin_trainers.py" \
+    && echo "[pengwin_v0] trainer shim installed at $NN_TR_DIR/pengwin_trainers.py" \
+    && python -c "import nnunetv2.training.nnUNetTrainer.pengwin_trainers as m; print('[pengwin_v0] shim re-exports', m.__pengwin_trainer_count__, 'PengwinTrainer classes')"
 
 # --- Runtime environment ---------------------------------------------------
 # The Grand Challenge platform extracts model.tar.gz to /opt/ml/model/ at
 # runtime. Our tarball is packed with trailing-dot convention (per GC docs:
 #   tar -czvf model.tar.gz -C model_payload .)
 # so contents land directly under /opt/ml/model/ (no prefix subdir).
+#
+# MPLCONFIGDIR / HOME fixes: the non-root `user` has no writable /home/user
+# dir, so matplotlib's default cache path raises PermissionError on import.
+# Point HOME and matplotlib cache at /tmp (the platform allows /tmp writes).
 ENV PENGWIN_ROOT=/opt/ml/model \
     nnUNet_results=/opt/ml/model/nnunet/results \
     nnUNet_preprocessed=/opt/ml/model/nnunet/preprocessed \
     nnUNet_raw=/opt/ml/model/nnunet/raw \
-    PYTHONPATH=/opt/app:/opt/app/code_task1
+    PYTHONPATH=/opt/app:/opt/app/code_task1 \
+    HOME=/tmp \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    XDG_CACHE_HOME=/tmp/.cache
 
 # Grand Challenge security policy: container must not run as root.
 # Create a service user with no shell, no password, no home write permissions
