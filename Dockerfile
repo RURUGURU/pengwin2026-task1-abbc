@@ -9,7 +9,7 @@
 # nnUNet_results / nnUNet_preprocessed / nnUNet_raw are pointed at the
 # extracted tarball tree (see ENV below).
 
-FROM pytorch/pytorch:2.0.1-cuda11.8-cudnn8-runtime
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \

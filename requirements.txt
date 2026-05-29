@@ -3,8 +3,8 @@
 # else is from PyPI.
 --extra-index-url https://download.pytorch.org/whl/cu118
 
-torch==2.0.1+cu118
-torchvision==0.15.2+cu118
+torch==2.1.0+cu118
+torchvision==0.16.0+cu118
 
 # nnU-Net v2 + its custom-head dependencies.
 nnunetv2==2.5.1
