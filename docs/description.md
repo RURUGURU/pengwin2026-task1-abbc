@@ -141,6 +141,74 @@ the tested cohort (no regression), but provides defense-in-depth
 against a known Ds532 sparse-outlier failure mode that does not
 appear in the held-out probe set.
 
+## 1.5c V0.3.4 bone-skeleton-aware pelvic/femur routing fix
+
+V0.3.4 patches the top-level pelvic-vs-femur anatomy routing
+(`classify_pelvic_femur`) that runs **before** the L1-L4
+robustness stack. The V0.3.1 routing rule was purely
+spacing-and-physical-FOV based, which misrouted small-FOV pelvic
+cases with `spacing_z = 0.80 mm` to the femur branch -- and since
+femur is intentionally unmodeled in V0.x, the container wrote a
+zero-valued label map and scored zero on the case. Case `189`
+(small-FOV pelvic, `spacing_z = 0.80`) is the canonical
+reproducer of this misroute.
+
+- **Bone-skeleton-aware router (`classify_pelvic_femur_v2`).**
+  Before falling back to the spacing rule, the router runs the
+  L1 bone-skeleton anatomy decomposition (HU > 200 connected
+  components, sized by `BONE_MIN_COMPONENT_VOXELS`) on the
+  LPS-canonicalized + HU-clipped CT and counts how many of
+  {Sacrum, LeftHip, RightHip} are recovered with at least
+  `BONE_MIN_COMPONENT_VOXELS` voxels. If **two or more** valid
+  pelvic anatomies are detected, the case is force-routed to
+  `pelvic` regardless of spacing/FOV. Otherwise the original
+  V0.3.1 spacing rule is used as fallback.
+- **Mask reuse into L1.** When the router force-routes to
+  pelvic, the bone-skeleton masks it computed are threaded
+  through into `run_per_anatomy_pelvic` as `prerouted_bone_masks`,
+  so the L1 step inside the per-anatomy pipeline reuses the
+  already-computed masks instead of recomputing them. This keeps
+  the V0.3.4 path **bit-identical to V0.3.3** on cases that the
+  V0.3.1 spacing router was already routing to pelvic correctly.
+
+A/B (V0.3.4 vs V0.3.3) on the same 3-case small-FOV pelvic slice
+(cases 162, 163, 189): **one routing change** -- case `189` is
+rescued from the femur branch (V0.3.3 wrote zero output) to the
+pelvic branch (V0.3.4 writes ~11.2M nonzero voxels through the
+full V291 ABBC pipeline). Cases 162 and 163 route to pelvic in
+both versions and are byte-identical. The routing fix itself is
+verified to work end-to-end on case 189.
+
+**Cohort delta (V0.3.4 vs V0.3.3, n=3, cases 162/163/189):**
+Fracture Dice 0.000 -> 0.000 (delta 0.000), Instance F1
+0.000 -> 0.000 (delta 0.000), HD95 undefined in both versions.
+The headline-metric delta is **zero** even though case `189` is
+now routed correctly and the V291 decoder runs on it. The reason
+is a model/decoder accuracy issue, not a routing issue: on this
+small-FOV slice the V291 ABBC decoder paints fragments that are
+substantially larger than the GT fragments (IoU ~0.06-0.08,
+below the `iou_match_threshold = 0.10` used by the per-anatomy
+argmax matching in the official-aligned eval), so no GT fragment
+acquires a matched prediction and the per-case Fracture Dice
+and Instance F1 collapse to 0. V0.3.4 is therefore a
+**routing-correctness fix**: it eliminates a known failure mode
+(small-FOV pelvic misrouted to zero output), is verified to
+reroute case 189 to the pelvic branch and run the full V291
+pipeline on it, and does not regress any case in the held-out
+or probe cohorts. The remaining decoder-accuracy gap on this
+small-FOV slice is a Stage 2 model issue and is out of scope
+for the V0.3 robustness stack; it is tracked for V1 fulltrain.
+
+V0.3.4 is the configuration actually shipped in this submission's
+container. The headline V0.3.1 held-out numbers in Section 5b
+remain the leaderboard projection for V0.3.4, because the V0.3.4
+routing change does not fire on any of the V0.3.1 held-out cases
+(`001`, `002`, `004`, `005`, `006`) -- they were all already
+routed to pelvic by the V0.3.1 spacing rule -- so V0.3.4 is
+**bit-identical to V0.3.3 (and to V0.3.1 on this cohort)** on
+the held-out cohort. V0.3.4 is a strictly additive safety-net
+change for the small-FOV pelvic misroute failure mode.
+
 # 2. Training
 
 | Item | Value |

@@ -132,6 +132,52 @@ def classify_pelvic_femur(spacing_x, spacing_y, spacing_z, physical_x_mm, physic
             return "pelvic" if physical_z_mm <= 390.78 else "femur"
 
 
+def classify_pelvic_femur_v2(arr_clipped, spacing_zyx,
+                             spacing_x, spacing_y, spacing_z,
+                             physical_x_mm, physical_z_mm,
+                             hu_threshold=BONE_HU_THRESHOLD,
+                             min_component_voxels=BONE_MIN_COMPONENT_VOXELS,
+                             min_bone_size_voxels=BONE_MIN_COMPONENT_VOXELS):
+    """Bone-skeleton 기반 anatomy 라우팅 (V0.4).
+
+    spacing 기반 classify_pelvic_femur 가 case 163/189 처럼 spacing_z=0.80 인
+    pelvic small-FOV 케이스를 'femur' 로 잘못 라우팅해 zero output 을 내는 문제를
+    해결하기 위해, bone HU mask 로부터 Sacrum/LeftHip/RightHip 가 충분히 추출되면
+    'pelvic' 으로 강제한다. 그 외엔 기존 spacing 룰로 fallback.
+
+    Returns:
+        tuple[str, dict|None]:
+            ('pelvic', bone_masks dict)  — bone-skeleton 분해 성공시
+            (spacing-rule-result, None)  — fallback
+    """
+    try:
+        bone_masks = bone_skeleton_anatomy_decomposition(
+            arr_clipped, spacing_zyx,
+            hu_threshold=hu_threshold,
+            min_component_voxels=min_component_voxels,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"classify_pelvic_femur_v2: bone decomposition failed ({exc}); falling back to spacing rule")
+        bone_masks = {}
+
+    # 충분한 크기의 hip/sacrum 가 2개 이상 추출됐는지 검사
+    candidate_keys = ('Sacrum', 'LeftHip', 'RightHip')
+    valid = 0
+    for k in candidate_keys:
+        m = bone_masks.get(k)
+        if m is not None and int(m.sum()) >= int(min_bone_size_voxels):
+            valid += 1
+    if valid >= 2:
+        log(f"classify_pelvic_femur_v2: bone-skeleton detected {valid} anatomies -> route=pelvic")
+        return "pelvic", bone_masks
+
+    fallback = classify_pelvic_femur(
+        spacing_x, spacing_y, spacing_z, physical_x_mm, physical_z_mm,
+    )
+    log(f"classify_pelvic_femur_v2: bone-skeleton insufficient ({valid} valid) -> spacing fallback={fallback}")
+    return fallback, None
+
+
 # ---------------------------------------------------------------------------
 # 입출력 관련 헬퍼.
 # ---------------------------------------------------------------------------
@@ -755,7 +801,8 @@ def estimate_v291_inference_seconds(bbox, patch_size=(224, 160, 192), seconds_pe
 # ---------------------------------------------------------------------------
 # anatomy 별 V291 추론 파이프라인 (메인 로직).
 # ---------------------------------------------------------------------------
-def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
+def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image,
+                           prerouted_bone_masks: dict | None = None) -> np.ndarray:
     """V0.3 견고화 파이프라인 (4-layer 구조):
        Layer 1: bone-skeleton anatomy 분해 (HU>200) — 항상 실행 (fallback 확보)
        Layer 2: Ds532 argmax refinement              — Ds532 가 합리적이면 우선 사용
@@ -777,12 +824,16 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
     log(f"V0.3 preproc: shape={img_shape} spacing_zyx={spacing_zyx}")
 
     # === Layer 1: bone HU mask 기반 anatomy 분해 (항상 실행, fallback 용) ===
-    bone_masks = bone_skeleton_anatomy_decomposition(
-        arr_clipped, spacing_zyx,
-        hu_threshold=BONE_HU_THRESHOLD,
-        min_component_voxels=BONE_MIN_COMPONENT_VOXELS,
-    )
-    log(f"L1 bone-skeleton: {list(bone_masks.keys())}")
+    if prerouted_bone_masks is not None:
+        bone_masks = prerouted_bone_masks
+        log(f"L1 bone-skeleton: reusing prerouted masks {list(bone_masks.keys())}")
+    else:
+        bone_masks = bone_skeleton_anatomy_decomposition(
+            arr_clipped, spacing_zyx,
+            hu_threshold=BONE_HU_THRESHOLD,
+            min_component_voxels=BONE_MIN_COMPONENT_VOXELS,
+        )
+        log(f"L1 bone-skeleton: {list(bone_masks.keys())}")
 
     # === Step 2: Ds532 anatomy classifier 추론 (전체 CT, 1-channel HU 입력) ===
     ds532_predictor = build_predictor(
@@ -1016,7 +1067,19 @@ def main() -> int:
             f"size={size} spacing=({spacing_x:.4f},{spacing_y:.4f},{spacing_z:.4f}) "
             f"physical_x_mm={physical_x_mm:.2f} physical_z_mm={physical_z_mm:.2f}"
         )
-        route = classify_pelvic_femur(
+        # Bone-skeleton-aware routing: spacing 룰 단독으로는 case 163/189 처럼
+        # spacing_z=0.80 인 pelvic small-FOV 를 'femur' 로 잘못 라우팅한다.
+        # 먼저 LPS 정규화 + HU clip 한 배열을 만들고, bone HU mask 로부터
+        # Sacrum/LeftHip/RightHip 가 2개 이상 확인되면 pelvic 으로 강제.
+        img_lps_for_route, arr_clipped_for_route = canonicalize_and_clip_image(ref_img)
+        spacing_xyz_lps = img_lps_for_route.GetSpacing()
+        spacing_zyx_lps = (
+            float(spacing_xyz_lps[2]),
+            float(spacing_xyz_lps[1]),
+            float(spacing_xyz_lps[0]),
+        )
+        route, prerouted_bone_masks = classify_pelvic_femur_v2(
+            arr_clipped_for_route, spacing_zyx_lps,
             spacing_x, spacing_y, spacing_z, physical_x_mm, physical_z_mm,
         )
         log(f"anatomy routing: {route}")
@@ -1025,7 +1088,7 @@ def main() -> int:
         if route == "femur":
             write_zero_output(image_path, ref_img, "femur route unmodeled in V0")
         else:
-            label_arr = run_per_anatomy_pelvic(image_path, ref_img)
+            label_arr = run_per_anatomy_pelvic(image_path, ref_img, prerouted_bone_masks)
             write_label_map(label_arr, ref_img, out_path)
             log(f"wrote pelvic prediction -> {out_path}")
     except Exception as exc:
