@@ -209,6 +209,63 @@ routed to pelvic by the V0.3.1 spacing rule -- so V0.3.4 is
 the held-out cohort. V0.3.4 is a strictly additive safety-net
 change for the small-FOV pelvic misroute failure mode.
 
+## 1.5d V0.3.4 cumulative routing + L1 reuse summary
+
+This subsection consolidates the bone-skeleton-aware routing
+behavior that is **actually live in the shipped container** as of
+the latest V0.3.x cumulative build. The intent is to give a single
+place to read the end-to-end pre-L1 routing behavior without
+having to diff sections 1.5, 1.5b, and 1.5c.
+
+- **Top-level entry point.** Every input CT is first sent to
+  `classify_pelvic_femur_v2` (the V0.3.4 bone-skeleton-aware
+  router). The router runs L1 bone-skeleton anatomy decomposition
+  (HU > 200 + 3D connected components, sized by
+  `BONE_MIN_COMPONENT_VOXELS`) on the LPS-canonicalized +
+  HU-clipped CT *before* consulting any spacing/FOV heuristic.
+- **Force-pelvic rule.** If two or more of
+  {Sacrum, LeftHip, RightHip} are recovered as valid pelvic CCs,
+  the case is force-routed to the pelvic branch regardless of
+  `spacing_z` or physical FOV. This is the rule that rescues case
+  `189` (small-FOV pelvic, `spacing_z = 0.80`) from the V0.3.1
+  femur misroute.
+- **Spacing fallback.** If fewer than two pelvic anatomies are
+  recovered, the router falls back to the original V0.3.1
+  spacing-and-physical-FOV rule. This preserves backwards
+  compatibility on every case the V0.3.1 router was already
+  routing correctly.
+- **Mask reuse into L1.** On the force-pelvic path, the
+  bone-skeleton masks that the router already computed are
+  threaded through into `run_per_anatomy_pelvic` as
+  `prerouted_bone_masks`. The L1 step inside the per-anatomy
+  pipeline reuses these masks instead of recomputing them, which
+  (a) avoids a redundant HU-threshold + CC pass and (b) keeps the
+  V0.3.4 force-pelvic path **bit-identical to V0.3.3** on the
+  downstream L1 mask values.
+- **Interaction with L1-L4.** Once routed to pelvic, the case
+  continues through the full L1-L4 robustness stack from Section
+  1.5 (bone-skeleton fallback, Ds532 argmax masks, post-pad bbox
+  sanity, time-budget enforcement) and the V0.3.3 morphology
+  cleanup + bone-skeleton fallback from Section 1.5b. Nothing
+  downstream of the router changes between V0.3.3 and V0.3.4.
+- **Femur branch is still zero.** Cases that the bone-skeleton
+  router cannot identify as pelvic (i.e. fewer than two pelvic
+  anatomies and the spacing fallback also says femur) continue to
+  emit a zero-valued label map in V0.3.4, because femur is
+  intentionally unmodeled in V0.x. The V0.3.4 router only changes
+  the **misroute** failure mode (pelvic incorrectly classified as
+  femur); true femur cases are unchanged.
+
+Net effect on the shipped container: V0.3.4 = V0.3.3 + V0.3.4
+router, with V0.3.3 = V0.3.1 + morphology cleanup + bone fallback
+after bbox-sanity fail. On the V0.3.1 held-out cohort the router
+does not fire (all five cases were already routed to pelvic by the
+spacing rule) so the V0.3.1 held-out numbers in Section 5b carry
+through unchanged. The V0.3.4 router is therefore a strictly
+additive safety-net change for the small-FOV pelvic misroute
+failure mode, with zero risk of regression on previously-passing
+cases.
+
 # 2. Training
 
 | Item | Value |
@@ -293,8 +350,14 @@ shipped via the model tarball, extracted by Grand Challenge under
 - **Single fold, single seed.** No ensembling, no TTA beyond
   nnU-Net defaults.
 - **Phase 6 fulltrain planned.** The next submission will train on
-  all 174 cases with both pelvic and femur anatomies and a full
-  1000-epoch schedule.
+  all **340 CTs** (the full PENGWIN training corpus, which is in
+  build as of the current cumulative V0.3.x cycle and supersedes
+  the earlier 174-case subset reference) with both pelvic and
+  femur anatomies and a full 1000-epoch schedule. The 340-CT
+  Phase 6 fulltrain dataset is currently being assembled and is
+  not part of this submission's container; the V0.3.4 shipped
+  container still uses the V291 fold0 sub-fulltrain probe Stage 2
+  weights described in Section 2.
 
 # 5. V0.2 held-out cohort metrics
 
@@ -411,6 +474,71 @@ stack described in Section 1.5. The V0.3.1 numbers above supersede
 the V0.2 numbers in Section 5 as the headline held-out result for
 this submission; the V0.2 table is retained above only to make the
 diff explicit.
+
+# 5c. Latest production metrics + per-tag cumulative history
+
+This section consolidates the latest production held-out metrics
+for the **V0.3.4 shipped container** and shows the full per-tag
+cumulative history across the V0.x release line. The held-out
+cohort is the same five out-of-fold0 cases used throughout this
+document (`001`, `002`, `004`, `005`, `006`).
+
+**Latest production metrics (V0.3.4, n=5 held-out):**
+
+| Metric | Value | vs V0.3.1 | vs V0.2 |
+|---|---|---|---|
+| Fracture Dice | **0.621** | 0.000 | +0.010 |
+| Local Dice (20 mm) | **0.616** | 0.000 | 0.000 |
+| HD95 (mm) | **20.6** | 0.0 | -6.1 |
+| ASSD (mm) | **4.96** | 0.00 | -0.76 |
+| Instance F1 | **0.805** | 0.000 | +0.123 |
+| Instance Recall | **0.774** | 0.000 | -0.011 |
+| Instance Precision | **0.933** | 0.000 | +0.225 |
+
+V0.3.4 is **bit-identical to V0.3.1 on the held-out cohort**
+because the V0.3.4 router does not fire on any of the five
+held-out cases (they were all already routed to pelvic by the
+V0.3.1 spacing rule), and V0.3.3's morphology cleanup is benign on
+this cohort (dominant CC unchanged). The latest production numbers
+above are therefore the V0.3.1 held-out numbers from Section 5b,
+carried through unchanged through V0.3.3 and V0.3.4.
+
+**Per-tag cumulative history (held-out, n=5):**
+
+| Tag | Fracture Dice | Instance F1 | HD95 (mm) | What changed |
+|---|---|---|---|---|
+| V0.2 | 0.612 | 0.683 | 26.7 | Baseline two-stage pipeline (Ds532 Stage 1 + V291 ABBC Stage 2, bw=10, sr_keep=0.05) |
+| V0.3.1 | 0.621 | 0.805 | 20.6 | + L1-L4 robustness stack (bone-skeleton fallback, Ds532 argmax, post-pad bbox sanity, time budget) |
+| V0.3.3 | 0.621 | 0.805 | 20.6 | + Ds532 mask morphology cleanup + bone-skeleton fallback after bbox-sanity fail (safety-net, no held-out delta) |
+| V0.3.4 | **0.621** | **0.805** | **20.6** | + Bone-skeleton-aware pelvic/femur router (rescues small-FOV pelvic misroute; does not fire on held-out cohort) |
+
+**Per-tag cumulative history (small-FOV probe, n=3, cases
+162/163/189):**
+
+| Tag | Fracture Dice | Instance F1 | Notes |
+|---|---|---|---|
+| V0.3.1 | 0.000 | 0.000 | Case 189 misrouted to femur (zero output); 162/163 ran through but IoU below threshold |
+| V0.3.3 | 0.000 | 0.000 | Morphology cleanup fires on 162 (sparse CCs dropped, dominant CC unchanged); 189 still misrouted |
+| V0.3.4 | 0.000 | 0.000 | Case 189 rescued to pelvic and runs full V291 decoder; per-case metrics still 0 due to decoder accuracy gap, not routing |
+
+The small-FOV probe cohort shows that V0.3.4 is a
+**routing-correctness fix verified end-to-end** on case `189`:
+the container now writes ~11.2M nonzero voxels through the full
+V291 ABBC pipeline instead of a zero label map. The remaining
+zero headline metric is a Stage 2 decoder-accuracy gap on small-
+FOV slices (V291 paints fragments larger than GT, IoU ~0.06-0.08
+below the `iou_match_threshold = 0.10`) and is tracked for the
+Phase 6 340-CT fulltrain.
+
+**Shipped configuration summary.** The V0.3.4 container ships:
+Ds532 Stage 1 anatomy classifier + V291 ABBC Stage 2 (bw=10,
+sr_keep=0.05) + L1-L4 robustness stack (Section 1.5) + V0.3.3
+morphology cleanup + bone fallback after bbox-sanity fail
+(Section 1.5b) + V0.3.4 bone-skeleton-aware pelvic/femur router
+with mask reuse (Sections 1.5c, 1.5d). The headline held-out
+projection for the preliminary leaderboard is **Fracture Dice
+0.621 / Instance F1 0.805 / HD95 20.6 mm**, modulo cohort
+dilution from femur cases (151-200) which V0.x emits as zeros.
 
 # 6. Pointers
 

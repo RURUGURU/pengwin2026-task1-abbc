@@ -703,7 +703,7 @@ def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
 
 
 def ds532_argmax_masks(probs_full):
-    """Ds532 4-channel softmax → mutually-exclusive anatomy mask + morphology cleanup.
+    """Ds532 4-channel softmax → 서로 배타적인 anatomy mask + morphology cleanup.
 
     Layer 2 일부: Ds532 4-channel softmax 의 argmax 로 서로 배타적인 anatomy mask 를
     추출하고, sparse outlier 잡음을 제거하기 위해 binary_opening + small CC drop 을
@@ -717,19 +717,19 @@ def ds532_argmax_masks(probs_full):
         dict[str, np.ndarray] — anatomy 별 mask (서로 disjoint 임이 보장됨).
     """
     import scipy.ndimage as ndi
-    argmax_map = np.argmax(probs_full, axis=0)  # (Z, Y, X), 0=bg, 1=sacrum, 2=lh, 3=rh
+    argmax_map = np.argmax(probs_full, axis=0)  # (Z, Y, X), 0=배경, 1=sacrum, 2=lh, 3=rh
     masks = {}
     structure = np.ones((2, 2, 2), dtype=bool)
     cc_struct = np.ones((3, 3, 3), dtype=bool)
     for anatomy, ch_idx in V5_DATASET532_PROB_CHANNEL.items():
         raw_mask = (argmax_map == ch_idx)
-        # Morphology cleanup: opening removes thin / isolated noise
+        # Morphology cleanup: opening 으로 얇거나 고립된 노이즈를 제거한다
         if DS532_MORPH_OPENING_ITERS > 0:
             cleaned = ndi.binary_opening(raw_mask, structure=structure,
                                           iterations=DS532_MORPH_OPENING_ITERS)
         else:
             cleaned = raw_mask
-        # Drop small CCs (Ds532 sparse outliers)
+        # 작은 CC 제거 (Ds532 sparse outlier)
         cc_labels, n_cc = ndi.label(cleaned, structure=cc_struct)
         if n_cc > 1:
             sizes = ndi.sum(cleaned, cc_labels, index=np.arange(1, n_cc + 1))
@@ -925,7 +925,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image,
             log(f"[{anatomy}] mask empty after CC filter, emit zero")
             continue
 
-        # NEW (FIX #2): pad 적용 후 bbox sanity check.
+        # FIX #2: pad 적용 후 bbox sanity check.
         # mask 가 작더라도 tight-FOV 입력에서는 pad 가 추가되며 bbox 가 폭증할 수 있다.
         # bbox 가 볼륨의 50% 를 넘으면 V291 추론이 매우 느려지고 결과 신뢰도가 떨어진다.
         bbox_fraction = float(np.prod([bbox[i].stop - bbox[i].start for i in range(3)])) / float(np.prod(img_shape))
@@ -946,10 +946,10 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image,
                     bbox_found = True
                     break
             if not bbox_found:
-                # NEW V0.3.2 fix: try bone-skeleton mask before giving up
+                # V0.3.2 fix: 포기하기 전에 bone-skeleton mask 로 한 번 더 시도
                 bone_mask = bone_masks.get(anatomy)
                 if bone_mask is not None and bone_mask.any():
-                    # Largest CC only
+                    # 가장 큰 CC 만 남기기
                     if LARGEST_CC_KEEP_ONLY:
                         import scipy.ndimage as _ndi
                         bcc_labels, bcc_n = _ndi.label(bone_mask, structure=np.ones((3, 3, 3), dtype=bool))
@@ -966,7 +966,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image,
                             bbox = bbox_bone
                             bbox_fraction = bbox_bone_fraction
                             info['source'] = 'bone_after_bbox_sanity_fail'
-                            # Recompute mask probability channel for V291 input
+                            # V291 입력의 mask 확률 채널을 다시 계산해 준다
                             bbox_found = True
                 if not bbox_found:
                     # pad=0 으로도 너무 크고 bone fallback 도 실패 — zero 로 처리
