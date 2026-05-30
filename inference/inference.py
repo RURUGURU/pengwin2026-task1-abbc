@@ -1,19 +1,28 @@
-"""PENGWIN 2026 Task 1 -- V0 pipeline-test inference entrypoint.
+"""PENGWIN 2026 Task 1 — V0.2 inference entrypoint.
 
-Reads the input CT MHA from
-    /input/images/peripelvic-fracture-ct/
-and writes a fragment-instance label map MHA to
-    /output/images/peripelvic-fracture-ct-segmentation/
+V0.2 fixes the V0.1 contract mismatch (model expected 3-channel anatomy-aware
+input, container fed 1-channel full CT). The new pipeline matches the V5
+training recipe verbatim:
 
-Anatomy routing (spec):
-    pelvic -> run V291 ABBC bw=10 fold_0 + V288 core-seed watershed decoder
-    femur  -> ALL-ZERO output (UNHANDLED in V0)
+    CT -> canonicalize LPS -> bone HU clip [-1000, 2000] -> bone-LUT normalize
+      -> Dataset532 anatomy classifier (full CT, 4-channel softmax)
+      -> for each anatomy in [Sacrum, LeftHip, RightHip]:
+           bbox = pad(anatomy_prob >= 0.5, pad_vox=24)
+           stack 3 channels = [CT_LUT_crop, prob_crop, SDF(prob_crop)]
+           V291 predict (ABBC 4-channel)
+           decode (core-seed watershed)
+           relabel into PENGWIN range [lo..hi]
+           paste into full label volume
+      -> Femur: zeros (V0 still does not model femur)
+      -> write uint8 label MHA
 
-This is a V0 pipeline-test, NOT a competitive scientific submission.
-On any unhandled failure the entrypoint still writes an all-zero MHA so
-Grand Challenge does not record a crashed case.
-
-[pengwin_v0] prefix is used for all stdout/stderr.
+Layout (mirrors the model.tar.gz unpacked tree):
+    /opt/ml/model/nnunet/results/Dataset532_PelvicAnatomyV2/
+        PengwinTrainer__nnUNetResEncUNetLPlans__3d_fullres/fold_0/checkpoint_best.pth
+    /opt/ml/model/nnunet/results/Dataset537_PelvicBICMFragmentV5/
+        PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025
+        StrongPeakNoContactABBCV291__nnUNetResEncUNetLPlans__3d_fullres/
+        fold_0/checkpoint_best.pth
 """
 from __future__ import annotations
 
@@ -39,49 +48,57 @@ MODEL_ROOT = Path(os.environ.get("PENGWIN_MODEL_ROOT", "/opt/ml/model"))
 NN_RES = Path(os.environ.get("nnUNet_results", str(MODEL_ROOT / "nnunet" / "results")))
 NN_PREP = Path(os.environ.get("nnUNet_preprocessed", str(MODEL_ROOT / "nnunet" / "preprocessed")))
 NN_RAW = Path(os.environ.get("nnUNet_raw", str(MODEL_ROOT / "nnunet" / "raw")))
-
-# Set the env vars early so nnU-Net does not print "is not defined" warnings on import.
 os.environ.setdefault("nnUNet_results", str(NN_RES))
 os.environ.setdefault("nnUNet_preprocessed", str(NN_PREP))
 os.environ.setdefault("nnUNet_raw", str(NN_RAW))
 os.environ.setdefault("PENGWIN_ROOT", str(MODEL_ROOT))
 
-DATASET_NAME = "Dataset537_PelvicBICMFragmentV5"
-TRAINER = (
+# --- Dataset532: anatomy classifier (background/Sacrum/LeftHip/RightHip). ---
+DS532_DATASET = "Dataset532_PelvicAnatomyV2"
+DS532_TRAINER = "PengwinTrainer"
+DS532_PLANS = "nnUNetResEncUNetLPlans"
+DS532_CONFIG = "3d_fullres"
+DS532_FOLD = 0
+DS532_OUTPUT_CHANNELS = 4  # bg, Sacrum, LeftHip, RightHip
+
+# --- Dataset537 V291: per-anatomy ABBC instance segmenter. ---
+V291_DATASET = "Dataset537_PelvicBICMFragmentV5"
+V291_TRAINER = (
     "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025"
     "StrongPeakNoContactABBCV291"
 )
-PLANS = "nnUNetResEncUNetLPlans"
-CONFIG = "3d_fullres"
-FOLD = 0
+V291_PLANS = "nnUNetResEncUNetLPlans"
+V291_CONFIG = "3d_fullres"
+V291_FOLD = 0
+V291_OUTPUT_CHANNELS = 4  # ABBC: bg, border, boundary, core
 CHECKPOINT_NAME = "checkpoint_best.pth"
-ABBC_OUTPUT_CHANNELS = 4
 
-# V0 post-processing config (matches the bw=10 + sr=0.05 row reported in
-# description.md and Comment.txt):
-ROI_PAD_VOX = 24
-BACKGROUND_THRESHOLD = 0.50
-CORE_THRESHOLD = 0.50
-ANATOMY_SIZE_RATIO_KEEP = 0.05
-# 1 cm^3 / (0.5496 mm^3/voxel) ~= 1820 voxels at the V5 plan resolution.
-MIN_COMPONENT_VOXELS = 1820
-
-# Anatomy ranges per PENGWIN 2026 official spec.
-PELVIC_RANGES = {
+# --- V5 anatomy contract (matches dataset.json v5_contract). ---
+V5_DATASET532_PROB_CHANNEL = {"Sacrum": 1, "LeftHip": 2, "RightHip": 3}
+V5_ANATOMY_RANGES = {
     "Sacrum": (1, 50),
     "LeftHip": (51, 100),
     "RightHip": (101, 150),
 }
-FEMUR_RANGE = (151, 200)  # V0: never emitted.
+ROI_PAD_VOX = 24
+ANATOMY_PROB_THRESHOLD = 0.50
+SDF_CLIP_MM = 40.0
+BONE_HU_RANGE = (-1000.0, 2000.0)
+
+# --- ABBC decode hyperparams (mirror V0.1 description.md "bw=10 + sr=0.05"). ---
+BACKGROUND_THRESHOLD = 0.50
+CORE_THRESHOLD = 0.50
+ANATOMY_SIZE_RATIO_KEEP = 0.05
+MIN_COMPONENT_VOXELS = 1820  # ~1 cm^3 at the V5 plan resolution.
+
+# --- Anatomy routing (verbatim from PENGWIN 2026 Task 1 spec). ---
+FEMUR_RANGE = (151, 200)
 
 
 def log(msg: str) -> None:
     print(f"[pengwin_v0] {msg}", flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Anatomy routing rule (verbatim from PENGWIN 2026 Task 1 spec).
-# ---------------------------------------------------------------------------
 def classify_pelvic_femur(spacing_x, spacing_y, spacing_z, physical_x_mm, physical_z_mm):
     if physical_x_mm <= 285.35:
         if spacing_x <= 0.71:
@@ -111,34 +128,18 @@ def find_input_image() -> Path:
 
 def output_path(input_path: Path) -> Path:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Grand Challenge expects the output filename to mirror the input (per
-    # `peripelvic-fracture-ct-segmentation`). Keep the same stem + .mha suffix.
     return OUTPUT_DIR / input_path.name
 
 
 def write_label_map(label_arr: np.ndarray, ref_img: sitk.Image, out_path: Path) -> None:
-    """Write a label MHA preserving the reference image's spatial metadata.
-
-    Defensive choices vs. GC segmentation validator failures observed on
-    submission 3dd1fa69 ("Image segments could not be determined"):
-      - Clip label values to [0, 200] (the PENGWIN label range) so the
-        validator never sees out-of-range ids.
-      - Cast to uint8: the full PENGWIN label range fits in a single byte,
-        which is the most portable label dtype for SimpleITK readers.
-      - Disable compression: validators sometimes choke on compressed MHA
-        because the raw element scalar type tag is harder to recover.
-      - Preserve ref_img spatial metadata (Spacing/Origin/Direction).
-    """
+    """Write a label MHA preserving ref_img geometry; clip to [0,200] uint8."""
     if label_arr.ndim != 3:
         raise ValueError(f"expected [Z, Y, X] label map, got {label_arr.shape}")
-    # Clip to PENGWIN label range then cast to uint8 in one go.
     label_arr = np.clip(label_arr, 0, 200).astype(np.uint8, copy=False)
     out_img = sitk.GetImageFromArray(label_arr)
     out_img.SetSpacing(ref_img.GetSpacing())
     out_img.SetOrigin(ref_img.GetOrigin())
     out_img.SetDirection(ref_img.GetDirection())
-    # Log unique label histogram before writing so the GC log can confirm
-    # the file we wrote actually has the segments we expect.
     uniq = np.unique(label_arr)
     log(
         f"write_label_map: dtype={label_arr.dtype} shape={label_arr.shape} "
@@ -155,15 +156,81 @@ def write_zero_output(input_path: Path, ref_img: sitk.Image, reason: str) -> Non
 
 
 # ---------------------------------------------------------------------------
-# nnU-Net prediction (full-CT single-pass).
+# Image preprocessing helpers (copied verbatim from preprocessing.py / utils.py
+# so the container has no dependency on /opt/app/code_task1 at runtime).
 # ---------------------------------------------------------------------------
-def build_predictor():
+def orientation_code(img: sitk.Image) -> str:
+    return sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(img.GetDirection())
+
+
+def canonicalize_sitk(img: sitk.Image, target: str = "LPS") -> sitk.Image:
+    code = orientation_code(img)
+    if code == target:
+        return img
+    return sitk.DICOMOrient(img, target)
+
+
+def bone_window_clip(arr: np.ndarray,
+                     hu_low: float = BONE_HU_RANGE[0],
+                     hu_high: float = BONE_HU_RANGE[1]) -> np.ndarray:
+    return np.clip(arr.astype(np.float32, copy=False), float(hu_low), float(hu_high))
+
+
+def canonicalize_and_clip_image(img: sitk.Image) -> tuple[sitk.Image, np.ndarray]:
+    img_lps = canonicalize_sitk(img, target="LPS")
+    arr = bone_window_clip(sitk.GetArrayFromImage(img_lps))
+    return img_lps, arr
+
+
+def bone_lut_normalize(arr: np.ndarray) -> np.ndarray:
+    """Deterministic bone-window LUT (verbatim from preprocessing._bone_lut_normalize)."""
+    x = arr.astype(np.float32, copy=False)
+    xp = np.asarray([-1000.0, -200.0, 150.0, 700.0, 1500.0, 2000.0], dtype=np.float32)
+    fp = np.asarray([0.0, 0.05, 0.35, 0.70, 0.92, 1.0], dtype=np.float32)
+    return np.interp(np.clip(x, xp[0], xp[-1]), xp, fp).astype(np.float32)
+
+
+def ndi_distance_transform(mask: np.ndarray,
+                           spacing_zyx: tuple[float, float, float]) -> np.ndarray:
+    from scipy import ndimage as ndi
+
+    return ndi.distance_transform_edt(mask, sampling=spacing_zyx).astype(np.float32, copy=False)
+
+
+def selected_anatomy_sdf_from_prob(prob: np.ndarray,
+                                   spacing_zyx: tuple[float, float, float],
+                                   clip_mm: float = SDF_CLIP_MM) -> np.ndarray:
+    """Signed distance to anatomy prob>=0.5 mask, clipped/scaled to [-1, 1]."""
+    arr = np.asarray(prob, dtype=np.float32)
+    mask = arr >= 0.5
+    if not mask.any():
+        return np.zeros_like(arr, dtype=np.float32)
+    inside = ndi_distance_transform(mask, spacing_zyx)
+    outside = ndi_distance_transform(~mask, spacing_zyx)
+    sdf = np.clip(inside - outside, -float(clip_mm), float(clip_mm)) / float(clip_mm)
+    return sdf.astype(np.float32, copy=False)
+
+
+def bbox_from_mask(mask: np.ndarray, pad_vox: int = ROI_PAD_VOX) -> tuple[slice, slice, slice] | None:
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    pad = int(max(0, pad_vox))
+    lo = np.maximum(coords.min(axis=0) - pad, 0)
+    hi = np.minimum(coords.max(axis=0) + pad + 1, np.asarray(mask.shape))
+    return tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# nnU-Net predictor utilities (generic over output channels).
+# ---------------------------------------------------------------------------
+def build_predictor(dataset: str, trainer: str, plans: str, config: str,
+                    fold: int, checkpoint_name: str = CHECKPOINT_NAME):
     import torch
     from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
     use_cuda = torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
-    log(f"build_predictor: device={device} cuda_available={use_cuda}")
     predictor = nnUNetPredictor(
         tile_step_size=0.5,
         use_gaussian=True,
@@ -174,38 +241,32 @@ def build_predictor():
         verbose_preprocessing=False,
         allow_tqdm=False,
     )
-    model_dir = NN_RES / DATASET_NAME / f"{TRAINER}__{PLANS}__{CONFIG}"
+    model_dir = NN_RES / dataset / f"{trainer}__{plans}__{config}"
     if not model_dir.is_dir():
         raise FileNotFoundError(f"trained model folder missing: {model_dir}")
     predictor.initialize_from_trained_model_folder(
         str(model_dir),
-        use_folds=(int(FOLD),),
-        checkpoint_name=CHECKPOINT_NAME,
+        use_folds=(int(fold),),
+        checkpoint_name=checkpoint_name,
     )
+    log(f"build_predictor: {dataset} {trainer[-30:]} device={device}")
     return predictor
 
 
-def predict_abbc_logits_full_ct(predictor, image_npy: np.ndarray, image_properties: dict) -> tuple[np.ndarray, dict]:
-    """Run the V291 ABBC model on the full CT and return 4-channel logits + props.
+def predict_logits_full(predictor, image_4d: np.ndarray,
+                        image_properties: dict, output_channels: int) -> tuple[np.ndarray, dict]:
+    """Run sliding-window inference on a (C, Z, Y, X) array; return logits + data_props.
 
-    Returns (logits_zyx, data_properties) where logits has shape (4, Zp, Yp, Xp)
-    at nnU-Net's preprocessed grid (NOT the original CT grid).
+    The number of input channels in image_4d MUST match the trained model's
+    plans.channel_names; otherwise the encoder will reject the input.
     """
-    import torch
     from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy
 
-    # PreprocessAdapterFromNpy expects a list of [C, Z, Y, X] arrays; nnU-Net
-    # convention adds the channel axis at the front. The Dataset537 plan has
-    # one image channel (CT) so we just unsqueeze on axis 0.
-    if image_npy.ndim == 3:
-        image_npy_4d = image_npy[None].astype(np.float32, copy=False)
-    elif image_npy.ndim == 4:
-        image_npy_4d = image_npy.astype(np.float32, copy=False)
-    else:
-        raise ValueError(f"expected 3D or [C,Z,Y,X] input, got {image_npy.shape}")
-
+    if image_4d.ndim != 4:
+        raise ValueError(f"expected (C, Z, Y, X) input, got {image_4d.shape}")
+    image_4d = image_4d.astype(np.float32, copy=False)
     ppa = PreprocessAdapterFromNpy(
-        [image_npy_4d],
+        [image_4d],
         [None],
         [image_properties],
         [None],
@@ -217,26 +278,20 @@ def predict_abbc_logits_full_ct(predictor, image_npy: np.ndarray, image_properti
     )
     dct = next(ppa)
     data = dct["data"]
+    import torch
     if torch.is_tensor(data):
         data_tensor = data.float()
     else:
         data_tensor = torch.from_numpy(np.asarray(data)).float()
-
-    # Custom 4-channel sliding-window export (mirrors
-    # _predict_custom_logits_from_preprocessed_data in code_task1/eval.py).
     logits = _predict_custom_logits_from_preprocessed_data(
-        predictor, data_tensor, output_channels=ABBC_OUTPUT_CHANNELS,
+        predictor, data_tensor, output_channels=output_channels,
     )
     logits_np = logits.detach().cpu().numpy().astype(np.float32, copy=False)
     return logits_np, dct["data_properties"]
 
 
 def _predict_custom_logits_from_preprocessed_data(predictor, data, output_channels: int):
-    """Sliding-window inference that allocates `output_channels` for a custom head.
-
-    Mirrors `code_task1/eval.py::_predict_custom_logits_from_preprocessed_data`
-    but trimmed for V0 (no `allowed` check; trust the ABBC trainer to emit 4).
-    """
+    """Sliding-window inference that allocates `output_channels` for a custom head."""
     import torch
     from acvl_utils.cropping_and_padding.padding import pad_nd_image
     from nnunetv2.inference.sliding_window_prediction import compute_gaussian
@@ -308,18 +363,16 @@ def _predict_custom_logits_from_preprocessed_data(predictor, data, output_channe
     return predicted_logits
 
 
-# ---------------------------------------------------------------------------
-# ABBC -> instance fragment decoder (V288 core-seed watershed).
-# ---------------------------------------------------------------------------
-def softmax_4ch(logits: np.ndarray) -> np.ndarray:
+def softmax_axis0(logits: np.ndarray) -> np.ndarray:
     arr = np.asarray(logits, dtype=np.float32)
-    if arr.ndim != 4 or arr.shape[0] != ABBC_OUTPUT_CHANNELS:
-        raise ValueError(f"expected [4, Z, Y, X] logits, got {arr.shape}")
     arr = arr - np.max(arr, axis=0, keepdims=True)
     exp = np.exp(arr).astype(np.float32, copy=False)
     return exp / np.maximum(np.sum(exp, axis=0, keepdims=True), np.float32(1e-8))
 
 
+# ---------------------------------------------------------------------------
+# ABBC -> instance fragment decoder (V288 core-seed watershed).
+# ---------------------------------------------------------------------------
 def decode_abbc_core_seed_watershed(
     probs: np.ndarray,
     *,
@@ -328,11 +381,7 @@ def decode_abbc_core_seed_watershed(
     min_component_voxels: int = MIN_COMPONENT_VOXELS,
     size_ratio_keep: float = ANATOMY_SIZE_RATIO_KEEP,
 ) -> np.ndarray:
-    """Mirror `decode_task1_v288_abbc` from code_task1/eval.py.
-
-    Channels: 0=background, 1=border, 2=boundary, 3=core (softmax).
-    Returns a uint16 instance map. Labels are 1..N within this single ROI.
-    """
+    """Channels: 0=background, 1=border, 2=boundary, 3=core. Returns uint16 labels 1..N."""
     import scipy.ndimage as ndi
 
     background = probs[0] >= float(background_threshold)
@@ -365,12 +414,6 @@ def decode_abbc_core_seed_watershed(
 
 
 def _merge_small_components(labels: np.ndarray, *, min_component_voxels: int) -> np.ndarray:
-    """Merge components smaller than `min_component_voxels` into the nearest larger one.
-
-    Simplified version of `_task1_v277_merge_small_components`: drop components
-    below threshold, then nearest-neighbor fill the resulting holes from the
-    remaining large components.
-    """
     import scipy.ndimage as ndi
 
     out = np.asarray(labels, dtype=np.int32).copy()
@@ -383,9 +426,7 @@ def _merge_small_components(labels: np.ndarray, *, min_component_voxels: int) ->
     small_mask = np.isin(out, small_ids)
     out[small_mask] = 0
     if (out == 0).any() and (out > 0).any():
-        # Refill original support with nearest-large-component IDs.
         original_support = labels > 0
-        # Only refill voxels that were originally support but now empty.
         refill_mask = original_support & (out == 0)
         if refill_mask.any():
             non_zero = out > 0
@@ -396,10 +437,6 @@ def _merge_small_components(labels: np.ndarray, *, min_component_voxels: int) ->
 
 
 def _merge_by_size_ratio(labels: np.ndarray, *, size_ratio_keep: float) -> np.ndarray:
-    """Drop components smaller than size_ratio_keep * largest, refill via nearest.
-
-    Approximates `_task1_v288_anatomy_size_ratio_merge` for single-ROI decoding.
-    """
     import scipy.ndimage as ndi
 
     out = np.asarray(labels, dtype=np.int32).copy()
@@ -427,24 +464,16 @@ def _merge_by_size_ratio(labels: np.ndarray, *, size_ratio_keep: float) -> np.nd
 def resample_label_map_to_original(
     label_pp: np.ndarray, data_properties: dict, predictor,
 ) -> np.ndarray:
-    """Resample uint16 instance map at preprocessed grid to original CT grid.
-
-    Uses nearest-neighbor resampling (`is_seg=True`) so fragment IDs are not
-    interpolated. Mirrors the resample + cropping-bbox restore + transpose
-    sequence in `nnunetv2.inference.export_prediction.export_prediction_from_logits`.
-    """
     from nnunetv2.preprocessing.resampling.default_resampling import (
         resample_data_or_seg_to_shape,
     )
 
-    # 4-D for nnU-Net: [C, x, y, z]; we only have one channel (label).
     label_in = label_pp.astype(np.uint16, copy=False)[None]
 
     shape_after_cropping = tuple(
         int(s) for s in data_properties["shape_after_cropping_and_before_resampling"]
     )
     current_spacing = predictor.configuration_manager.spacing
-    # original_spacing in plans axis order:
     transpose_forward = predictor.plans_manager.transpose_forward
     original_spacing = [data_properties["spacing"][i] for i in transpose_forward]
 
@@ -459,7 +488,6 @@ def resample_label_map_to_original(
     )
     resampled_np = np.asarray(resampled).astype(np.uint16, copy=False)[0]
 
-    # Place into shape_before_cropping at bbox_used_for_cropping.
     from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
 
     shape_before_cropping = tuple(
@@ -473,102 +501,184 @@ def resample_label_map_to_original(
         slicer = bounding_box_to_slice(bbox)
         full[slicer] = resampled_np
 
-    # Undo plans.transpose_forward (i.e. apply transpose_backward) so axes
-    # match the SimpleITK array order ([Z, Y, X]).
     transpose_backward = predictor.plans_manager.transpose_backward
     full = np.transpose(full, tuple(transpose_backward))
     return full
 
 
 # ---------------------------------------------------------------------------
-# Top-level pelvic pipeline.
+# Per-anatomy V291 inference pipeline.
 # ---------------------------------------------------------------------------
-def run_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
-    """Run the V291 ABBC pipeline on a pelvic CT and return a uint16 instance map.
+def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
+    """Full V0.2 pipeline: Ds532 anatomy classifier -> per-anatomy V291 ABBC inference.
 
-    V0 simplification: Dataset537 was trained on per-anatomy ROI crops, but the
-    container runs a single full-CT pass. We split fragments between the three
-    PENGWIN pelvic ranges using a coarse physical-x centroid rule (LPS:
-    +x = patient left), with the central band assigned to Sacrum. This is a
-    heuristic and is acceptable for V0 (pipeline test); the description notes
-    that a proper anatomy router is planned for the next submission.
+    Femur (151-200) is still NOT modeled in V0; this returns a label map sized
+    to ref_img with only Sacrum (1-50) / LeftHip (51-100) / RightHip (101-150)
+    fragments populated.
     """
-    predictor = build_predictor()
+    # --- Step 1: canonicalize CT to LPS + bone-window clip + LUT-normalize. ---
+    img_lps, arr_clipped = canonicalize_and_clip_image(ref_img)
+    image_npy_lps = arr_clipped.astype(np.float32, copy=False)
+    ct_lut_full = bone_lut_normalize(arr_clipped)
 
-    image_npy = sitk.GetArrayFromImage(ref_img).astype(np.float32, copy=False)
-    spacing_xyz = ref_img.GetSpacing()  # (sx, sy, sz)
-    # nnU-Net expects spacing in (z, y, x) order matching the numpy array.
+    spacing_xyz = img_lps.GetSpacing()
     spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
-    image_properties = {"spacing": spacing_zyx}
-
-    log(f"pelvic predict: image shape={image_npy.shape} spacing_zyx={spacing_zyx}")
-    logits_pp, data_props = predict_abbc_logits_full_ct(predictor, image_npy, image_properties)
-    log(f"pelvic predict: logits shape (preprocessed) = {logits_pp.shape}")
-
-    # Decode at the preprocessed grid (where the model is most confident), then
-    # nearest-neighbor resample the integer label map back to the original CT
-    # grid. This avoids per-channel resampling artefacts on the watershed seeds.
-    probs = softmax_4ch(logits_pp)
-    decoded_pp = decode_abbc_core_seed_watershed(probs)
-    n_frag = int(len([v for v in np.unique(decoded_pp) if int(v) > 0]))
-    log(f"pelvic decode: {n_frag} fragments after post-process (preprocessed grid)")
-
-    decoded = resample_label_map_to_original(decoded_pp, data_props, predictor)
-    log(f"pelvic resample: label map shape (original) = {decoded.shape}")
-
-    # Split fragments into Sacrum / LeftHip / RightHip by physical-x centroid.
-    # decoded is [Z, Y, X] in SimpleITK array order; index axis 2 corresponds
-    # to the +x direction. In LPS, +x means patient left (LeftHip).
-    remapped = _split_pelvic_by_x_centroid(decoded)
-    return remapped
-
-
-def _split_pelvic_by_x_centroid(decoded: np.ndarray) -> np.ndarray:
-    """V0 heuristic anatomy router: split fragments by x-centroid into Sacrum /
-    LeftHip / RightHip ranges. Center band [40 %, 60 %] of the volume's x extent
-    is Sacrum (1..50); fragments with x-centroid > 60 % are LeftHip (51..100);
-    fragments with x-centroid < 40 % are RightHip (101..150).
-    """
-    import scipy.ndimage as ndi
-
-    if decoded.ndim != 3:
-        raise ValueError(f"expected [Z, Y, X] label map, got {decoded.shape}")
-    x_dim = float(decoded.shape[2])
-    if x_dim <= 0:
-        return decoded.astype(np.uint16, copy=False)
-    ids = sorted(int(v) for v in np.unique(decoded) if int(v) > 0)
-    if not ids:
-        return decoded.astype(np.uint16, copy=False)
-    # Use centroid via center_of_mass for each ID. Coordinates are (Z, Y, X).
-    centroids = ndi.center_of_mass(np.ones_like(decoded, dtype=np.uint8), decoded, ids)
-    if len(ids) == 1:
-        centroids = [centroids]
-    remapped = np.zeros_like(decoded, dtype=np.uint16)
-    bucket_counters = {"Sacrum": 0, "LeftHip": 0, "RightHip": 0}
-    for old_id, (_cz, _cy, cx) in zip(ids, centroids):
-        if not np.isfinite(cx):
-            anat = "Sacrum"
-        else:
-            frac = float(cx) / x_dim
-            if frac >= 0.60:
-                anat = "LeftHip"
-            elif frac <= 0.40:
-                anat = "RightHip"
-            else:
-                anat = "Sacrum"
-        lo, hi = PELVIC_RANGES[anat]
-        bucket_counters[anat] += 1
-        new_id = lo + bucket_counters[anat] - 1
-        if new_id > hi:
-            new_id = hi  # collapse overflow into the last slot.
-        remapped[decoded == int(old_id)] = np.uint16(new_id)
     log(
-        "pelvic split: "
-        f"Sacrum={bucket_counters['Sacrum']} "
-        f"LeftHip={bucket_counters['LeftHip']} "
-        f"RightHip={bucket_counters['RightHip']}"
+        f"pelvic LPS preproc: shape={image_npy_lps.shape} "
+        f"spacing_zyx={spacing_zyx} hu_clip=[{BONE_HU_RANGE[0]},{BONE_HU_RANGE[1]}]"
     )
-    return remapped
+
+    # --- Step 2: Dataset532 anatomy classifier (full CT, 1-channel HU input). ---
+    ds532_predictor = build_predictor(
+        DS532_DATASET, DS532_TRAINER, DS532_PLANS, DS532_CONFIG, DS532_FOLD,
+    )
+    ds532_image_4d = image_npy_lps[None]  # (1, Z, Y, X) raw HU; CTNormalization handles z-score.
+    ds532_props = {"spacing": list(spacing_zyx)}
+    log(f"ds532 predict: image (C,Z,Y,X)={ds532_image_4d.shape}")
+    ds532_logits_pp, ds532_data_props = predict_logits_full(
+        ds532_predictor, ds532_image_4d, ds532_props, output_channels=DS532_OUTPUT_CHANNELS,
+    )
+    ds532_probs_pp = softmax_axis0(ds532_logits_pp)
+    log(f"ds532 predict: probs shape (preprocessed) = {ds532_probs_pp.shape}")
+
+    # Resample each anatomy probability channel back to the original CT grid.
+    # We re-use the integer label-map resampler with a (prob*255) trick: the
+    # resampler does nearest for label_in but actually accepts a float buffer
+    # and runs linear order=1 z-order=0 anyway. For probability, we want
+    # linear interpolation, so we call a dedicated path that mirrors nnUNet's
+    # export_prediction (probability resample is order=1 / order_z=0 linear).
+    from nnunetv2.preprocessing.resampling.default_resampling import (
+        resample_data_or_seg_to_shape,
+    )
+    shape_after_cropping = tuple(int(s) for s in ds532_data_props["shape_after_cropping_and_before_resampling"])
+    current_spacing = ds532_predictor.configuration_manager.spacing
+    transpose_forward = ds532_predictor.plans_manager.transpose_forward
+    transpose_backward = ds532_predictor.plans_manager.transpose_backward
+    original_spacing = [ds532_data_props["spacing"][i] for i in transpose_forward]
+    probs_resampled_axes = resample_data_or_seg_to_shape(
+        ds532_probs_pp.astype(np.float32, copy=False),
+        shape_after_cropping,
+        current_spacing,
+        original_spacing,
+        is_seg=False,
+        order=1,
+        order_z=0,
+    )  # shape: (C, *shape_after_cropping) in plans axis order.
+
+    # Paste into the full pre-cropping volume.
+    from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
+    shape_before_cropping = tuple(int(s) for s in ds532_data_props["shape_before_cropping"])
+    bbox_used = ds532_data_props.get("bbox_used_for_cropping", None)
+    probs_full_axes = np.zeros(
+        (DS532_OUTPUT_CHANNELS, *shape_before_cropping), dtype=np.float32,
+    )
+    if bbox_used is None:
+        probs_full_axes = np.asarray(probs_resampled_axes, dtype=np.float32)
+    else:
+        slicer = bounding_box_to_slice(bbox_used)
+        probs_full_axes[(slice(None), *slicer)] = np.asarray(probs_resampled_axes, dtype=np.float32)
+
+    # Set background prob = 1 outside any anatomy where we filled zeros so
+    # the channel sum stays ≈ 1 (not strictly required for the downstream
+    # thresholding, but safer).
+    fg_sum = probs_full_axes[1:].sum(axis=0)
+    bg_mask = fg_sum < 1e-6
+    if bg_mask.any():
+        probs_full_axes[0][bg_mask] = 1.0
+
+    # Undo plans.transpose_forward so axes match the SimpleITK (Z, Y, X) order.
+    probs_full = np.transpose(
+        probs_full_axes, (0, *(int(a) + 1 for a in transpose_backward)),
+    )
+    if probs_full.shape[1:] != image_npy_lps.shape:
+        raise RuntimeError(
+            f"ds532 probs shape {probs_full.shape[1:]} != CT shape {image_npy_lps.shape}"
+        )
+
+    # Free Ds532 predictor before loading V291 (T4 has 16 GiB).
+    del ds532_predictor, ds532_logits_pp, ds532_probs_pp
+    import gc, torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- Step 3: V291 per-anatomy inference. ---
+    v291_predictor = build_predictor(
+        V291_DATASET, V291_TRAINER, V291_PLANS, V291_CONFIG, V291_FOLD,
+    )
+
+    full_label = np.zeros(image_npy_lps.shape, dtype=np.uint16)
+    for anatomy in ("Sacrum", "LeftHip", "RightHip"):
+        prob_channel = V5_DATASET532_PROB_CHANNEL[anatomy]
+        anatomy_prob = probs_full[prob_channel]  # (Z, Y, X)
+        anatomy_mask = anatomy_prob >= ANATOMY_PROB_THRESHOLD
+        bbox = bbox_from_mask(anatomy_mask, pad_vox=ROI_PAD_VOX)
+        if bbox is None:
+            log(f"[{anatomy}] empty Ds532 anatomy mask (>={ANATOMY_PROB_THRESHOLD}); skipping")
+            continue
+        ct_lut_crop = ct_lut_full[bbox]
+        prob_crop = anatomy_prob[bbox]
+        sdf_crop = selected_anatomy_sdf_from_prob(prob_crop, spacing_zyx, clip_mm=SDF_CLIP_MM)
+        v291_image_4d = np.stack([ct_lut_crop, prob_crop, sdf_crop], axis=0)
+        v291_props = {"spacing": list(spacing_zyx)}
+        log(
+            f"[{anatomy}] V291 predict: bbox={[(s.start, s.stop) for s in bbox]} "
+            f"crop_shape={ct_lut_crop.shape}"
+        )
+        v291_logits_pp, v291_data_props = predict_logits_full(
+            v291_predictor, v291_image_4d, v291_props, output_channels=V291_OUTPUT_CHANNELS,
+        )
+        v291_probs = softmax_axis0(v291_logits_pp)
+        decoded_pp = decode_abbc_core_seed_watershed(v291_probs)
+        n_local = int(len([v for v in np.unique(decoded_pp) if int(v) > 0]))
+        log(f"[{anatomy}] decode: {n_local} fragments at preprocessed grid")
+
+        # Resample integer label map back to ORIGINAL CROP grid (not full CT).
+        decoded_crop = resample_label_map_to_original(
+            decoded_pp, v291_data_props, v291_predictor,
+        )
+        if decoded_crop.shape != ct_lut_crop.shape:
+            log(
+                f"[{anatomy}] WARNING: resampled crop {decoded_crop.shape} != "
+                f"input crop {ct_lut_crop.shape}; using min-overlap paste"
+            )
+
+        # Relabel into the PENGWIN range for this anatomy.
+        lo, hi = V5_ANATOMY_RANGES[anatomy]
+        n_slots = hi - lo + 1
+        local_ids = sorted(int(v) for v in np.unique(decoded_crop) if int(v) > 0)
+        if not local_ids:
+            log(f"[{anatomy}] no fragments after resample; skipping paste")
+            continue
+        remap = np.zeros(int(max(local_ids)) + 1, dtype=np.uint16)
+        for i, old_id in enumerate(local_ids):
+            slot = i if i < n_slots else (n_slots - 1)  # collapse overflow into last slot.
+            remap[old_id] = np.uint16(lo + slot)
+        remapped_crop = remap[decoded_crop]
+
+        # Paste into full label, only over voxels that already 0.
+        out_slot = full_label[bbox]
+        write_mask = (remapped_crop > 0) & (out_slot == 0)
+        out_slot[write_mask] = remapped_crop[write_mask]
+        full_label[bbox] = out_slot
+        log(
+            f"[{anatomy}] painted {int(write_mask.sum())} voxels "
+            f"into range [{lo},{hi}] ({len(local_ids)} fragments)"
+        )
+
+    # --- Step 4: undo LPS reorientation so output aligns with the ORIGINAL ref_img. ---
+    if orientation_code(ref_img) != "LPS":
+        # Wrap full_label as a SimpleITK image in the LPS frame, then reorient
+        # back to the original orientation code.
+        lps_label_img = sitk.GetImageFromArray(full_label.astype(np.uint16, copy=False))
+        lps_label_img.SetSpacing(img_lps.GetSpacing())
+        lps_label_img.SetOrigin(img_lps.GetOrigin())
+        lps_label_img.SetDirection(img_lps.GetDirection())
+        target_code = orientation_code(ref_img)
+        oriented = sitk.DICOMOrient(lps_label_img, target_code)
+        full_label = sitk.GetArrayFromImage(oriented).astype(np.uint16, copy=False)
+        log(f"reoriented label map: LPS -> {target_code} (shape={full_label.shape})")
+    return full_label
 
 
 # ---------------------------------------------------------------------------
@@ -599,15 +709,12 @@ def main() -> int:
 
         out_path = output_path(image_path)
         if route == "femur":
-            # V0 short-circuit: femur is unmodeled.
             write_zero_output(image_path, ref_img, "femur route unmodeled in V0")
         else:
-            label_arr = run_pelvic(image_path, ref_img)
+            label_arr = run_per_anatomy_pelvic(image_path, ref_img)
             write_label_map(label_arr, ref_img, out_path)
             log(f"wrote pelvic prediction -> {out_path}")
     except Exception as exc:
-        # Never crash the container -- write an all-zero MHA so Grand Challenge
-        # records a (poor) score instead of a failed run.
         log(f"FATAL: {exc}")
         traceback.print_exc()
         try:

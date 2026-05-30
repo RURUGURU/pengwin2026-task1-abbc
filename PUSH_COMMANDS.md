@@ -7,7 +7,7 @@ Replace `OWNER` with your GitHub username or org.
 > `model_payload/`, any `*.pth`, any `*.tar.gz` (or `model.tar.gz`).
 > The bundled `.gitignore` already blocks them, but double-check
 > `git status` before the first commit. The `checkpoint_best.pth`
-> (819 MB) and `model.tar.gz` (725 MB) both exceed GitHub's 100 MB
+> (819 MB) and `model.tar.gz` (1.5 GB) both exceed GitHub's 100 MB
 > hard limit and will fail the push if accidentally staged.
 
 ---
@@ -24,8 +24,8 @@ git add .
 git -c user.email=you@example.com -c user.name=you commit -m "Initial commit: PENGWIN 2026 Task 1 V0 (ABBC bw=10)"
 git remote add origin git@github.com:OWNER/pengwin2026-task1-abbc.git
 git push -u origin main
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Notes:
@@ -34,7 +34,7 @@ Notes:
   overrides.
 - The HTTPS remote works too:
   `https://github.com/OWNER/pengwin2026-task1-abbc.git`.
-- Tagging `v0.1.0` is what Grand Challenge "Link to GitHub" picks up
+- Tagging `v0.2.0` is what Grand Challenge "Link to GitHub" picks up
   for the container build.
 
 ---
@@ -50,8 +50,8 @@ git init -b main
 git add .
 git -c user.email=you@example.com -c user.name=you commit -m "Initial commit: PENGWIN 2026 Task 1 V0 (ABBC bw=10)"
 gh repo create OWNER/pengwin2026-task1-abbc --public --source=. --remote=origin --push
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 If you prefer `gh` to also commit, drop the manual `git add` / `git commit`

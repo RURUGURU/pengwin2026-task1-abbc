@@ -18,25 +18,27 @@ Per-Anatomy ABBC nnU-Net with Core-Seed Watershed (PENGWIN-Auto)
 ----------------------------------------------------------------
 Pelvic and femoral fracture fragment instance segmentation in CT.
 
-Pipeline:
-1. Anatomy routing — the official spacing-based rule classifies each case as pelvic or femoral and crops per-anatomy ROIs (Sacrum, Left/Right Hipbone, Femur).
-2. Per-anatomy semantic segmentation — nnU-Net v2 ResEnc-L trained with an Adaptive Border / Boundary / Core (ABBC) 4-class representation (background / border / boundary / core). A boundary-class weight on the CE+Dice loss biases the network toward sharper inter-fragment separation.
-3. Instance decoding — core-seeded watershed converts the 4-class softmax into instance masks. Connected components below ~1 cm^3 are pruned per case spacing; an anatomy-size-ratio filter merges spurious tiny fragments.
+Pipeline (two models, loaded serially on a single GPU):
+1. Anatomy classifier — Dataset532_PelvicAnatomyV2 nnU-Net runs on the full CT to label Sacrum, Left/Right Hipbone, and Femur and to crop per-anatomy ROIs. The model is then released from GPU memory.
+2. Per-anatomy fragment segmenter — Dataset537 V291 ABBC nnU-Net v2 ResEnc-L is loaded on the freed GPU and run per ROI. It uses a 4-class Adaptive Border/Boundary/Core representation (background/border/boundary/core); a boundary-class CE+Dice weight sharpens inter-fragment separation.
+3. Instance decoding — core-seeded watershed converts the softmax into instance masks; components <~1 cm^3 are pruned and an anatomy-size-ratio filter merges spurious tiny fragments.
 
-Output: integer label map per PENGWIN convention (0 background; 1-50 sacrum; 51-100 left hipbone; 101-150 right hipbone; 151-200 femur). Sacrum and hipbone are modeled by the current network; femur extension is in progress.
+Output: integer label map per PENGWIN convention (0 bg; 1-50 sacrum; 51-100 L hipbone; 101-150 R hipbone; 151-200 femur).
 
-GPU: T4 16 GiB. Inference patch 224x160x192 (~11 GiB peak).
+GPU: T4 16 GiB. Peak = max(Ds532, V291), not sum (serial load). V291 patch 224x160x192 ~11 GiB.
 ----------------------------------------------------------------
-(약 990 chars, 한도 1024 이내)
+(약 1019 chars, 한도 1024 이내)
 
 
 [Job requires gpu type]
 ----------------------------------------------------------------
 NVIDIA T4 Tensor Core GPU (16 GiB VRAM)  -- 그대로 유지 (기본값 맞음)
 
-이유: V291 ABBC 모델 inference 시 patch_size 224x160x192 + ResEnc-L 백본
-      → 약 11 GiB VRAM 사용. T4 16 GiB로 충분 (마진 ~5 GiB).
-      더 큰 GPU는 비용 증가만 발생.
+이유: 두 모델(Ds532 anatomy classifier + V291 ABBC fragment segmenter)은
+      직렬(serial)로 로드/해제되므로 peak VRAM = max(Ds532, V291), not sum.
+      V291 ABBC inference 시 patch_size 224x160x192 + ResEnc-L 백본
+      → 약 11 GiB VRAM 사용. Ds532는 그보다 작음.
+      따라서 T4 16 GiB로 충분 (마진 ~5 GiB). 더 큰 GPU는 비용 증가만 발생.
 
 
 ================================================================
