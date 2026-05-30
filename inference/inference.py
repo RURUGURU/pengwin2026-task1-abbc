@@ -1,22 +1,23 @@
-"""PENGWIN 2026 Task 1 — V0.2 inference entrypoint.
+"""PENGWIN 2026 Task 1 — V0.2 추론 진입점 (V0.3.1 견고화 버전).
 
-V0.2 fixes the V0.1 contract mismatch (model expected 3-channel anatomy-aware
-input, container fed 1-channel full CT). The new pipeline matches the V5
-training recipe verbatim:
+V0.2 는 V0.1 의 contract mismatch 를 수정한 버전이다.
+(V0.1 은 모델이 3-channel anatomy-aware 입력을 기대했지만 컨테이너가 1-channel
+full CT 를 넣어 주는 문제가 있었다.)
+새 파이프라인은 V5 학습 레시피를 그대로 재현한다:
 
-    CT -> canonicalize LPS -> bone HU clip [-1000, 2000] -> bone-LUT normalize
-      -> Dataset532 anatomy classifier (full CT, 4-channel softmax)
-      -> for each anatomy in [Sacrum, LeftHip, RightHip]:
+    CT -> LPS 정규화 -> bone HU clip [-1000, 2000] -> bone-LUT 정규화
+      -> Dataset532 anatomy classifier 추론 (full CT, 4-channel softmax)
+      -> [Sacrum, LeftHip, RightHip] 각각에 대해:
            bbox = pad(anatomy_prob >= 0.5, pad_vox=24)
-           stack 3 channels = [CT_LUT_crop, prob_crop, SDF(prob_crop)]
-           V291 predict (ABBC 4-channel)
-           decode (core-seed watershed)
-           relabel into PENGWIN range [lo..hi]
-           paste into full label volume
-      -> Femur: zeros (V0 still does not model femur)
-      -> write uint8 label MHA
+           3-channel 입력 구성 = [CT_LUT_crop, prob_crop, SDF(prob_crop)]
+           V291 추론 (ABBC 4-channel)
+           디코딩 (core-seed watershed)
+           PENGWIN 라벨 범위 [lo..hi] 로 재매핑
+           전체 라벨 볼륨에 paste
+      -> Femur: 전부 zero (V0 에서는 femur 모델이 아직 없음)
+      -> uint8 라벨 MHA 로 write
 
-Layout (mirrors the model.tar.gz unpacked tree):
+모델 파일 레이아웃 (model.tar.gz 해제된 트리 구조):
     /opt/ml/model/nnunet/results/Dataset532_PelvicAnatomyV2/
         PengwinTrainer__nnUNetResEncUNetLPlans__3d_fullres/fold_0/checkpoint_best.pth
     /opt/ml/model/nnunet/results/Dataset537_PelvicBICMFragmentV5/
@@ -30,7 +31,7 @@ import json
 import os
 import sys
 import time
-import time as _time  # alias for V0.3 time-budget helpers (avoid name clash)
+import time as _time  # V0.3 시간 예산 헬퍼에서 사용 (이름 충돌 회피용 alias)
 import traceback
 from pathlib import Path
 from typing import Any
@@ -42,9 +43,9 @@ import SimpleITK as sitk
 INPUT_DIR = Path("/input/images/peripelvic-fracture-ct")
 OUTPUT_DIR = Path("/output/images/peripelvic-fracture-ct-segmentation")
 
-# Model dir on Grand Challenge: the model.tar.gz is packed with the trailing-dot
-# convention (`tar -C model_payload -czf model.tar.gz .`) so its contents are
-# extracted directly under /opt/ml/model/ (no `model_payload/` prefix).
+# Grand Challenge 의 모델 디렉터리 경로.
+# model.tar.gz 는 trailing-dot convention (`tar -C model_payload -czf model.tar.gz .`)
+# 으로 패킹되어 있어 내용물이 /opt/ml/model/ 바로 아래로 풀린다 (model_payload/ prefix 없음).
 MODEL_ROOT = Path(os.environ.get("PENGWIN_MODEL_ROOT", "/opt/ml/model"))
 NN_RES = Path(os.environ.get("nnUNet_results", str(MODEL_ROOT / "nnunet" / "results")))
 NN_PREP = Path(os.environ.get("nnUNet_preprocessed", str(MODEL_ROOT / "nnunet" / "preprocessed")))
@@ -54,15 +55,15 @@ os.environ.setdefault("nnUNet_preprocessed", str(NN_PREP))
 os.environ.setdefault("nnUNet_raw", str(NN_RAW))
 os.environ.setdefault("PENGWIN_ROOT", str(MODEL_ROOT))
 
-# --- Dataset532: anatomy classifier (background/Sacrum/LeftHip/RightHip). ---
+# --- Dataset532: anatomy classifier (background/Sacrum/LeftHip/RightHip 4-class). ---
 DS532_DATASET = "Dataset532_PelvicAnatomyV2"
 DS532_TRAINER = "PengwinTrainer"
 DS532_PLANS = "nnUNetResEncUNetLPlans"
 DS532_CONFIG = "3d_fullres"
 DS532_FOLD = 0
-DS532_OUTPUT_CHANNELS = 4  # bg, Sacrum, LeftHip, RightHip
+DS532_OUTPUT_CHANNELS = 4  # background, Sacrum, LeftHip, RightHip
 
-# --- Dataset537 V291: per-anatomy ABBC instance segmenter. ---
+# --- Dataset537 V291: anatomy 별 ABBC instance segmenter. ---
 V291_DATASET = "Dataset537_PelvicBICMFragmentV5"
 V291_TRAINER = (
     "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025"
@@ -71,10 +72,10 @@ V291_TRAINER = (
 V291_PLANS = "nnUNetResEncUNetLPlans"
 V291_CONFIG = "3d_fullres"
 V291_FOLD = 0
-V291_OUTPUT_CHANNELS = 4  # ABBC: bg, border, boundary, core
+V291_OUTPUT_CHANNELS = 4  # ABBC: background, border, boundary, core
 CHECKPOINT_NAME = "checkpoint_best.pth"
 
-# --- V5 anatomy contract (matches dataset.json v5_contract). ---
+# --- V5 anatomy contract (dataset.json 의 v5_contract 와 일치). ---
 V5_DATASET532_PROB_CHANNEL = {"Sacrum": 1, "LeftHip": 2, "RightHip": 3}
 V5_ANATOMY_RANGES = {
     "Sacrum": (1, 50),
@@ -86,28 +87,28 @@ ANATOMY_PROB_THRESHOLD = 0.50
 SDF_CLIP_MM = 40.0
 BONE_HU_RANGE = (-1000.0, 2000.0)
 
-# --- ABBC decode hyperparams (mirror V0.1 description.md "bw=10 + sr=0.05"). ---
+# --- ABBC decode 하이퍼파라미터 (V0.1 description.md 의 "bw=10 + sr=0.05" 와 동일). ---
 BACKGROUND_THRESHOLD = 0.50
 CORE_THRESHOLD = 0.50
 ANATOMY_SIZE_RATIO_KEEP = 0.05
-MIN_COMPONENT_VOXELS = 1820  # ~1 cm^3 at the V5 plan resolution.
+MIN_COMPONENT_VOXELS = 1820  # V5 plan 해상도에서 약 1 cm^3 에 해당
 
-# --- Anatomy routing (verbatim from PENGWIN 2026 Task 1 spec). ---
+# --- anatomy routing (PENGWIN 2026 Task 1 스펙 그대로). ---
 FEMUR_RANGE = (151, 200)
 
-# --- V0.3 robustness flags. ---
-V03_USE_BONE_SKELETON_FALLBACK = True
-V03_USE_TIME_BUDGET = True
+# --- V0.3 견고화 관련 플래그 ---
+V03_USE_BONE_SKELETON_FALLBACK = True  # Ds532 실패 시 bone HU mask fallback 사용
+V03_USE_TIME_BUDGET = True             # 시간 예산 기반 안전망 활성화
 
-# --- V0.3 robustness constants. ---
-# 시간 예산 (Grand Challenge 10분 limit)
-TIME_BUDGET_SECONDS = 480.0   # 8 minutes (margin for I/O, decode, paste)
-TIME_BUDGET_HARD_LIMIT = 540.0   # 9 minutes — beyond this, skip remaining
+# --- V0.3 견고화 관련 상수 ---
+# 시간 예산 설정 (Grand Challenge 의 10분 제한을 안전하게 지키기 위함)
+TIME_BUDGET_SECONDS = 480.0   # 8분: I/O / decode / paste 여유분 포함
+TIME_BUDGET_HARD_LIMIT = 540.0   # 9분: 이 시점 이후로는 남은 anatomy 모두 skip
 BONE_HU_THRESHOLD = 200.0
 BONE_MIN_COMPONENT_VOXELS = 10000
 SANITY_MAX_BBOX_FRACTION = 0.35
-SANITY_MAX_POSTPAD_BBOX_FRACTION = 0.50  # bbox after pad must be < 50% of image
-LARGEST_CC_KEEP_ONLY = True  # 노이즈 fragment 25개 방지
+SANITY_MAX_POSTPAD_BBOX_FRACTION = 0.50  # pad 적용 후 bbox 가 전체 볼륨의 50% 미만이어야 한다
+LARGEST_CC_KEEP_ONLY = True  # 가장 큰 CC 만 유지해 25개 슬롯이 노이즈 fragment 로 채워지는 것 방지
 
 
 def log(msg: str) -> None:
@@ -130,7 +131,7 @@ def classify_pelvic_femur(spacing_x, spacing_y, spacing_z, physical_x_mm, physic
 
 
 # ---------------------------------------------------------------------------
-# I/O helpers.
+# 입출력 관련 헬퍼.
 # ---------------------------------------------------------------------------
 def find_input_image() -> Path:
     if not INPUT_DIR.is_dir():
@@ -147,7 +148,10 @@ def output_path(input_path: Path) -> Path:
 
 
 def write_label_map(label_arr: np.ndarray, ref_img: sitk.Image, out_path: Path) -> None:
-    """Write a label MHA preserving ref_img geometry; clip to [0,200] uint8."""
+    """ref_img 의 geometry (spacing/origin/direction) 를 유지하며 라벨 MHA 를 저장한다.
+
+    값은 [0, 200] 으로 clip 후 uint8 로 캐스팅한다 (PENGWIN 라벨 범위 보장).
+    """
     if label_arr.ndim != 3:
         raise ValueError(f"expected [Z, Y, X] label map, got {label_arr.shape}")
     label_arr = np.clip(label_arr, 0, 200).astype(np.uint8, copy=False)
@@ -171,8 +175,8 @@ def write_zero_output(input_path: Path, ref_img: sitk.Image, reason: str) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Image preprocessing helpers (copied verbatim from preprocessing.py / utils.py
-# so the container has no dependency on /opt/app/code_task1 at runtime).
+# 이미지 전처리 헬퍼들. preprocessing.py / utils.py 에서 그대로 복사해 왔다.
+# 이렇게 함으로써 런타임에 /opt/app/code_task1 에 의존하지 않아도 되도록 한다.
 # ---------------------------------------------------------------------------
 def orientation_code(img: sitk.Image) -> str:
     return sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(img.GetDirection())
@@ -198,7 +202,11 @@ def canonicalize_and_clip_image(img: sitk.Image) -> tuple[sitk.Image, np.ndarray
 
 
 def bone_lut_normalize(arr: np.ndarray) -> np.ndarray:
-    """Deterministic bone-window LUT (verbatim from preprocessing._bone_lut_normalize)."""
+    """결정론적 bone-window LUT (preprocessing._bone_lut_normalize 의 동일 구현).
+
+    학습 시 사용한 piecewise-linear HU → [0,1] 매핑을 그대로 재현해 train/inference
+    contract 가 어긋나지 않도록 한다.
+    """
     x = arr.astype(np.float32, copy=False)
     xp = np.asarray([-1000.0, -200.0, 150.0, 700.0, 1500.0, 2000.0], dtype=np.float32)
     fp = np.asarray([0.0, 0.05, 0.35, 0.70, 0.92, 1.0], dtype=np.float32)
@@ -215,7 +223,10 @@ def ndi_distance_transform(mask: np.ndarray,
 def selected_anatomy_sdf_from_prob(prob: np.ndarray,
                                    spacing_zyx: tuple[float, float, float],
                                    clip_mm: float = SDF_CLIP_MM) -> np.ndarray:
-    """Signed distance to anatomy prob>=0.5 mask, clipped/scaled to [-1, 1]."""
+    """anatomy 확률 prob>=0.5 mask 로부터 signed distance 를 계산해 [-1, 1] 범위로 스케일링한다.
+
+    mask 내부는 양수, 외부는 음수가 되어 V291 모델이 위치 정보를 학습된 형태로 받을 수 있다.
+    """
     arr = np.asarray(prob, dtype=np.float32)
     mask = arr >= 0.5
     if not mask.any():
@@ -237,7 +248,7 @@ def bbox_from_mask(mask: np.ndarray, pad_vox: int = ROI_PAD_VOX) -> tuple[slice,
 
 
 # ---------------------------------------------------------------------------
-# nnU-Net predictor utilities (generic over output channels).
+# nnU-Net predictor 관련 헬퍼 (출력 채널 수에 일반화된 형태).
 # ---------------------------------------------------------------------------
 def build_predictor(dataset: str, trainer: str, plans: str, config: str,
                     fold: int, checkpoint_name: str = CHECKPOINT_NAME):
@@ -270,10 +281,10 @@ def build_predictor(dataset: str, trainer: str, plans: str, config: str,
 
 def predict_logits_full(predictor, image_4d: np.ndarray,
                         image_properties: dict, output_channels: int) -> tuple[np.ndarray, dict]:
-    """Run sliding-window inference on a (C, Z, Y, X) array; return logits + data_props.
+    """(C, Z, Y, X) 배열에 sliding-window 추론을 수행해 logit 과 data_properties 를 반환한다.
 
-    The number of input channels in image_4d MUST match the trained model's
-    plans.channel_names; otherwise the encoder will reject the input.
+    image_4d 의 입력 채널 수는 학습된 모델의 plans.channel_names 와 정확히 일치해야 한다.
+    그렇지 않으면 encoder 가 입력을 거부한다.
     """
     from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy
 
@@ -306,7 +317,12 @@ def predict_logits_full(predictor, image_4d: np.ndarray,
 
 
 def _predict_custom_logits_from_preprocessed_data(predictor, data, output_channels: int):
-    """Sliding-window inference that allocates `output_channels` for a custom head."""
+    """custom head 의 출력 채널 수에 맞춰 logit 버퍼를 할당하는 sliding-window 추론.
+
+    nnUNet 기본 구현은 plans.json 의 num_classes 에 의존하지만, 본 프로젝트는
+    ABBC 4-channel 헤드처럼 비표준 출력 채널을 사용하므로 output_channels 를
+    명시적으로 주입한다.
+    """
     import torch
     from acvl_utils.cropping_and_padding.padding import pad_nd_image
     from nnunetv2.inference.sliding_window_prediction import compute_gaussian
@@ -386,7 +402,7 @@ def softmax_axis0(logits: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# ABBC -> instance fragment decoder (V288 core-seed watershed).
+# ABBC 확률 → fragment instance 라벨 디코더 (V288 core-seed watershed).
 # ---------------------------------------------------------------------------
 def decode_abbc_core_seed_watershed(
     probs: np.ndarray,
@@ -396,7 +412,12 @@ def decode_abbc_core_seed_watershed(
     min_component_voxels: int = MIN_COMPONENT_VOXELS,
     size_ratio_keep: float = ANATOMY_SIZE_RATIO_KEEP,
 ) -> np.ndarray:
-    """Channels: 0=background, 1=border, 2=boundary, 3=core. Returns uint16 labels 1..N."""
+    """V288 core-seed watershed 로 ABBC 확률맵을 fragment instance 라벨로 디코딩한다.
+
+    ABBC 채널 의미: 0=background, 1=border, 2=boundary, 3=core.
+    core 영역을 seed 로 두고 background 가 아닌 영역(support) 전체로 watershed 를 확장한다.
+    반환값은 uint16 라벨 1..N (배경은 0).
+    """
     import scipy.ndimage as ndi
 
     background = probs[0] >= float(background_threshold)
@@ -474,7 +495,7 @@ def _merge_by_size_ratio(labels: np.ndarray, *, size_ratio_keep: float) -> np.nd
 
 
 # ---------------------------------------------------------------------------
-# Resample a per-instance label map from preprocessed grid back to original.
+# fragment 단위 라벨 맵을 preprocessed grid 에서 원본 CT 격자로 resampling.
 # ---------------------------------------------------------------------------
 def resample_label_map_to_original(
     label_pp: np.ndarray, data_properties: dict, predictor,
@@ -522,53 +543,53 @@ def resample_label_map_to_original(
 
 
 # ---------------------------------------------------------------------------
-# V0.3 robust anatomy ROI helpers (4-Layer pipeline).
+# V0.3 견고화된 anatomy ROI 추출 헬퍼 (4-layer 파이프라인용).
 # ---------------------------------------------------------------------------
 def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
                                         hu_threshold=200.0,
                                         min_component_voxels=10000):
-    """Layer 1: 학습-분포-독립적 anatomy ROI 분해 (bone HU mask 기반).
+    """Layer 1: 학습 데이터 분포에 의존하지 않는 anatomy ROI 분해 (bone HU mask 기반).
 
-    PENGWIN CT 의 골격 부분은 HU>200 으로 신뢰성 있게 segment 가능.
-    Ds532 가 OOD 케이스에서 실패해도, 이 함수는 항상 합리적인
-    Sacrum/LeftHip/RightHip ROI 를 추출함.
+    PENGWIN CT 의 골격 부위는 HU > 200 으로 안정적으로 분리 가능하다.
+    Ds532 가 OOD (out-of-distribution) 케이스에서 실패하더라도, 본 함수는 항상
+    합리적인 Sacrum/LeftHip/RightHip ROI 를 추출할 수 있게 해 주는 안전망이다.
 
     Args:
-        arr_clipped: (Z, Y, X) HU 값 (이미 [-1000, 2000] clip 됨)
+        arr_clipped: (Z, Y, X) HU 배열 (이미 [-1000, 2000] 로 clip 된 상태)
         spacing_zyx: physical spacing (z, y, x) mm
-        hu_threshold: bone 으로 간주할 최소 HU
-        min_component_voxels: 너무 작은 CC 무시
+        hu_threshold: bone 으로 간주할 최소 HU 값
+        min_component_voxels: 너무 작은 connected component 는 무시할 임계값
 
     Returns:
-        dict[str, np.ndarray] — anatomy 별 mask (LPS frame).
-        Sacrum: 중앙 CC, LeftHip: +x 쪽, RightHip: -x 쪽.
-        실패시 빈 dict 반환.
+        dict[str, np.ndarray] — anatomy 별 mask (LPS frame 기준).
+        Sacrum 은 중앙 CC, LeftHip 은 +x 쪽, RightHip 은 -x 쪽으로 배정한다.
+        추출 실패 시 빈 dict 반환.
     """
     import scipy.ndimage as ndi
     bone_mask = arr_clipped > float(hu_threshold)
-    # Morphology: noise 제거 + small gap close
+    # Morphology 후처리: opening 으로 노이즈 제거하면서 작은 gap 도 함께 정리
     bone_mask = ndi.binary_opening(bone_mask, structure=np.ones((2, 2, 2), dtype=bool), iterations=1)
     labels, n_cc = ndi.label(bone_mask, structure=np.ones((3, 3, 3), dtype=bool))
     if n_cc == 0:
         return {}
-    # CC 크기 순으로 sort
+    # connected component 를 크기 내림차순으로 정렬
     sizes = ndi.sum(bone_mask, labels, index=np.arange(1, n_cc + 1))
     sorted_idx = np.argsort(sizes)[::-1]
     top_cc_ids = [int(sorted_idx[i]) + 1 for i in range(min(5, n_cc)) if sizes[sorted_idx[i]] >= min_component_voxels]
     if not top_cc_ids:
         return {}
-    # 각 CC 의 centroid (z, y, x)
+    # 각 CC 의 centroid (z, y, x) 좌표 계산
     centroids_raw = ndi.center_of_mass(bone_mask, labels, top_cc_ids)
-    # Normalize centroids_raw to a list of 3-tuples regardless of scipy version / len-1 collapse.
+    # scipy 버전/입력 개수에 따라 반환 형식이 달라지므로 3-tuple 의 list 로 정규화한다.
     if len(top_cc_ids) == 1:
-        # scipy returns a single tuple when given 1 index — wrap in list
+        # index 가 1개일 때 scipy 가 단일 tuple 을 반환하는 경우가 있어 list 로 감싼다
         if isinstance(centroids_raw, tuple) and len(centroids_raw) == 3 and not isinstance(centroids_raw[0], tuple):
             centroids = [centroids_raw]
         else:
             centroids = list(centroids_raw)
     else:
         centroids = list(centroids_raw)
-    # x-centroid 로 좌/중/우 분류 (LPS: +x = patient left)
+    # x-centroid 로 좌/중/우 분류 (LPS 좌표계에서는 +x 가 patient left)
     x_dim = float(arr_clipped.shape[2])
     cc_info = []
     for i, cc_id in enumerate(top_cc_ids):
@@ -584,21 +605,21 @@ def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
             'cz': float(cz),
             'size': int(sizes[cc_id - 1]),
         })
-    # Sort by size desc
+    # 크기 내림차순으로 정렬
     cc_info.sort(key=lambda d: -d['size'])
 
-    # 가장 큰 3 CC 사용; x-centroid 로 분류:
-    #   가장 중앙에 가까운 = Sacrum
-    #   +x (image left half) = LeftHip
-    #   -x (image right half) = RightHip
+    # 가장 큰 3개 CC 를 사용해 x-centroid 로 anatomy 를 분류한다:
+    #   가장 중앙에 가까운 CC = Sacrum
+    #   +x 쪽 (이미지 좌측 절반) = LeftHip
+    #   -x 쪽 (이미지 우측 절반) = RightHip
     if len(cc_info) >= 3:
         top3 = cc_info[:3]
     else:
-        top3 = cc_info  # fewer than 3, best effort
+        top3 = cc_info  # 3개 미만이면 가능한 만큼만 사용 (best effort)
 
-    # Image center x
+    # 이미지 중앙 x 좌표
     cx_center = x_dim / 2.0
-    # 중앙성 = abs(cx - cx_center)
+    # 중앙성 점수 = abs(cx - cx_center). 작을수록 중앙에 가깝다.
     top3_sorted_by_centrality = sorted(top3, key=lambda d: abs(d['cx'] - cx_center))
     if len(top3_sorted_by_centrality) >= 1:
         sacrum_cc = top3_sorted_by_centrality[0]
@@ -607,11 +628,11 @@ def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
 
     remaining = [d for d in top3 if d['cc_id'] != (sacrum_cc['cc_id'] if sacrum_cc else None)]
     if len(remaining) >= 2:
-        remaining.sort(key=lambda d: d['cx'])  # ascending by x
-        righthip_cc = remaining[0]   # smaller x = patient right (LPS)
-        lefthip_cc = remaining[-1]   # larger x = patient left (LPS)
+        remaining.sort(key=lambda d: d['cx'])  # x 좌표 오름차순 정렬
+        righthip_cc = remaining[0]   # x 가 작은 쪽 = patient right (LPS)
+        lefthip_cc = remaining[-1]   # x 가 큰 쪽 = patient left (LPS)
     elif len(remaining) == 1:
-        # only 1 hip CC visible — assign by centroid sign
+        # hip CC 가 1개만 보일 때 centroid 부호를 보고 좌/우 결정
         only_hip = remaining[0]
         if only_hip['cx'] < cx_center:
             righthip_cc = only_hip
@@ -634,14 +655,15 @@ def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
 
 
 def ds532_argmax_masks(probs_full):
-    """Layer 2 부분: Ds532 4-channel softmax 의 argmax 로 mutually-exclusive
-    anatomy mask 추출. independent threshold 의 over-coverage 문제 회피.
+    """Layer 2 일부: Ds532 4-channel softmax 의 argmax 로 서로 배타적인
+    anatomy mask 를 추출한다. 채널별 독립 threshold 가 일으키는
+    over-coverage (중복 영역) 문제를 회피하기 위함이다.
 
     Args:
-        probs_full: (4, Z, Y, X) softmax probabilities.
+        probs_full: (4, Z, Y, X) softmax 확률 텐서.
 
     Returns:
-        dict[str, np.ndarray] — anatomy mask (서로 disjoint).
+        dict[str, np.ndarray] — anatomy 별 mask (서로 disjoint 임이 보장됨).
     """
     argmax_map = np.argmax(probs_full, axis=0)  # (Z, Y, X), 0=bg, 1=sacrum, 2=lh, 3=rh
     masks = {}
@@ -653,15 +675,15 @@ def ds532_argmax_masks(probs_full):
 def merge_masks_with_sanity(ds532_masks, bone_masks, image_shape,
                             sanity_max_fraction=0.35,
                             bone_fallback_when_sanity_fails=True):
-    """Layer 2+3: Ds532 mask 와 bone-skeleton mask 결합 + sanity check.
+    """Layer 2+3: Ds532 mask 와 bone-skeleton mask 를 sanity check 와 함께 병합한다.
 
-    각 anatomy 별로:
-      1) Ds532 mask 의 voxel 비율 < sanity_max_fraction 이면 Ds532 사용 (refined)
-      2) sanity 실패 → bone skeleton mask 로 fallback (있으면)
-      3) 둘 다 실패 → 해당 anatomy skip (그 라벨 zero output)
+    각 anatomy 별 정책:
+      1) Ds532 mask 의 voxel 비율이 sanity_max_fraction 미만이면 Ds532 사용 (정확도 우선)
+      2) sanity 실패 시 bone skeleton mask 로 fallback (가용한 경우)
+      3) 둘 다 실패 → 해당 anatomy 는 skip 하고 라벨을 0 으로 둔다
 
-    Returns:
-        dict[str, dict] — { anatomy: { 'mask': arr, 'source': 'ds532' | 'bone' | 'none' } }
+    반환:
+        dict[str, dict] — { anatomy: { 'mask': arr, 'source': 'ds532' | 'bone_fallback' | 'none' } }
     """
     img_voxels = float(np.prod(image_shape))
     out = {}
@@ -682,10 +704,11 @@ def merge_masks_with_sanity(ds532_masks, bone_masks, image_shape,
 
 
 def estimate_v291_inference_seconds(bbox, patch_size=(224, 160, 192), seconds_per_patch=2.5):
-    """Layer 3: V291 sliding-window inference 시간 대략 추정.
+    """Layer 3: V291 sliding-window 추론 소요 시간 대략 추정.
 
-    nnUNet 의 sliding window 는 tile_step_size=0.5 라 patch 의 50% 씩 이동.
-    크기 별 patch 개수 = ceil((dim - patch) / (patch * 0.5)) + 1
+    nnUNet 의 sliding window 는 tile_step_size=0.5 이므로 patch 의 50% 씩 이동한다.
+    축별 patch 개수 = ceil((dim - patch) / (patch * 0.5)) + 1.
+    이를 곱한 총 patch 수에 patch 당 평균 추론 시간을 곱해 ETA 를 구한다.
     """
     if bbox is None:
         return 0.0
@@ -701,21 +724,21 @@ def estimate_v291_inference_seconds(bbox, patch_size=(224, 160, 192), seconds_pe
 
 
 # ---------------------------------------------------------------------------
-# Per-anatomy V291 inference pipeline.
+# anatomy 별 V291 추론 파이프라인 (메인 로직).
 # ---------------------------------------------------------------------------
 def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
-    """V0.3 robust pipeline:
-       Layer 1: bone-skeleton anatomy decomposition (HU>200)  — 항상 실행
-       Layer 2: Ds532 argmax refinement                       — 가능하면 사용
-       Layer 3: bbox sanity + time budget                     — 안전망
-       Layer 4: V291 per-anatomy ABBC inference + decode + paste
+    """V0.3 견고화 파이프라인 (4-layer 구조):
+       Layer 1: bone-skeleton anatomy 분해 (HU>200) — 항상 실행 (fallback 확보)
+       Layer 2: Ds532 argmax refinement              — Ds532 가 합리적이면 우선 사용
+       Layer 3: bbox sanity + 시간 예산 점검         — 안전망 역할
+       Layer 4: V291 per-anatomy ABBC 추론 + decode + paste
 
-    Femur (151-200) 은 V0.2 와 동일하게 emit zero.
+    Femur (151-200) 은 V0.2 와 동일하게 zero 출력 (V0 에서는 femur 모델 미포함).
     """
     import time
     t_start = time.time()
 
-    # === Step 1: LPS canonicalize + bone-window clip ===
+    # === Step 1: LPS 정규화 + bone window HU clip ===
     img_lps, arr_clipped = canonicalize_and_clip_image(ref_img)
     image_npy_lps = arr_clipped.astype(np.float32, copy=False)
     ct_lut_full = bone_lut_normalize(arr_clipped)
@@ -724,7 +747,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
     img_shape = image_npy_lps.shape
     log(f"V0.3 preproc: shape={img_shape} spacing_zyx={spacing_zyx}")
 
-    # === Layer 1: Bone-skeleton anatomy decomposition (always) ===
+    # === Layer 1: bone HU mask 기반 anatomy 분해 (항상 실행, fallback 용) ===
     bone_masks = bone_skeleton_anatomy_decomposition(
         arr_clipped, spacing_zyx,
         hu_threshold=BONE_HU_THRESHOLD,
@@ -732,7 +755,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
     )
     log(f"L1 bone-skeleton: {list(bone_masks.keys())}")
 
-    # === Step 2: Ds532 predict (full CT, 1-channel HU input) ===
+    # === Step 2: Ds532 anatomy classifier 추론 (전체 CT, 1-channel HU 입력) ===
     ds532_predictor = build_predictor(
         DS532_DATASET, DS532_TRAINER, DS532_PLANS, DS532_CONFIG, DS532_FOLD,
     )
@@ -743,7 +766,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
         ds532_predictor, ds532_image_4d, ds532_props, output_channels=DS532_OUTPUT_CHANNELS,
     )
     ds532_probs_pp = softmax_axis0(ds532_logits_pp)
-    # Resample probs back to original CT grid (linear)
+    # nnUNet preprocessed grid 의 prob 를 원본 CT 격자로 다시 resampling (linear interp)
     from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
     from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
     shape_after_cropping = tuple(int(s) for s in ds532_data_props["shape_after_cropping_and_before_resampling"])
@@ -764,7 +787,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
     else:
         slicer = bounding_box_to_slice(bbox_used)
         probs_full_axes[(slice(None), *slicer)] = np.asarray(probs_resampled_axes, dtype=np.float32)
-    # Set bg=1 where fg is empty (outside cropping bbox)
+    # cropping bbox 바깥 영역은 fg 가 비어 있으므로 background prob 를 1 로 채워 정상화
     fg_sum = probs_full_axes[1:].sum(axis=0)
     bg_mask = fg_sum < 1e-6
     if bg_mask.any():
@@ -772,25 +795,25 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
     probs_full = np.transpose(probs_full_axes, (0, *(int(a) + 1 for a in transpose_backward)))
     assert probs_full.shape[1:] == img_shape, f"shape mismatch: {probs_full.shape[1:]} vs {img_shape}"
 
-    # === Layer 2: Ds532 argmax-based anatomy masks ===
+    # === Layer 2: Ds532 argmax 기반 anatomy mask 추출 ===
     ds532_masks = ds532_argmax_masks(probs_full)
     log(f"L2 Ds532 argmax: " + ", ".join(f"{a}={ds532_masks[a].sum()}" for a in ['Sacrum','LeftHip','RightHip']))
 
-    # === Layer 2+3: Merge with sanity ===
+    # === Layer 2+3: Ds532 mask 와 bone fallback 을 sanity check 와 함께 병합 ===
     merged = merge_masks_with_sanity(
         ds532_masks, bone_masks, img_shape,
         sanity_max_fraction=SANITY_MAX_BBOX_FRACTION,
         bone_fallback_when_sanity_fails=V03_USE_BONE_SKELETON_FALLBACK,
     )
 
-    # Free Ds532 before V291
+    # V291 모델 로딩 전에 Ds532 관련 텐서를 해제해 GPU 메모리 확보
     del ds532_predictor, ds532_logits_pp, ds532_probs_pp, probs_resampled_axes, probs_full_axes
     import gc, torch
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # === Layer 4: V291 per-anatomy inference + decode + paste ===
+    # === Layer 4: anatomy 별 V291 추론 → ABBC decode → 전체 라벨에 paste ===
     v291_predictor = build_predictor(
         V291_DATASET, V291_TRAINER, V291_PLANS, V291_CONFIG, V291_FOLD,
     )
@@ -808,7 +831,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
             continue
 
         mask = info['mask']
-        # Largest CC only (noise filtering)
+        # 가장 큰 connected component 만 유지 (작은 노이즈 CC 가 fragment 슬롯을 낭비하는 것 방지)
         if LARGEST_CC_KEEP_ONLY:
             import scipy.ndimage as ndi
             cc_labels, n_cc = ndi.label(mask, structure=np.ones((3,3,3), dtype=bool))
@@ -822,14 +845,14 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
             log(f"[{anatomy}] mask empty after CC filter, emit zero")
             continue
 
-        # NEW (FIX #2): post-pad bbox sanity — even if mask is small, the padded
-        # bbox can blow up on tight-FOV inputs. If bbox covers >50% of volume
-        # the V291 inference will be slow and the result will be unreliable.
+        # NEW (FIX #2): pad 적용 후 bbox sanity check.
+        # mask 가 작더라도 tight-FOV 입력에서는 pad 가 추가되며 bbox 가 폭증할 수 있다.
+        # bbox 가 볼륨의 50% 를 넘으면 V291 추론이 매우 느려지고 결과 신뢰도가 떨어진다.
         bbox_fraction = float(np.prod([bbox[i].stop - bbox[i].start for i in range(3)])) / float(np.prod(img_shape))
         if bbox_fraction > SANITY_MAX_POSTPAD_BBOX_FRACTION:
             log(f"[{anatomy}] bbox covers {bbox_fraction*100:.1f}% (>{SANITY_MAX_POSTPAD_BBOX_FRACTION*100:.0f}%); "
                 f"shrinking pad_vox to keep bbox under threshold")
-            # Try smaller pad
+            # pad_vox 를 단계적으로 줄여가며 임계값 밑으로 떨어뜨린다
             for shrunk_pad in (12, 6, 0):
                 bbox_try = bbox_from_mask(mask, pad_vox=shrunk_pad)
                 if bbox_try is None:
@@ -841,10 +864,11 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
                     bbox_fraction = bbox_fraction_try
                     break
             else:
+                # pad=0 으로도 너무 크다면 mask 자체가 비정상 — zero 로 처리
                 log(f"[{anatomy}] even pad=0 bbox is too large ({bbox_fraction*100:.1f}%); emit zero")
                 continue
 
-        # Time estimate sanity
+        # 시간 예산 기반 sanity check (Grand Challenge 10분 제한 보호)
         eta = estimate_v291_inference_seconds(bbox)
         bbox_fraction = float(np.prod([bbox[i].stop - bbox[i].start for i in range(3)])) / float(np.prod(img_shape))
         log(f"[{anatomy}] bbox crop={tuple(bbox[i].stop - bbox[i].start for i in range(3))} "
@@ -854,16 +878,17 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
             log(f"[{anatomy}] elapsed+ETA={elapsed+eta:.0f}s > budget {TIME_BUDGET_SECONDS}s, emit zero")
             continue
 
-        # Build 3-channel V291 input
+        # V291 입력: 3-channel anatomy-aware 텐서 구성
+        # (V5 학습 레시피와 동일 — CT_LUT / anatomy prob / SDF)
         ct_lut_crop = ct_lut_full[bbox]
-        # Channel 1: Ds532 anatomy probability (clipped to [0,1])
+        # Channel 1: Ds532 anatomy 확률 ([0,1] clip). bone fallback 시에는 mask 자체를 0/1 로 사용
         prob_crop = probs_full[V5_DATASET532_PROB_CHANNEL[anatomy]][bbox] if info['source'] == 'ds532' else np.clip(mask[bbox].astype(np.float32), 0.0, 1.0)
-        # Channel 2: SDF from prob>=0.5 mask
+        # Channel 2: prob>=0.5 mask 의 signed distance field
         sdf_crop = selected_anatomy_sdf_from_prob(prob_crop, spacing_zyx, clip_mm=SDF_CLIP_MM)
         v291_image_4d = np.stack([ct_lut_crop, prob_crop, sdf_crop], axis=0)
         v291_props = {"spacing": list(spacing_zyx)}
 
-        # V291 inference
+        # V291 sliding-window 추론 실행
         v291_logits_pp, v291_data_props = predict_logits_full(
             v291_predictor, v291_image_4d, v291_props, output_channels=V291_OUTPUT_CHANNELS,
         )
@@ -871,14 +896,15 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
         decoded_pp = decode_abbc_core_seed_watershed(v291_probs)
         decoded_crop = resample_label_map_to_original(decoded_pp, v291_data_props, v291_predictor)
 
-        # Relabel and paste
+        # 라벨 재매핑 후 전체 볼륨에 paste
+        # PENGWIN 스펙: Sacrum [1..50], LeftHip [51..100], RightHip [101..150]
         lo, hi = V5_ANATOMY_RANGES[anatomy]
         n_slots = hi - lo + 1
         local_ids = sorted(int(v) for v in np.unique(decoded_crop) if int(v) > 0)
         if not local_ids:
             log(f"[{anatomy}] no fragments after decode")
             continue
-        # Keep only up to n_slots fragments (size-sorted)
+        # 슬롯이 부족하면 fragment 크기 순으로 상위 n_slots 개만 살린다
         if len(local_ids) > n_slots:
             sizes_local = [(lid, int((decoded_crop == lid).sum())) for lid in local_ids]
             sizes_local.sort(key=lambda x: -x[1])
@@ -886,9 +912,9 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
         remap = np.zeros(max(local_ids) + 1, dtype=np.uint16)
         for i, old_id in enumerate(local_ids):
             remap[old_id] = np.uint16(lo + i)
-        # Mask-out overflow IDs
+        # 슬롯 초과 ID 는 0 으로 마스킹 (PENGWIN 라벨 범위 보호)
         decoded_crop_filtered = np.where(np.isin(decoded_crop, local_ids), decoded_crop, 0).astype(np.int32, copy=False)
-        # Clip filtered IDs to valid range to avoid index out of bounds
+        # remap 인덱스를 안전하게 사용하기 위해 valid 범위로 clip
         decoded_crop_filtered = np.clip(decoded_crop_filtered, 0, max(local_ids))
         remapped_crop = remap[decoded_crop_filtered]
 
@@ -898,7 +924,9 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
         full_label[bbox] = out_slot
         log(f"[{anatomy}] painted {int(write_mask.sum())} voxels, {len(local_ids)} fragments in range [{lo},{hi}]")
 
-    # === Step 5: undo LPS reorientation if original was different ===
+    # === Step 5: 원본이 LPS 가 아니었다면 원래 방향으로 되돌린다 ===
+    # nnUNet 은 LPS 로 추론하므로, 원본 orientation 으로 복구해야
+    # Grand Challenge 가 기대하는 좌표계와 일치한다.
     if orientation_code(ref_img) != "LPS":
         lps_label_img = sitk.GetImageFromArray(full_label.astype(np.uint16, copy=False))
         lps_label_img.SetSpacing(img_lps.GetSpacing())
@@ -914,7 +942,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# main()
+# main() — 컨테이너 진입점
 # ---------------------------------------------------------------------------
 def main() -> int:
     t0 = time.time()
@@ -924,8 +952,8 @@ def main() -> int:
         log(f"input image: {image_path}")
         ref_img = sitk.ReadImage(str(image_path))
 
-        size = ref_img.GetSize()       # (X, Y, Z)
-        spacing = ref_img.GetSpacing() # (sx, sy, sz)
+        size = ref_img.GetSize()       # SimpleITK 순서 (X, Y, Z)
+        spacing = ref_img.GetSpacing() # SimpleITK 순서 (sx, sy, sz)
         spacing_x, spacing_y, spacing_z = (float(s) for s in spacing)
         physical_x_mm = float(size[0]) * spacing_x
         physical_z_mm = float(size[2]) * spacing_z
