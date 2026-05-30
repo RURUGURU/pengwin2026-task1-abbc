@@ -30,6 +30,7 @@ import json
 import os
 import sys
 import time
+import time as _time  # alias for V0.3 time-budget helpers (avoid name clash)
 import traceback
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,20 @@ MIN_COMPONENT_VOXELS = 1820  # ~1 cm^3 at the V5 plan resolution.
 
 # --- Anatomy routing (verbatim from PENGWIN 2026 Task 1 spec). ---
 FEMUR_RANGE = (151, 200)
+
+# --- V0.3 robustness flags. ---
+V03_USE_BONE_SKELETON_FALLBACK = True
+V03_USE_TIME_BUDGET = True
+
+# --- V0.3 robustness constants. ---
+# 시간 예산 (Grand Challenge 10분 limit)
+TIME_BUDGET_SECONDS = 480.0   # 8 minutes (margin for I/O, decode, paste)
+TIME_BUDGET_HARD_LIMIT = 540.0   # 9 minutes — beyond this, skip remaining
+BONE_HU_THRESHOLD = 200.0
+BONE_MIN_COMPONENT_VOXELS = 10000
+SANITY_MAX_BBOX_FRACTION = 0.35
+SANITY_MAX_POSTPAD_BBOX_FRACTION = 0.50  # bbox after pad must be < 50% of image
+LARGEST_CC_KEEP_ONLY = True  # 노이즈 fragment 25개 방지
 
 
 def log(msg: str) -> None:
@@ -507,49 +522,230 @@ def resample_label_map_to_original(
 
 
 # ---------------------------------------------------------------------------
+# V0.3 robust anatomy ROI helpers (4-Layer pipeline).
+# ---------------------------------------------------------------------------
+def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
+                                        hu_threshold=200.0,
+                                        min_component_voxels=10000):
+    """Layer 1: 학습-분포-독립적 anatomy ROI 분해 (bone HU mask 기반).
+
+    PENGWIN CT 의 골격 부분은 HU>200 으로 신뢰성 있게 segment 가능.
+    Ds532 가 OOD 케이스에서 실패해도, 이 함수는 항상 합리적인
+    Sacrum/LeftHip/RightHip ROI 를 추출함.
+
+    Args:
+        arr_clipped: (Z, Y, X) HU 값 (이미 [-1000, 2000] clip 됨)
+        spacing_zyx: physical spacing (z, y, x) mm
+        hu_threshold: bone 으로 간주할 최소 HU
+        min_component_voxels: 너무 작은 CC 무시
+
+    Returns:
+        dict[str, np.ndarray] — anatomy 별 mask (LPS frame).
+        Sacrum: 중앙 CC, LeftHip: +x 쪽, RightHip: -x 쪽.
+        실패시 빈 dict 반환.
+    """
+    import scipy.ndimage as ndi
+    bone_mask = arr_clipped > float(hu_threshold)
+    # Morphology: noise 제거 + small gap close
+    bone_mask = ndi.binary_opening(bone_mask, structure=np.ones((2, 2, 2), dtype=bool), iterations=1)
+    labels, n_cc = ndi.label(bone_mask, structure=np.ones((3, 3, 3), dtype=bool))
+    if n_cc == 0:
+        return {}
+    # CC 크기 순으로 sort
+    sizes = ndi.sum(bone_mask, labels, index=np.arange(1, n_cc + 1))
+    sorted_idx = np.argsort(sizes)[::-1]
+    top_cc_ids = [int(sorted_idx[i]) + 1 for i in range(min(5, n_cc)) if sizes[sorted_idx[i]] >= min_component_voxels]
+    if not top_cc_ids:
+        return {}
+    # 각 CC 의 centroid (z, y, x)
+    centroids_raw = ndi.center_of_mass(bone_mask, labels, top_cc_ids)
+    # Normalize centroids_raw to a list of 3-tuples regardless of scipy version / len-1 collapse.
+    if len(top_cc_ids) == 1:
+        # scipy returns a single tuple when given 1 index — wrap in list
+        if isinstance(centroids_raw, tuple) and len(centroids_raw) == 3 and not isinstance(centroids_raw[0], tuple):
+            centroids = [centroids_raw]
+        else:
+            centroids = list(centroids_raw)
+    else:
+        centroids = list(centroids_raw)
+    # x-centroid 로 좌/중/우 분류 (LPS: +x = patient left)
+    x_dim = float(arr_clipped.shape[2])
+    cc_info = []
+    for i, cc_id in enumerate(top_cc_ids):
+        c = centroids[i]
+        if not (hasattr(c, '__len__') and len(c) == 3):
+            log(f"bone-skeleton: CC {cc_id} centroid malformed ({c}), skipping")
+            continue
+        cz, cy, cx = float(c[0]), float(c[1]), float(c[2])
+        cc_info.append({
+            'cc_id': int(cc_id),
+            'cx': float(cx),
+            'cy': float(cy),
+            'cz': float(cz),
+            'size': int(sizes[cc_id - 1]),
+        })
+    # Sort by size desc
+    cc_info.sort(key=lambda d: -d['size'])
+
+    # 가장 큰 3 CC 사용; x-centroid 로 분류:
+    #   가장 중앙에 가까운 = Sacrum
+    #   +x (image left half) = LeftHip
+    #   -x (image right half) = RightHip
+    if len(cc_info) >= 3:
+        top3 = cc_info[:3]
+    else:
+        top3 = cc_info  # fewer than 3, best effort
+
+    # Image center x
+    cx_center = x_dim / 2.0
+    # 중앙성 = abs(cx - cx_center)
+    top3_sorted_by_centrality = sorted(top3, key=lambda d: abs(d['cx'] - cx_center))
+    if len(top3_sorted_by_centrality) >= 1:
+        sacrum_cc = top3_sorted_by_centrality[0]
+    else:
+        sacrum_cc = None
+
+    remaining = [d for d in top3 if d['cc_id'] != (sacrum_cc['cc_id'] if sacrum_cc else None)]
+    if len(remaining) >= 2:
+        remaining.sort(key=lambda d: d['cx'])  # ascending by x
+        righthip_cc = remaining[0]   # smaller x = patient right (LPS)
+        lefthip_cc = remaining[-1]   # larger x = patient left (LPS)
+    elif len(remaining) == 1:
+        # only 1 hip CC visible — assign by centroid sign
+        only_hip = remaining[0]
+        if only_hip['cx'] < cx_center:
+            righthip_cc = only_hip
+            lefthip_cc = None
+        else:
+            lefthip_cc = only_hip
+            righthip_cc = None
+    else:
+        lefthip_cc = righthip_cc = None
+
+    masks = {}
+    if sacrum_cc is not None:
+        masks['Sacrum'] = (labels == sacrum_cc['cc_id'])
+    if lefthip_cc is not None:
+        masks['LeftHip'] = (labels == lefthip_cc['cc_id'])
+    if righthip_cc is not None:
+        masks['RightHip'] = (labels == righthip_cc['cc_id'])
+    log(f"bone-skeleton: {len(masks)} anatomies extracted ({list(masks.keys())})")
+    return masks
+
+
+def ds532_argmax_masks(probs_full):
+    """Layer 2 부분: Ds532 4-channel softmax 의 argmax 로 mutually-exclusive
+    anatomy mask 추출. independent threshold 의 over-coverage 문제 회피.
+
+    Args:
+        probs_full: (4, Z, Y, X) softmax probabilities.
+
+    Returns:
+        dict[str, np.ndarray] — anatomy mask (서로 disjoint).
+    """
+    argmax_map = np.argmax(probs_full, axis=0)  # (Z, Y, X), 0=bg, 1=sacrum, 2=lh, 3=rh
+    masks = {}
+    for anatomy, ch_idx in V5_DATASET532_PROB_CHANNEL.items():
+        masks[anatomy] = (argmax_map == ch_idx)
+    return masks
+
+
+def merge_masks_with_sanity(ds532_masks, bone_masks, image_shape,
+                            sanity_max_fraction=0.35,
+                            bone_fallback_when_sanity_fails=True):
+    """Layer 2+3: Ds532 mask 와 bone-skeleton mask 결합 + sanity check.
+
+    각 anatomy 별로:
+      1) Ds532 mask 의 voxel 비율 < sanity_max_fraction 이면 Ds532 사용 (refined)
+      2) sanity 실패 → bone skeleton mask 로 fallback (있으면)
+      3) 둘 다 실패 → 해당 anatomy skip (그 라벨 zero output)
+
+    Returns:
+        dict[str, dict] — { anatomy: { 'mask': arr, 'source': 'ds532' | 'bone' | 'none' } }
+    """
+    img_voxels = float(np.prod(image_shape))
+    out = {}
+    for anatomy in ('Sacrum', 'LeftHip', 'RightHip'):
+        ds_mask = ds532_masks.get(anatomy)
+        bone_mask = bone_masks.get(anatomy)
+        ds_fraction = float(ds_mask.sum()) / img_voxels if ds_mask is not None else 1.0
+        if ds_mask is not None and ds_fraction < sanity_max_fraction:
+            out[anatomy] = {'mask': ds_mask, 'source': 'ds532', 'fraction': ds_fraction}
+        elif bone_mask is not None and bone_fallback_when_sanity_fails:
+            bone_fraction = float(bone_mask.sum()) / img_voxels
+            out[anatomy] = {'mask': bone_mask, 'source': 'bone_fallback', 'fraction': bone_fraction}
+            log(f"[{anatomy}] Ds532 sanity fail (covers {ds_fraction*100:.1f}%), bone-skeleton fallback ({bone_fraction*100:.1f}%)")
+        else:
+            out[anatomy] = {'mask': None, 'source': 'none', 'fraction': ds_fraction}
+            log(f"[{anatomy}] both Ds532 ({ds_fraction*100:.1f}%) and bone skeleton failed — anatomy will be zero")
+    return out
+
+
+def estimate_v291_inference_seconds(bbox, patch_size=(224, 160, 192), seconds_per_patch=2.5):
+    """Layer 3: V291 sliding-window inference 시간 대략 추정.
+
+    nnUNet 의 sliding window 는 tile_step_size=0.5 라 patch 의 50% 씩 이동.
+    크기 별 patch 개수 = ceil((dim - patch) / (patch * 0.5)) + 1
+    """
+    if bbox is None:
+        return 0.0
+    crop_z = bbox[0].stop - bbox[0].start
+    crop_y = bbox[1].stop - bbox[1].start
+    crop_x = bbox[2].stop - bbox[2].start
+    pz, py, px = patch_size
+    n_z = max(1, int(np.ceil(max(0, crop_z - pz) / (pz * 0.5)) + 1))
+    n_y = max(1, int(np.ceil(max(0, crop_y - py) / (py * 0.5)) + 1))
+    n_x = max(1, int(np.ceil(max(0, crop_x - px) / (px * 0.5)) + 1))
+    n_patches = n_z * n_y * n_x
+    return float(n_patches) * float(seconds_per_patch)
+
+
+# ---------------------------------------------------------------------------
 # Per-anatomy V291 inference pipeline.
 # ---------------------------------------------------------------------------
 def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
-    """Full V0.2 pipeline: Ds532 anatomy classifier -> per-anatomy V291 ABBC inference.
+    """V0.3 robust pipeline:
+       Layer 1: bone-skeleton anatomy decomposition (HU>200)  — 항상 실행
+       Layer 2: Ds532 argmax refinement                       — 가능하면 사용
+       Layer 3: bbox sanity + time budget                     — 안전망
+       Layer 4: V291 per-anatomy ABBC inference + decode + paste
 
-    Femur (151-200) is still NOT modeled in V0; this returns a label map sized
-    to ref_img with only Sacrum (1-50) / LeftHip (51-100) / RightHip (101-150)
-    fragments populated.
+    Femur (151-200) 은 V0.2 와 동일하게 emit zero.
     """
-    # --- Step 1: canonicalize CT to LPS + bone-window clip + LUT-normalize. ---
+    import time
+    t_start = time.time()
+
+    # === Step 1: LPS canonicalize + bone-window clip ===
     img_lps, arr_clipped = canonicalize_and_clip_image(ref_img)
     image_npy_lps = arr_clipped.astype(np.float32, copy=False)
     ct_lut_full = bone_lut_normalize(arr_clipped)
-
     spacing_xyz = img_lps.GetSpacing()
     spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
-    log(
-        f"pelvic LPS preproc: shape={image_npy_lps.shape} "
-        f"spacing_zyx={spacing_zyx} hu_clip=[{BONE_HU_RANGE[0]},{BONE_HU_RANGE[1]}]"
-    )
+    img_shape = image_npy_lps.shape
+    log(f"V0.3 preproc: shape={img_shape} spacing_zyx={spacing_zyx}")
 
-    # --- Step 2: Dataset532 anatomy classifier (full CT, 1-channel HU input). ---
+    # === Layer 1: Bone-skeleton anatomy decomposition (always) ===
+    bone_masks = bone_skeleton_anatomy_decomposition(
+        arr_clipped, spacing_zyx,
+        hu_threshold=BONE_HU_THRESHOLD,
+        min_component_voxels=BONE_MIN_COMPONENT_VOXELS,
+    )
+    log(f"L1 bone-skeleton: {list(bone_masks.keys())}")
+
+    # === Step 2: Ds532 predict (full CT, 1-channel HU input) ===
     ds532_predictor = build_predictor(
         DS532_DATASET, DS532_TRAINER, DS532_PLANS, DS532_CONFIG, DS532_FOLD,
     )
-    ds532_image_4d = image_npy_lps[None]  # (1, Z, Y, X) raw HU; CTNormalization handles z-score.
+    ds532_image_4d = image_npy_lps[None]
     ds532_props = {"spacing": list(spacing_zyx)}
-    log(f"ds532 predict: image (C,Z,Y,X)={ds532_image_4d.shape}")
+    log(f"L2 Ds532 predict: image (C,Z,Y,X)={ds532_image_4d.shape}")
     ds532_logits_pp, ds532_data_props = predict_logits_full(
         ds532_predictor, ds532_image_4d, ds532_props, output_channels=DS532_OUTPUT_CHANNELS,
     )
     ds532_probs_pp = softmax_axis0(ds532_logits_pp)
-    log(f"ds532 predict: probs shape (preprocessed) = {ds532_probs_pp.shape}")
-
-    # Resample each anatomy probability channel back to the original CT grid.
-    # We re-use the integer label-map resampler with a (prob*255) trick: the
-    # resampler does nearest for label_in but actually accepts a float buffer
-    # and runs linear order=1 z-order=0 anyway. For probability, we want
-    # linear interpolation, so we call a dedicated path that mirrors nnUNet's
-    # export_prediction (probability resample is order=1 / order_z=0 linear).
-    from nnunetv2.preprocessing.resampling.default_resampling import (
-        resample_data_or_seg_to_shape,
-    )
+    # Resample probs back to original CT grid (linear)
+    from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
+    from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
     shape_after_cropping = tuple(int(s) for s in ds532_data_props["shape_after_cropping_and_before_resampling"])
     current_spacing = ds532_predictor.configuration_manager.spacing
     transpose_forward = ds532_predictor.plans_manager.transpose_forward
@@ -557,119 +753,153 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
     original_spacing = [ds532_data_props["spacing"][i] for i in transpose_forward]
     probs_resampled_axes = resample_data_or_seg_to_shape(
         ds532_probs_pp.astype(np.float32, copy=False),
-        shape_after_cropping,
-        current_spacing,
-        original_spacing,
-        is_seg=False,
-        order=1,
-        order_z=0,
-    )  # shape: (C, *shape_after_cropping) in plans axis order.
-
-    # Paste into the full pre-cropping volume.
-    from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
+        shape_after_cropping, current_spacing, original_spacing,
+        is_seg=False, order=1, order_z=0,
+    )
     shape_before_cropping = tuple(int(s) for s in ds532_data_props["shape_before_cropping"])
     bbox_used = ds532_data_props.get("bbox_used_for_cropping", None)
-    probs_full_axes = np.zeros(
-        (DS532_OUTPUT_CHANNELS, *shape_before_cropping), dtype=np.float32,
-    )
+    probs_full_axes = np.zeros((DS532_OUTPUT_CHANNELS, *shape_before_cropping), dtype=np.float32)
     if bbox_used is None:
         probs_full_axes = np.asarray(probs_resampled_axes, dtype=np.float32)
     else:
         slicer = bounding_box_to_slice(bbox_used)
         probs_full_axes[(slice(None), *slicer)] = np.asarray(probs_resampled_axes, dtype=np.float32)
-
-    # Set background prob = 1 outside any anatomy where we filled zeros so
-    # the channel sum stays ≈ 1 (not strictly required for the downstream
-    # thresholding, but safer).
+    # Set bg=1 where fg is empty (outside cropping bbox)
     fg_sum = probs_full_axes[1:].sum(axis=0)
     bg_mask = fg_sum < 1e-6
     if bg_mask.any():
         probs_full_axes[0][bg_mask] = 1.0
+    probs_full = np.transpose(probs_full_axes, (0, *(int(a) + 1 for a in transpose_backward)))
+    assert probs_full.shape[1:] == img_shape, f"shape mismatch: {probs_full.shape[1:]} vs {img_shape}"
 
-    # Undo plans.transpose_forward so axes match the SimpleITK (Z, Y, X) order.
-    probs_full = np.transpose(
-        probs_full_axes, (0, *(int(a) + 1 for a in transpose_backward)),
+    # === Layer 2: Ds532 argmax-based anatomy masks ===
+    ds532_masks = ds532_argmax_masks(probs_full)
+    log(f"L2 Ds532 argmax: " + ", ".join(f"{a}={ds532_masks[a].sum()}" for a in ['Sacrum','LeftHip','RightHip']))
+
+    # === Layer 2+3: Merge with sanity ===
+    merged = merge_masks_with_sanity(
+        ds532_masks, bone_masks, img_shape,
+        sanity_max_fraction=SANITY_MAX_BBOX_FRACTION,
+        bone_fallback_when_sanity_fails=V03_USE_BONE_SKELETON_FALLBACK,
     )
-    if probs_full.shape[1:] != image_npy_lps.shape:
-        raise RuntimeError(
-            f"ds532 probs shape {probs_full.shape[1:]} != CT shape {image_npy_lps.shape}"
-        )
 
-    # Free Ds532 predictor before loading V291 (T4 has 16 GiB).
-    del ds532_predictor, ds532_logits_pp, ds532_probs_pp
+    # Free Ds532 before V291
+    del ds532_predictor, ds532_logits_pp, ds532_probs_pp, probs_resampled_axes, probs_full_axes
     import gc, torch
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # --- Step 3: V291 per-anatomy inference. ---
+    # === Layer 4: V291 per-anatomy inference + decode + paste ===
     v291_predictor = build_predictor(
         V291_DATASET, V291_TRAINER, V291_PLANS, V291_CONFIG, V291_FOLD,
     )
 
-    full_label = np.zeros(image_npy_lps.shape, dtype=np.uint16)
+    full_label = np.zeros(img_shape, dtype=np.uint16)
     for anatomy in ("Sacrum", "LeftHip", "RightHip"):
-        prob_channel = V5_DATASET532_PROB_CHANNEL[anatomy]
-        anatomy_prob = probs_full[prob_channel]  # (Z, Y, X)
-        anatomy_mask = anatomy_prob >= ANATOMY_PROB_THRESHOLD
-        bbox = bbox_from_mask(anatomy_mask, pad_vox=ROI_PAD_VOX)
-        if bbox is None:
-            log(f"[{anatomy}] empty Ds532 anatomy mask (>={ANATOMY_PROB_THRESHOLD}); skipping")
+        elapsed = time.time() - t_start
+        if V03_USE_TIME_BUDGET and elapsed >= TIME_BUDGET_HARD_LIMIT:
+            log(f"[{anatomy}] HARD time budget hit at {elapsed:.0f}s, emit zero for this and remaining anatomies")
+            break
+
+        info = merged[anatomy]
+        if info['mask'] is None:
+            log(f"[{anatomy}] no usable mask, emit zero")
             continue
+
+        mask = info['mask']
+        # Largest CC only (noise filtering)
+        if LARGEST_CC_KEEP_ONLY:
+            import scipy.ndimage as ndi
+            cc_labels, n_cc = ndi.label(mask, structure=np.ones((3,3,3), dtype=bool))
+            if n_cc > 1:
+                sizes = ndi.sum(mask, cc_labels, index=np.arange(1, n_cc+1))
+                keep_idx = int(np.argmax(sizes)) + 1
+                mask = (cc_labels == keep_idx)
+
+        bbox = bbox_from_mask(mask, pad_vox=ROI_PAD_VOX)
+        if bbox is None:
+            log(f"[{anatomy}] mask empty after CC filter, emit zero")
+            continue
+
+        # NEW (FIX #2): post-pad bbox sanity — even if mask is small, the padded
+        # bbox can blow up on tight-FOV inputs. If bbox covers >50% of volume
+        # the V291 inference will be slow and the result will be unreliable.
+        bbox_fraction = float(np.prod([bbox[i].stop - bbox[i].start for i in range(3)])) / float(np.prod(img_shape))
+        if bbox_fraction > SANITY_MAX_POSTPAD_BBOX_FRACTION:
+            log(f"[{anatomy}] bbox covers {bbox_fraction*100:.1f}% (>{SANITY_MAX_POSTPAD_BBOX_FRACTION*100:.0f}%); "
+                f"shrinking pad_vox to keep bbox under threshold")
+            # Try smaller pad
+            for shrunk_pad in (12, 6, 0):
+                bbox_try = bbox_from_mask(mask, pad_vox=shrunk_pad)
+                if bbox_try is None:
+                    continue
+                bbox_fraction_try = float(np.prod([bbox_try[i].stop - bbox_try[i].start for i in range(3)])) / float(np.prod(img_shape))
+                if bbox_fraction_try <= SANITY_MAX_POSTPAD_BBOX_FRACTION:
+                    log(f"[{anatomy}] shrunk pad_vox={shrunk_pad}, new bbox fraction={bbox_fraction_try*100:.1f}%")
+                    bbox = bbox_try
+                    bbox_fraction = bbox_fraction_try
+                    break
+            else:
+                log(f"[{anatomy}] even pad=0 bbox is too large ({bbox_fraction*100:.1f}%); emit zero")
+                continue
+
+        # Time estimate sanity
+        eta = estimate_v291_inference_seconds(bbox)
+        bbox_fraction = float(np.prod([bbox[i].stop - bbox[i].start for i in range(3)])) / float(np.prod(img_shape))
+        log(f"[{anatomy}] bbox crop={tuple(bbox[i].stop - bbox[i].start for i in range(3))} "
+            f"fraction={bbox_fraction*100:.1f}% source={info['source']} ETA={eta:.0f}s elapsed={elapsed:.0f}s")
+
+        if V03_USE_TIME_BUDGET and (elapsed + eta) > TIME_BUDGET_SECONDS:
+            log(f"[{anatomy}] elapsed+ETA={elapsed+eta:.0f}s > budget {TIME_BUDGET_SECONDS}s, emit zero")
+            continue
+
+        # Build 3-channel V291 input
         ct_lut_crop = ct_lut_full[bbox]
-        prob_crop = anatomy_prob[bbox]
+        # Channel 1: Ds532 anatomy probability (clipped to [0,1])
+        prob_crop = probs_full[V5_DATASET532_PROB_CHANNEL[anatomy]][bbox] if info['source'] == 'ds532' else np.clip(mask[bbox].astype(np.float32), 0.0, 1.0)
+        # Channel 2: SDF from prob>=0.5 mask
         sdf_crop = selected_anatomy_sdf_from_prob(prob_crop, spacing_zyx, clip_mm=SDF_CLIP_MM)
         v291_image_4d = np.stack([ct_lut_crop, prob_crop, sdf_crop], axis=0)
         v291_props = {"spacing": list(spacing_zyx)}
-        log(
-            f"[{anatomy}] V291 predict: bbox={[(s.start, s.stop) for s in bbox]} "
-            f"crop_shape={ct_lut_crop.shape}"
-        )
+
+        # V291 inference
         v291_logits_pp, v291_data_props = predict_logits_full(
             v291_predictor, v291_image_4d, v291_props, output_channels=V291_OUTPUT_CHANNELS,
         )
         v291_probs = softmax_axis0(v291_logits_pp)
         decoded_pp = decode_abbc_core_seed_watershed(v291_probs)
-        n_local = int(len([v for v in np.unique(decoded_pp) if int(v) > 0]))
-        log(f"[{anatomy}] decode: {n_local} fragments at preprocessed grid")
+        decoded_crop = resample_label_map_to_original(decoded_pp, v291_data_props, v291_predictor)
 
-        # Resample integer label map back to ORIGINAL CROP grid (not full CT).
-        decoded_crop = resample_label_map_to_original(
-            decoded_pp, v291_data_props, v291_predictor,
-        )
-        if decoded_crop.shape != ct_lut_crop.shape:
-            log(
-                f"[{anatomy}] WARNING: resampled crop {decoded_crop.shape} != "
-                f"input crop {ct_lut_crop.shape}; using min-overlap paste"
-            )
-
-        # Relabel into the PENGWIN range for this anatomy.
+        # Relabel and paste
         lo, hi = V5_ANATOMY_RANGES[anatomy]
         n_slots = hi - lo + 1
         local_ids = sorted(int(v) for v in np.unique(decoded_crop) if int(v) > 0)
         if not local_ids:
-            log(f"[{anatomy}] no fragments after resample; skipping paste")
+            log(f"[{anatomy}] no fragments after decode")
             continue
-        remap = np.zeros(int(max(local_ids)) + 1, dtype=np.uint16)
+        # Keep only up to n_slots fragments (size-sorted)
+        if len(local_ids) > n_slots:
+            sizes_local = [(lid, int((decoded_crop == lid).sum())) for lid in local_ids]
+            sizes_local.sort(key=lambda x: -x[1])
+            local_ids = [t[0] for t in sizes_local[:n_slots]]
+        remap = np.zeros(max(local_ids) + 1, dtype=np.uint16)
         for i, old_id in enumerate(local_ids):
-            slot = i if i < n_slots else (n_slots - 1)  # collapse overflow into last slot.
-            remap[old_id] = np.uint16(lo + slot)
-        remapped_crop = remap[decoded_crop]
+            remap[old_id] = np.uint16(lo + i)
+        # Mask-out overflow IDs
+        decoded_crop_filtered = np.where(np.isin(decoded_crop, local_ids), decoded_crop, 0).astype(np.int32, copy=False)
+        # Clip filtered IDs to valid range to avoid index out of bounds
+        decoded_crop_filtered = np.clip(decoded_crop_filtered, 0, max(local_ids))
+        remapped_crop = remap[decoded_crop_filtered]
 
-        # Paste into full label, only over voxels that already 0.
         out_slot = full_label[bbox]
         write_mask = (remapped_crop > 0) & (out_slot == 0)
         out_slot[write_mask] = remapped_crop[write_mask]
         full_label[bbox] = out_slot
-        log(
-            f"[{anatomy}] painted {int(write_mask.sum())} voxels "
-            f"into range [{lo},{hi}] ({len(local_ids)} fragments)"
-        )
+        log(f"[{anatomy}] painted {int(write_mask.sum())} voxels, {len(local_ids)} fragments in range [{lo},{hi}]")
 
-    # --- Step 4: undo LPS reorientation so output aligns with the ORIGINAL ref_img. ---
+    # === Step 5: undo LPS reorientation if original was different ===
     if orientation_code(ref_img) != "LPS":
-        # Wrap full_label as a SimpleITK image in the LPS frame, then reorient
-        # back to the original orientation code.
         lps_label_img = sitk.GetImageFromArray(full_label.astype(np.uint16, copy=False))
         lps_label_img.SetSpacing(img_lps.GetSpacing())
         lps_label_img.SetOrigin(img_lps.GetOrigin())
@@ -678,6 +908,8 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
         oriented = sitk.DICOMOrient(lps_label_img, target_code)
         full_label = sitk.GetArrayFromImage(oriented).astype(np.uint16, copy=False)
         log(f"reoriented label map: LPS -> {target_code} (shape={full_label.shape})")
+
+    log(f"V0.3 pipeline complete in {time.time() - t_start:.1f}s, unique={sorted(int(v) for v in np.unique(full_label)[:20])}")
     return full_label
 
 
