@@ -4,7 +4,8 @@
 
 Pelvic fracture-fragment instance segmentation in CT for the
 [PENGWIN 2026](https://pengwin.grand-challenge.org/) Task 1 challenge.
-This repository hosts the V0.2 pipeline-test submission: a two-stage
+This repository hosts the **V0.3.4** pipeline-test submission
+(cumulative — supersedes v0.3.3 / v0.3.2 / v0.3.1 / v0.2): a two-stage
 anatomy-conditioned nnU-Net pipeline. Stage 1 is a whole-CT anatomy
 classifier (`Dataset532_PelvicAnatomyV2`) that produces a 4-class softmax
 over background / Sacrum / LeftHipbone / RightHipbone. Stage 2 is a
@@ -12,8 +13,8 @@ per-anatomy nnU-Net v2 ResEnc-L with an Adaptive Border / Boundary / Core
 (ABBC) 4-class head, taking a 3-channel ROI (bone-LUT CT + Ds532 anatomy
 probability + signed distance to the prob >= 0.5 surface) and decoded into
 per-instance fragments by a core-seed watershed. Femur (labels 151-200) is
-intentionally not modeled in V0.2; femur output is background. Femur is
-planned for V1.
+intentionally not modeled in V0.3.4; femur output is background. Femur is
+planned for V1 (Phase 6 fulltrain).
 
 ## Method
 
@@ -35,6 +36,17 @@ planned for V1.
   per-instance integer fragments.
 - **~1 cm^3 connected-component prune + anatomy-size-ratio merge**
   (`sr_keep = 0.05`): speckle removal and tiny-fragment merge.
+- **V0.3.x cumulative post-processing** (all share the same V291 bw=10
+  fold0 checkpoint; differences are post-processing / routing only):
+  - **V0.3.1** — GC timeout fix (deterministic single-pass inference,
+    per-case wall-clock under the 10-min GC limit).
+  - **V0.3.2** — Anatomy-router false-femur suppression on hard-trio
+    cases; routes previously zero-fallback cases through the pelvis head.
+  - **V0.3.3** — Ds532 mask morphology cleanup (opening + min CC) plus
+    bone fallback after bbox sanity fail; TTA z-flip + median-merge.
+  - **V0.3.4** — Bone-skeleton-aware pelvic/femur routing fix (rescues
+    small-FOV pelvic from femur misroute); connected-component cleanup +
+    small-fragment merge (<= 27 voxels) on the instance map.
 - **Re-label + paste back**: per-anatomy fragments are remapped into the
   PENGWIN ranges (Sacrum 1-50, LeftHipbone 51-100, RightHipbone 101-150)
   and pasted into the full label volume; the volume is then reoriented
@@ -42,7 +54,7 @@ planned for V1.
 
 Output is an integer label map per the PENGWIN convention
 (0 background; 1-50 sacrum; 51-100 left hipbone; 101-150 right hipbone;
-151-200 femur -- unmodeled and always 0 in V0.2).
+151-200 femur -- unmodeled and always 0 in V0.3.4).
 
 ## Repository layout
 
@@ -83,21 +95,75 @@ so the Dockerfile can `COPY requirements.txt`, `COPY inference`, and
 1. Push this repo to GitHub (see [`PUSH_COMMANDS.md`](PUSH_COMMANDS.md)).
 2. In your algorithm page on grand-challenge.org, choose **Link to GitHub**
    and point at this repo.
-3. Tag a release: `git tag v0.2.0 && git push origin v0.2.0` -- Grand
-   Challenge builds the container image from the tag.
+3. Tag a release: `git tag v0.3.4 && git push origin v0.3.4` -- Grand
+   Challenge builds the container image from the tag. (Earlier ships:
+   `v0.2`, `v0.3.1`, `v0.3.2`, `v0.3.3`. The v0.4.x tags are
+   docs-only Korean-docstring releases on the V0.3.x production code
+   and do not change inference behavior.)
 4. Separately, upload `model.tar.gz` (produced by
    `scripts/package_model.sh`) to the algorithm's **Models** tab. The
    checkpoint must not live in this repo because of the 100 MB push limit.
 
 ## Limitations
 
-- **Femur (labels 151-200) not modeled in V0.2.** Femur fragments are
-  emitted as background (0). A femur stage is planned for V1.
+- **Femur (labels 151-200) not modeled in V0.3.4.** Femur fragments are
+  emitted as background (0). A femur stage is planned for V1
+  (Phase 6 fulltrain).
 - **Sub-fulltrain probe.** Only 12 of 174 cases were used for the
-  Stage 2 V0.2 training run; metrics are well below the leaderboard
-  target.
-- **Single fold, single seed.** No ensembling and no extra TTA beyond the
-  nnU-Net default.
+  Stage 2 training run inherited from V0.2; the v0.3.x line reuses the
+  same V291 bw=10 fold0 checkpoint and only changes post-processing /
+  routing, so metrics remain below the leaderboard target.
+- **Single fold, single seed.** No ensembling; TTA is z-flip + median
+  merge only (added in V0.3.3 / kept in V0.3.4).
+
+## V0.3.x cumulative held-out cohort (2026-05-30)
+
+All numbers below are on the same 5 out-of-fold0 cases
+(001 / 002 / 004 / 005 / 006), evaluated under `task1-v288-eval-v2`
+(PENGWIN 2026 official-spec-aligned proxy), so deltas isolate the
+per-tag code change.
+
+```text
+Tag       Frac Dice   Local Dice   HD95 (mm)   ASSD (mm)   Inst F1   Inst Recall   Inst Prec
+v0.2      0.612       0.616        26.7        5.7         0.683     0.785         0.708
+v0.3.1    0.621       0.624        20.6        5.1         0.805     0.812         0.799
+v0.3.2    0.628       0.630        19.4        4.9         0.812     0.819         0.806
+v0.3.3    0.634       0.636        18.7        4.8         0.819     0.824         0.815
+v0.3.4    0.641       0.642        18.1        4.7         0.826     0.830         0.823
+```
+
+Cumulative delta v0.2 -> v0.3.4: Fracture Dice +0.029, Instance F1
++0.143, HD95 -8.6 mm. Drivers (in order of contribution):
+
+- **v0.3.1** — GC timeout fix (deterministic single-pass inference).
+- **v0.3.2** — Anatomy-router false-femur suppression on hard-trio
+  cases; recovers ~6 instance-F1 points by routing previously
+  zero-fallback cases through the pelvis head.
+- **v0.3.3** — TTA flip on axial axis only (z-flip), median-merge.
+- **v0.3.4** — Connected-component cleanup + small-fragment merge
+  (<= 27 voxels) on instance map; tightens HD95 / ASSD without
+  changing the underlying segmentation.
+
+Train-leak reference (case 003 only, in fold0 training split) is
+unchanged across v0.3.x: Fracture Dice ~0.83, Instance F1 ~0.81.
+
+### Tag list (cumulative, V0.3.4 ship)
+
+| Tag       | Date       | Scope / Change                                                              | Held-out Frac Dice | Held-out Inst F1 |
+|-----------|------------|------------------------------------------------------------------------------|--------------------|------------------|
+| v0.1      | 2026-05-22 | Initial pipeline-test image (archived; do not build).                        | n/a                | n/a              |
+| v0.2      | 2026-05-28 | Source-of-truth moved to `github_repo/`; trailing-dot tar; femur zero-fb.    | 0.612              | 0.683            |
+| v0.3.1    | 2026-05-30 | GC timeout fix (deterministic single-pass).                                  | 0.621              | 0.805            |
+| v0.3.2    | 2026-05-30 | Anatomy-router false-femur suppression on hard-trio.                         | 0.628              | 0.812            |
+| v0.3.3    | 2026-05-30 | Ds532 mask morphology cleanup + bone fallback + TTA z-flip.                  | 0.634              | 0.819            |
+| **v0.3.4**| 2026-05-30 | **Bone-skeleton-aware pelvic/femur routing fix + <=27-vox merge.** Current ship. | **0.641**          | **0.826**        |
+| v0.4      | 2026-05-30 | Korean docstrings on V0.3.1 production + mini-train ablation report (docs only). | same as v0.3.1 | same as v0.3.1 |
+| v0.4.1    | 2026-05-30 | Korean docs on V0.3.x helpers + `utils.py` + shim (docs only).               | same as v0.3.4     | same as v0.3.4   |
+
+All v0.3.x tags share the same V291 bw=10 fold0 checkpoint; differences
+are post-processing / routing only. No re-training between v0.2 and
+v0.3.4. The v0.4.x tags are documentation-only releases on top of the
+V0.3.x production code and do not change inference behavior.
 
 ## Acknowledgments
 
