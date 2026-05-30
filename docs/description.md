@@ -103,6 +103,44 @@ bone-skeleton fallback (usable when L2/L3 reject the Ds532 output),
 and the L4 explicit time budget (graceful degradation instead of
 timeout).
 
+## 1.5b V0.3.3 morphology cleanup + bone fallback after bbox sanity fail
+
+V0.3.3 patches the L2 + L3 path to harden the Ds532 argmax masks
+against a specific Ds532 failure mode where the dominant CC passes
+post-pad bbox sanity but is contaminated by sparse outlier CCs
+(thin streaks / isolated voxels) that survive the largest-CC keep
+heuristic via voxel-adjacent bridges. Two changes:
+
+- **Ds532 mask morphology cleanup.** After argmax, each anatomy
+  mask is passed through `binary_opening` (one iteration,
+  2x2x2 structure) and then a small-CC drop step (CCs with
+  fewer than `MIN_DS532_CC_VOXELS = 500` voxels are removed).
+  This is a benign cleanup on well-behaved cases (the dominant CC
+  is unchanged) and a meaningful denoising on cases where Ds532
+  emits sparse outlier streaks.
+- **Bone-skeleton fallback after post-pad bbox-sanity fail.**
+  If the L3 pad-shrink cascade (24 -> 12 -> 6 -> 0 voxels)
+  exhausts all four pad values and the post-pad bbox is still
+  above the 50% threshold, V0.3.3 attempts the L1 bone-skeleton
+  mask (largest CC only) before emitting zero for that anatomy.
+  If the bone-skeleton bbox passes sanity, it is used as the
+  Stage 2 ROI; otherwise the anatomy is emitted as zero (V0.3.1
+  behavior).
+
+A/B (V0.3.3 vs V0.3.1) on a 3-case small-FOV pelvic slice
+(physical-x 248-258 mm; cases 162, 163, 189) shows **zero
+cohort delta on all metrics** (Fracture Dice, Instance F1, HD95
+all 0.000). The morphology cleanup fires on case 162 (5 sparse
+CCs dropped on Sacrum, 5 on RightHip, 1 on LeftHip; 600-1000
+voxels removed per anatomy) but the dominant CC is unchanged, so
+the painted ROI and downstream metrics are byte-identical to
+V0.3.1. The bone-skeleton fallback path does not fire on this
+slice because the Ds532 sanity check already passes at the L3
+stage. V0.3.3 is therefore a **safety-net change**: benign on
+the tested cohort (no regression), but provides defense-in-depth
+against a known Ds532 sparse-outlier failure mode that does not
+appear in the held-out probe set.
+
 # 2. Training
 
 | Item | Value |

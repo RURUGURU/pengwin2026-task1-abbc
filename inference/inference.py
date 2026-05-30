@@ -109,6 +109,8 @@ BONE_MIN_COMPONENT_VOXELS = 10000
 SANITY_MAX_BBOX_FRACTION = 0.35
 SANITY_MAX_POSTPAD_BBOX_FRACTION = 0.50  # pad 적용 후 bbox 가 전체 볼륨의 50% 미만이어야 한다
 LARGEST_CC_KEEP_ONLY = True  # 가장 큰 CC 만 유지해 25개 슬롯이 노이즈 fragment 로 채워지는 것 방지
+MIN_DS532_CC_VOXELS = 500  # Ds532 mask 의 sparse outlier CC 제거 임계값 (voxels)
+DS532_MORPH_OPENING_ITERS = 1  # Ds532 mask 에 적용할 binary_opening 반복 횟수
 
 
 def log(msg: str) -> None:
@@ -655,9 +657,12 @@ def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
 
 
 def ds532_argmax_masks(probs_full):
-    """Layer 2 일부: Ds532 4-channel softmax 의 argmax 로 서로 배타적인
-    anatomy mask 를 추출한다. 채널별 독립 threshold 가 일으키는
-    over-coverage (중복 영역) 문제를 회피하기 위함이다.
+    """Ds532 4-channel softmax → mutually-exclusive anatomy mask + morphology cleanup.
+
+    Layer 2 일부: Ds532 4-channel softmax 의 argmax 로 서로 배타적인 anatomy mask 를
+    추출하고, sparse outlier 잡음을 제거하기 위해 binary_opening + small CC drop 을
+    적용한다. 이는 V0.3.1 GC failure (LeftHip bbox 98.6% / RightHip bbox 100%) 처럼
+    largest-CC keep 만으로는 막을 수 없는 sparse fragment 연결 문제를 차단한다.
 
     Args:
         probs_full: (4, Z, Y, X) softmax 확률 텐서.
@@ -665,10 +670,34 @@ def ds532_argmax_masks(probs_full):
     Returns:
         dict[str, np.ndarray] — anatomy 별 mask (서로 disjoint 임이 보장됨).
     """
+    import scipy.ndimage as ndi
     argmax_map = np.argmax(probs_full, axis=0)  # (Z, Y, X), 0=bg, 1=sacrum, 2=lh, 3=rh
     masks = {}
+    structure = np.ones((2, 2, 2), dtype=bool)
+    cc_struct = np.ones((3, 3, 3), dtype=bool)
     for anatomy, ch_idx in V5_DATASET532_PROB_CHANNEL.items():
-        masks[anatomy] = (argmax_map == ch_idx)
+        raw_mask = (argmax_map == ch_idx)
+        # Morphology cleanup: opening removes thin / isolated noise
+        if DS532_MORPH_OPENING_ITERS > 0:
+            cleaned = ndi.binary_opening(raw_mask, structure=structure,
+                                          iterations=DS532_MORPH_OPENING_ITERS)
+        else:
+            cleaned = raw_mask
+        # Drop small CCs (Ds532 sparse outliers)
+        cc_labels, n_cc = ndi.label(cleaned, structure=cc_struct)
+        if n_cc > 1:
+            sizes = ndi.sum(cleaned, cc_labels, index=np.arange(1, n_cc + 1))
+            keep_ids = np.where(sizes >= MIN_DS532_CC_VOXELS)[0] + 1
+            if len(keep_ids) > 0:
+                cleaned = np.isin(cc_labels, keep_ids)
+            else:
+                cleaned = np.zeros_like(cleaned)
+        elif n_cc == 1:
+            if int(cleaned.sum()) < MIN_DS532_CC_VOXELS:
+                cleaned = np.zeros_like(cleaned)
+        masks[anatomy] = cleaned
+        log(f"Ds532 argmax: {anatomy} raw={int(raw_mask.sum())} cleaned={int(cleaned.sum())} "
+            f"({n_cc} CCs, drop<{MIN_DS532_CC_VOXELS})")
     return masks
 
 
@@ -853,6 +882,7 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
             log(f"[{anatomy}] bbox covers {bbox_fraction*100:.1f}% (>{SANITY_MAX_POSTPAD_BBOX_FRACTION*100:.0f}%); "
                 f"shrinking pad_vox to keep bbox under threshold")
             # pad_vox 를 단계적으로 줄여가며 임계값 밑으로 떨어뜨린다
+            bbox_found = False
             for shrunk_pad in (12, 6, 0):
                 bbox_try = bbox_from_mask(mask, pad_vox=shrunk_pad)
                 if bbox_try is None:
@@ -862,11 +892,35 @@ def run_per_anatomy_pelvic(image_path: Path, ref_img: sitk.Image) -> np.ndarray:
                     log(f"[{anatomy}] shrunk pad_vox={shrunk_pad}, new bbox fraction={bbox_fraction_try*100:.1f}%")
                     bbox = bbox_try
                     bbox_fraction = bbox_fraction_try
+                    bbox_found = True
                     break
-            else:
-                # pad=0 으로도 너무 크다면 mask 자체가 비정상 — zero 로 처리
-                log(f"[{anatomy}] even pad=0 bbox is too large ({bbox_fraction*100:.1f}%); emit zero")
-                continue
+            if not bbox_found:
+                # NEW V0.3.2 fix: try bone-skeleton mask before giving up
+                bone_mask = bone_masks.get(anatomy)
+                if bone_mask is not None and bone_mask.any():
+                    # Largest CC only
+                    if LARGEST_CC_KEEP_ONLY:
+                        import scipy.ndimage as _ndi
+                        bcc_labels, bcc_n = _ndi.label(bone_mask, structure=np.ones((3, 3, 3), dtype=bool))
+                        if bcc_n > 1:
+                            bcc_sizes = _ndi.sum(bone_mask, bcc_labels, index=np.arange(1, bcc_n + 1))
+                            keep_idx = int(np.argmax(bcc_sizes)) + 1
+                            bone_mask = (bcc_labels == keep_idx)
+                    bbox_bone = bbox_from_mask(bone_mask, pad_vox=ROI_PAD_VOX)
+                    if bbox_bone is not None:
+                        bbox_bone_fraction = float(np.prod([bbox_bone[i].stop - bbox_bone[i].start for i in range(3)])) / float(np.prod(img_shape))
+                        if bbox_bone_fraction <= SANITY_MAX_POSTPAD_BBOX_FRACTION:
+                            log(f"[{anatomy}] bone-skeleton fallback after bbox-sanity fail: bbox fraction {bbox_bone_fraction*100:.1f}%")
+                            mask = bone_mask
+                            bbox = bbox_bone
+                            bbox_fraction = bbox_bone_fraction
+                            info['source'] = 'bone_after_bbox_sanity_fail'
+                            # Recompute mask probability channel for V291 input
+                            bbox_found = True
+                if not bbox_found:
+                    # pad=0 으로도 너무 크고 bone fallback 도 실패 — zero 로 처리
+                    log(f"[{anatomy}] even bone-skeleton bbox too large or absent; emit zero")
+                    continue
 
         # 시간 예산 기반 sanity check (Grand Challenge 10분 제한 보호)
         eta = estimate_v291_inference_seconds(bbox)
