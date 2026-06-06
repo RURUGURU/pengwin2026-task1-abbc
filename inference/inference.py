@@ -51,8 +51,8 @@ import numpy as np
 import SimpleITK as sitk
 
 
-INPUT_DIR = Path("/input/images/peripelvic-fracture-ct")
-OUTPUT_DIR = Path("/output/images/peripelvic-fracture-ct-segmentation")
+INPUT_DIR = Path(os.environ.get("PENGWIN_INPUT_DIR", "/input/images/peripelvic-fracture-ct"))
+OUTPUT_DIR = Path(os.environ.get("PENGWIN_OUTPUT_DIR", "/output/images/peripelvic-fracture-ct-segmentation"))
 
 # Grand Challenge 의 모델 디렉터리 경로.
 # model.tar.gz 는 trailing-dot convention (`tar -C model_payload -czf model.tar.gz .`)
@@ -867,14 +867,24 @@ def route_from_ds539_masks(ds539_masks: dict,
             ('femur',  ('Femur',))                         — femur 케이스
             ('pelvic', ('Sacrum','LeftHip','RightHip'))    — pelvic 케이스
     """
-    femur_vox = int(ds539_masks.get("Femur", np.zeros(0)).sum()) if "Femur" in ds539_masks else 0
-    pelvic_vox = sum(int(ds539_masks[a].sum()) for a in PELVIC_ANATOMIES if a in ds539_masks)
-    ratio = femur_vox / float(max(pelvic_vox, 1))
-    if ratio > float(ratio_threshold):
-        log(f"route_from_ds539: femur/pelvic={ratio:.3f} > {ratio_threshold} -> FEMUR")
-        return "femur", ("Femur",)
-    log(f"route_from_ds539: femur/pelvic={ratio:.3f} <= {ratio_threshold} -> PELVIC")
-    return "pelvic", PELVIC_ANATOMIES
+    # [2026-06-06] Single femur-vs-pelvic ratio gate was catastrophically brittle:
+    # Ds539's marginal training hallucinates the cross-group anatomy, and ~25% of
+    # cases (both directions) flipped past the 0.45 threshold -> the entire case
+    # routed to the WRONG set -> 0 score (verified e2e: 251/254 femur->pelvic,
+    # 011 pelvic->femur). Robust fix: process EVERY anatomy whose Ds539 mask is a
+    # substantial fraction of the largest present mask. The genuinely-present
+    # anatomy is always kept (no misroute -> 0); a small hallucination is dropped
+    # by the fraction gate, and a sizable one becomes a minor FP, never a zero.
+    sizes = {a: int(ds539_masks[a].sum()) for a in ALL_ANATOMIES
+             if a in ds539_masks and ds539_masks[a] is not None}
+    biggest = max(sizes.values(), default=0)
+    if biggest <= 0:
+        log("route_from_ds539(multi): no Ds539 mask -> pelvic fallback")
+        return "pelvic", PELVIC_ANATOMIES
+    keep_frac = float(os.environ.get("PENGWIN_ROUTE_KEEP_FRAC", "0.20"))
+    kept = tuple(a for a in ALL_ANATOMIES if sizes.get(a, 0) >= keep_frac * biggest)
+    log(f"route_from_ds539(multi): sizes={sizes} keep>={keep_frac:.2f}x{biggest} -> {kept}")
+    return "multi", kept
 
 
 # ---------------------------------------------------------------------------
