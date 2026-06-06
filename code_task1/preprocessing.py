@@ -39,9 +39,18 @@ from utils import (
     ABBC_OFFICIAL_LABELS, ABBC_BORDER_LABEL, ABBC_CORE_LABEL,
     audit_official_target, compute_abbc_official_target, get_contact_surface_regions,
     BFV3_LABELS, BFV3_CLASS_NAMES, BoundaryFragmentParams, compute_boundary_fragment_target,
-    BICMV5Params, V5_ANATOMY_RANGES, V5_LABELS, V5_TARGET_PROFILES,
+    BICMV5Params, V5_ANATOMY_RANGES, V5_ANATOMY_RANGES_WITH_FEMUR,
+    V5_LABELS, V5_TARGET_PROFILES,
     anatomy_range, anatomy_mask_from_instances, bbox_from_mask, compute_bicm_v5_target,
     label_distribution,
+)
+# Registry single source. The per-anatomy BICM V5 sidecar builder handles Femur
+# ROIs (151-200) so it uses the FULL view; legacy pelvic-only V3/V4 builders keep
+# the explicit pelvic_only=True view (their "drop femur" intent stays visible).
+from anatomy_registry import (
+    MAX_INSTANCE_ID,
+    PELVIC_MAX_INSTANCE_ID,
+    valid_instance_mask,
 )
 configure_nnunet_env()
 log = get_logger(__name__)
@@ -73,14 +82,19 @@ def _instance_labels_for_dataset(ds_id: int) -> dict[str, int]:
 
 def _pelvic_instance_target(inst: np.ndarray) -> np.ndarray:
     """Keep pelvic PENGWIN fragment IDs and drop femur/other labels."""
-    out = np.where((inst >= 1) & (inst <= 150), inst, 0)
+    out = np.where(valid_instance_mask(inst, pelvic_only=True), inst, 0)
     return out.astype(np.uint16, copy=False)
 
 
 V3_INPUT_VARIANTS = ("ct_hu", "ct_lut", "ct_lut_ifs", "ct_lut_anat_gate", "ct_anatprob")
 V4_INPUT_VARIANTS = ("ct_lut", "ct_hu", "ct_lut_ifs")
 V5_INPUT_VARIANTS = ("ct_lut", "ct_lut_anat_sdf")
-V5_DATASET532_PROB_CHANNEL = {"Sacrum": 1, "LeftHip": 2, "RightHip": 3}
+# [V0.x][FIX:B1+B2][2026-05-31] Dataset539 5-class anatomy 의 softmax 채널 인덱스.
+# Ds532 4-class (Sacrum=1/LeftHip=2/RightHip=3) 는 그대로 호환되고, Dataset539 의
+# 5-class (Femur=4) 채널이 추가된다. 본 dict 는 Dataset537 (3-anatomy) 과
+# Dataset538 (4-anatomy) 모두에서 anatomy-specific Ds532/539 prob 채널을 찾을 때
+# 사용된다.
+V5_DATASET532_PROB_CHANNEL = {"Sacrum": 1, "LeftHip": 2, "RightHip": 3, "Femur": 4}
 
 
 def _boundary_fragment_labels_for_dataset() -> dict[str, int]:
@@ -200,48 +214,12 @@ def _spacing_zyx(spacing_xyz: tuple[float, float, float] | list[float]) -> tuple
     return (sz, sy, sx)
 
 
-def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
-    """Keep one connected component from a binary mask using 26-connectivity."""
-    from scipy import ndimage as ndi
-
-    cc, n_cc = ndi.label(mask, structure=np.ones((3, 3, 3), dtype=np.uint8))
-    if n_cc <= 1:
-        return mask.astype(bool, copy=False)
-    sizes = ndi.sum(mask, cc, index=np.arange(1, n_cc + 1))
-    keep = int(np.argmax(sizes)) + 1
-    return cc == keep
 
 
-def _connected_component_count(mask: np.ndarray) -> int:
-    """Return 26-connected component count for a binary mask."""
-    from scipy import ndimage as ndi
-
-    _, n_cc = ndi.label(mask, structure=np.ones((3, 3, 3), dtype=np.uint8))
-    return int(n_cc)
 
 
-def _connected_component_count_bbox(mask: np.ndarray) -> int:
-    """Count components after cropping to foreground bbox.
-
-    ABBC target audits call this once per GT fragment. Running connected
-    components over the full CT volume for every tiny fragment is needlessly
-    expensive; cropping preserves the exact component count while turning a
-    minutes-long audit into a practical QA gate.
-    """
-    bbox = _mask_bbox(mask, pad=1)
-    if bbox is None:
-        return 0
-    return _connected_component_count(mask[bbox])
 
 
-def _mask_bbox(mask: np.ndarray, pad: int = 2) -> tuple[slice, slice, slice] | None:
-    """Return a small padded bbox around a binary mask in z/y/x order."""
-    coords = np.argwhere(mask)
-    if len(coords) == 0:
-        return None
-    mins = np.maximum(coords.min(axis=0) - int(pad), 0)
-    maxs = np.minimum(coords.max(axis=0) + int(pad) + 1, mask.shape)
-    return tuple(slice(int(a), int(b)) for a, b in zip(mins, maxs))
 
 
 def to_abbc_official_pelvis(label: np.ndarray) -> np.ndarray:
@@ -351,7 +329,7 @@ def _contact_hard_negative_target(img_arr: np.ndarray,
     """
     from scipy import ndimage as ndi
 
-    pelvis_gt = (inst >= 1) & (inst <= 150)
+    pelvis_gt = valid_instance_mask(inst, pelvic_only=True)
     contact = abbc == ABBC_BORDER_LABEL
     core = abbc == ABBC_CORE_LABEL
     contact_guard = ndi.binary_dilation(contact, structure=np.ones((3, 3, 3), dtype=bool), iterations=2)
@@ -378,37 +356,76 @@ def ndi_distance_transform(mask: np.ndarray,
     return ndi.distance_transform_edt(mask, sampling=spacing_zyx).astype(np.float32, copy=False)
 
 
-def _anatomy_context_root() -> Path:
-    return Path(os.environ.get(
-        "PENGWIN_ABBC_ANATOMY_CONTEXT_ROOT",
-        str(RESULT_VISUALIZE / "anatomy_context_ds532_checkpoint_best"),
-    ))
+def _anatomy_context_root(foundation_ds_id: int = 532) -> Path:
+    """[V0.x][FIX:C2][2026-06-01] anatomy-prob 캐시 경로를 foundation_ds_id 로 키잉.
+
+    이전: 경로가 항상 ".../anatomy_context_ds532_checkpoint_best" 로 고정되어, Ds537
+    빌드(foundation=Ds532, 4-class)와 Ds538 빌드(foundation=Ds539, 5-class w/ Femur)가
+    같은 캐시 dir 을 공유했다. 먼저 돈 빌드의 확률맵을 다음 빌드가 (잘못된 foundation 의
+    출력임에도) image.npz 존재만 보고 조용히 재사용하는 cross-foundation 오염 위험.
+
+    현재: 기본 경로를 ".../anatomy_context_ds{foundation_ds_id}_checkpoint_best" 로 분리.
+    명시적 PENGWIN_ABBC_ANATOMY_CONTEXT_ROOT override 는 사용자 의도이므로 그대로 존중한다.
+    """
+    override = os.environ.get("PENGWIN_ABBC_ANATOMY_CONTEXT_ROOT", "").strip()
+    if override:
+        return Path(override)
+    return Path(str(RESULT_VISUALIZE / f"anatomy_context_ds{foundation_ds_id}_checkpoint_best"))
 
 
 def _ensure_ds532_anatomy_probability_context(cases: list[Path],
                                               force: bool = False,
                                               gpu: int = 0,
-                                              checkpoint: str = "checkpoint_best.pth") -> Path:
-    """Generate Dataset532 soft anatomy context for ABBC input channels."""
-    out_root = _anatomy_context_root()
+                                              checkpoint: str = "checkpoint_best.pth",
+                                              foundation_ds_id: int = 532) -> Path:
+    """Generate anatomy probability context for ABBC input channels.
+
+    [V0.x][FIX:B3][2026-05-31] foundation_ds_id 인자 추가.
+    이전: 함수 이름은 "Ds532" 였지만 cfg["foundation_dataset"] 와 무관하게 Ds532 만 사용.
+    현재: foundation_ds_id 인자로 Ds532 (4-class pelvic) 또는 Ds539 (5-class w/ Femur) 선택.
+
+    인수:
+        cases: 처리할 case Path 목록.
+        force: 기존 cache 무시.
+        gpu: CUDA 디바이스 인덱스.
+        checkpoint: nnUNet checkpoint 파일 이름.
+        foundation_ds_id: anatomy 모델의 Dataset ID. Dataset537 빌드 시 532,
+                          Dataset538 빌드 시 539 사용. 기본 532 (backward compat).
+
+    반환: 캐시 root 경로.
+    """
+    out_root = _anatomy_context_root(foundation_ds_id)
     missing = []
     for cd in cases:
         cid = cd.name.zfill(3)
         if force or not (out_root / cid / "image.npz").exists():
             missing.append(cd)
     if not missing:
-        print(f"  anatomy context cache ready: {out_root}")
+        print(f"  anatomy context cache ready (foundation_ds={foundation_ds_id}): {out_root}")
         return out_root
 
     from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
     import torch
 
+    # [FIX:B3] DATASETS[532] 하드코딩 → DATASETS[foundation_ds_id] 동적 lookup.
+    foundation_cfg = DATASETS[foundation_ds_id]
+    # [V0.x][FIX:FT][2026-06-02] foundation trainer 이름을 env 로 override 가능하게.
+    # registry 의 DATASETS[539]["trainer"]="PengwinTrainer" 와 달리, STU-Net 백본 전환 후엔
+    # 실제 학습 trainer 가 PengwinTrainerSTUNetBaseAnatomyV301 이다. checkpoint 경로는
+    # {trainer}__nnUNetResEncUNetLPlans__3d_fullres 로 구성되므로 trainer 이름이 맞아야 한다.
+    # PENGWIN_FOUNDATION_TRAINER 로 지정(없으면 registry 기본값).
+    foundation_trainer = os.environ.get(
+        "PENGWIN_FOUNDATION_TRAINER", foundation_cfg["trainer"]
+    )
     model_root = (
-        NN_RES / DATASETS[532]["name"]
-        / f"{DATASETS[532]['trainer']}__nnUNetResEncUNetLPlans__3d_fullres"
+        NN_RES / foundation_cfg["name"]
+        / f"{foundation_trainer}__nnUNetResEncUNetLPlans__3d_fullres"
     )
     if not (model_root / "fold_0" / checkpoint).exists():
-        raise FileNotFoundError(f"Dataset532 checkpoint missing: {model_root / 'fold_0' / checkpoint}")
+        raise FileNotFoundError(
+            f"Foundation dataset {foundation_ds_id} ({foundation_cfg['name']}) checkpoint missing: "
+            f"{model_root / 'fold_0' / checkpoint}"
+        )
     device = torch.device("cuda", int(gpu)) if torch.cuda.is_available() else torch.device("cpu")
     predictor = nnUNetPredictor(
         tile_step_size=0.5,
@@ -423,16 +440,16 @@ def _ensure_ds532_anatomy_probability_context(cases: list[Path],
     predictor.initialize_from_trained_model_folder(
         str(model_root), use_folds=(0,), checkpoint_name=checkpoint,
     )
-    print(f"  generating Dataset532 probability context for {len(missing)} cases -> {out_root}")
+    print(f"  generating Ds{foundation_ds_id} probability context for {len(missing)} cases -> {out_root}")
     source_lists = []
     output_truncated = []
     meta_rows = []
-    ds532_raw = NN_RAW / DATASETS[532]["name"] / "imagesTr"
+    foundation_raw = NN_RAW / foundation_cfg["name"] / "imagesTr"
     for cd in missing:
         cid = cd.name.zfill(3)
         out_dir = out_root / cid
         out_dir.mkdir(parents=True, exist_ok=True)
-        raw_input = ds532_raw / f"PENGWIN_{cid}_0000.mha"
+        raw_input = foundation_raw / f"PENGWIN_{cid}_0000.mha"
         if not raw_input.exists():
             # [DATA][Scope:anatomy_context][Risk:Major]
             # Aggressive cleanup may remove nnU-Net raw Dataset532 while keeping
@@ -579,8 +596,8 @@ def _build_contact_instance_case_worker(args: tuple[int, str, bool, str]) -> dic
     hard_negative_prior = _bone_like_hard_negative_prior(arr_img, probs)
 
     values = set(int(v) for v in np.unique(inst))
-    if any(v < 0 or v > 150 for v in values):
-        raise RuntimeError(f"Ds{ds_id} case {cid:03d}: instance IDs outside 0..150: {sorted(values)}")
+    if any(v < 0 or v > PELVIC_MAX_INSTANCE_ID for v in values):
+        raise RuntimeError(f"Ds{ds_id} case {cid:03d}: instance IDs outside 0..{PELVIC_MAX_INSTANCE_ID}: {sorted(values)}")
 
     save_full_mha(arr_img, img, out_img, dtype=arr_img.dtype)
     save_full_mha(probs[1], img, out_context[0], dtype=np.float32)
@@ -600,49 +617,6 @@ def _build_contact_instance_case_worker(args: tuple[int, str, bool, str]) -> dic
     }
 
 
-def compute_body_mask(img_arr: np.ndarray,
-                      hu_threshold: float = -500.0,
-                      morph_close_iter: int = 3,
-                      min_volume: int = 100_000) -> np.ndarray:
-    """Pre-compute body silhouette mask (boolean) for FP suppression.
-
-    v8 best practice:
-        Sano 5위 PeFreCT (PENGWIN'24) reported 19.23 mean unmatched fragments
-        per case from CT-table / hand-rest contamination. Pre-computing body
-        silhouette and storing once per case ensures consistent FP filtering.
-
-    Algorithm:
-        1. Threshold > hu_threshold (-500): excludes air, table, gantry.
-        2. Morphological closing (iter=3) to fill hand/clothing gaps.
-        3. Largest 3D connected component = body silhouette.
-        4. Sanity: if largest CC < min_volume, return all-True (degenerate input).
-
-    Args:
-        img_arr: CT volume (z, y, x), HU values.
-        hu_threshold: HU cutoff. -500 captures both bone+soft-tissue but rejects
-        CT table (typically -800 HU) and air pockets.
-        morph_close_iter: morphological closing iterations to seal gaps.
-        min_volume: largest CC sanity threshold; below this, return None.
-
-    Returns:
-        boolean numpy array same shape as img_arr (True = inside body).
-    """
-    from scipy import ndimage as ndi
-    mask = img_arr > hu_threshold
-    if not mask.any():
-        return np.ones_like(img_arr, dtype=bool)
-    # Closing to fill holes inside body silhouette
-    if morph_close_iter > 0:
-        mask = ndi.binary_closing(mask, iterations=morph_close_iter)
-    cc, n = ndi.label(mask, structure=np.ones((3, 3, 3), dtype=int))
-    if n == 0:
-        return np.ones_like(img_arr, dtype=bool)
-    sizes = ndi.sum(mask, cc, index=np.arange(1, n + 1))
-    largest = int(np.argmax(sizes)) + 1
-    if sizes[largest - 1] < min_volume:
-        # degenerate input; defer filtering
-        return np.ones_like(img_arr, dtype=bool)
-    return (cc == largest)
 
 
 def build_anatomy_semantic_dataset(ds_id: int, force: bool = False) -> int:
@@ -671,6 +645,23 @@ def build_anatomy_semantic_dataset(ds_id: int, force: bool = False) -> int:
         f"[anatomy] Ds{ds_id} {cfg['name']} — {len(cases)} trusted labeled CT cases "
         f"anatomies={cfg['anatomies']}"
     )
+
+    # [V0.x][FIX:W1][2026-06-01] --overwrite(force) 시 현재 case 집합에 없는 orphan
+    # 파일만 정리한다. force 는 기존엔 case 파일을 덮어쓰기만 하고 이전 빌드의 다른
+    # case 집합에서 남은 파일은 그대로 두어, "깨끗한 rebuild" 가 아니었다. blanket
+    # rmtree 대신 expected 파일명에 없는 것만 제거해 안전하게 stale 만 지운다.
+    if force:
+        expected_imgs = {f"PENGWIN_{int(cd.name):03d}_0000.mha" for cd in cases}
+        expected_lbls = {f"PENGWIN_{int(cd.name):03d}.mha" for cd in cases}
+        removed = 0
+        for f in (dst / "imagesTr").glob("*.mha"):
+            if f.name not in expected_imgs:
+                f.unlink(); removed += 1
+        for f in (dst / "labelsTr").glob("*.mha"):
+            if f.name not in expected_lbls:
+                f.unlink(); removed += 1
+        if removed:
+            print(f"  [overwrite] removed {removed} stale orphan file(s) from {cfg['name']}")
 
     for i, cd in enumerate(cases):
         cid = int(cd.name)
@@ -1142,9 +1133,9 @@ def _build_factorized_instance_v4_case_worker(args: tuple[int, str, bool, str]) 
     if not (inst > 0).any():
         raise RuntimeError(f"Ds{ds_id} case {cid:03d}: empty pelvic instance target")
     values = set(int(v) for v in np.unique(inst))
-    invalid = [v for v in values if v < 0 or v > 150]
+    invalid = [v for v in values if v < 0 or v > PELVIC_MAX_INSTANCE_ID]
     if invalid:
-        raise RuntimeError(f"Ds{ds_id} case {cid:03d}: instance IDs outside 0..150: {invalid}")
+        raise RuntimeError(f"Ds{ds_id} case {cid:03d}: instance IDs outside 0..{PELVIC_MAX_INSTANCE_ID}: {invalid}")
 
     if v4_input == "ct_hu":
         save_full_mha(arr_img, img, out_images[0], dtype=arr_img.dtype)
@@ -1275,18 +1266,19 @@ def build_bicm_v5_dataset(ds_id: int,
                           v5_core_body_mm: float = 3.0,
                           v5_contact_band_mm: float = 2.0,
                           case_subset: list[str] | None = None) -> int:
-    """Build Dataset537 per-anatomy BICM V5 raw data.
+    """Dataset537 per-anatomy BICM V5 raw 데이터를 만든다.
 
     [AUDIT][Risk:High][Scope:pipeline_reset]
-    V5 stops the V4 factorized/global-pelvis path. Anatomy is used to crop one
-    ROI per Sacrum/LeftHip/RightHip sample. The default model input is a single
-    CT-LUT channel. The V7 diagnostic input profile may add selected Dataset532
-    anatomy probability/SDF channels while leaving the target and trainer fixed.
+    V5에서는 V4의 factorized / global-pelvis 경로를 더 이상 쓰지 않는다.
+    대신 anatomy 정보를 이용해 Sacrum / LeftHip / RightHip 각각에 대해
+    샘플당 ROI를 하나씩 crop한다. 기본 모델 입력은 CT-LUT 단일 채널이고,
+    V7 진단용 입력 프로파일에서는 target과 trainer는 그대로 둔 채
+    선택된 Dataset532 anatomy probability / SDF 채널을 추가할 수 있다.
 
     [DATA][Leakage]
-    Labels come only from the original Task1 GT instance map. Dataset532
-    predictions, when requested by `ct_lut_anat_sdf`, are saved as input
-    context only and never alter label generation or case selection.
+    라벨은 오직 원본 Task1 GT instance map에서만 생성된다. `ct_lut_anat_sdf`
+    가 지정되어 Dataset532 prediction이 사용될 때도, 그 값은 input context
+    로만 저장될 뿐 라벨 생성이나 케이스 선정에는 절대 영향을 주지 않는다.
     """
     if v5_input not in V5_INPUT_VARIANTS:
         raise ValueError(f"--v5-input must be one of {V5_INPUT_VARIANTS}, got {v5_input!r}")
@@ -1300,7 +1292,10 @@ def build_bicm_v5_dataset(ds_id: int,
     labels_dir = dst / "labelsTr"
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
-    cases = _select_case_subset(list_cases("pelvic"), case_subset)
+    # [V0.x][FIX:B2][2026-05-31] cfg["filter"] 을 반영한 case 선정.
+    # 이전: 하드코딩 list_cases("pelvic") — 170 femur-only 케이스 누락.
+    # 현재: cfg.filter ("all" / "pelvic" / "femur") 을 그대로 list_cases 에 전달.
+    cases = _select_case_subset(list_cases(cfg["filter"]), case_subset)
     params = BICMV5Params(
         target_profile=v5_target_profile,
         core_ball_radius_mm=float(v5_core_ball_radius_mm),
@@ -1313,16 +1308,21 @@ def build_bicm_v5_dataset(ds_id: int,
     context_root = None
     if uses_anatomy_context:
         # [AUDIT][Risk:High][Scope:input_ablation]
-        # This is the only changed variable for the V7 root-cause run:
-        # target, decoder, trainer, loss, and ROI samples stay fixed while the
-        # model receives selected Dataset532 support context. The cache path and
-        # checkpoint are recorded below so later fold0 work can replace this with
-        # out-of-fold anatomy probabilities instead of silently reusing fold0.
+        # V7 root-cause 실험에서 이 변수 하나만 바꾼다. target, decoder, trainer,
+        # loss, ROI 샘플은 그대로 고정한 채, 모델만 선택된 Dataset532 support
+        # context를 추가로 받는다. 캐시 경로와 checkpoint를 아래에 기록해 두면,
+        # 이후 fold0 작업에서 fold0를 몰래 재사용하는 일 없이 이 부분을
+        # out-of-fold anatomy probability로 교체할 수 있다.
+        # [V0.x][FIX:B3][2026-05-31] cfg["foundation_dataset"] 전달.
+        # Ds537 (foundation=532) → Ds532 anatomy prob 사용 (기존 동작).
+        # Ds538 (foundation=539) → Ds539 anatomy prob 사용 (Femur 포함 5-class).
+        foundation_ds = int(cfg["foundation_dataset"] or 532)
         context_root = _ensure_ds532_anatomy_probability_context(
             cases,
             force=os.environ.get("PENGWIN_V7_FORCE_CONTEXT", "0") == "1",
             gpu=int(os.environ.get("PENGWIN_V7_CONTEXT_GPU", "0")),
             checkpoint=context_checkpoint,
+            foundation_ds_id=foundation_ds,
         )
     if uses_anatomy_context:
         channel_names = {"0": "nonorm", "1": "nonorm", "2": "nonorm"}
@@ -1335,9 +1335,13 @@ def build_bicm_v5_dataset(ds_id: int,
         channel_names = {"0": "nonorm"}
         input_contract = ["ct_lut"]
     rows = []
+    # [V0.x][FIX:B2][2026-05-31] anatomies 카운트는 cfg["anatomies"] 기반.
+    # 단 cfg_anatomies 는 아래 loop 안에서 정의되므로 여기선 cfg 직접 참조.
+    _cfg_anat_count = len(cfg["anatomies"]) if cfg["anatomies"] else len(V5_ANATOMY_RANGES_WITH_FEMUR)
+    _cfg_filter_desc = {"pelvic": "pelvic", "femur": "femur", "all": "pelvic+femur"}.get(cfg["filter"], cfg["filter"])
     print(
-        f"[bicm_v5] Ds{ds_id} {cfg['name']} — {len(cases)} pelvic CT cases "
-        f"x {len(V5_ANATOMY_RANGES)} anatomy ROI samples input={v5_input} "
+        f"[bicm_v5] Ds{ds_id} {cfg['name']} — {len(cases)} {_cfg_filter_desc} CT cases "
+        f"x {_cfg_anat_count} anatomy ROI samples input={v5_input} "
         f"target={v5_target_profile}"
     )
     for cd in cases:
@@ -1360,15 +1364,32 @@ def build_bicm_v5_dataset(ds_id: int,
                     f"Dataset532 context shape mismatch for case {cid:03d}: "
                     f"prob={tuple(probs.shape[1:])}, ct={tuple(arr_img.shape)}"
                 )
-            if probs.shape[0] <= max(V5_DATASET532_PROB_CHANNEL.values()):
+            # [V0.x][FIX:B1+B2][2026-05-31] cfg.anatomies 에 포함된 채널만 검증.
+            # 이전: V5_DATASET532_PROB_CHANNEL 의 max (=4, Femur 채널 포함) 와 비교.
+            # 현재: cfg.anatomies 에 실제로 필요한 채널의 max 와만 비교.
+            # Ds537 (foundation=Ds532, 4-class) 는 Femur 채널 없이도 동작,
+            # Ds538 (foundation=Ds539, 5-class) 는 Femur 채널까지 검증.
+            cfg_required_anats = cfg["anatomies"] if cfg["anatomies"] else list(V5_DATASET532_PROB_CHANNEL)
+            cfg_required_channels = {a: V5_DATASET532_PROB_CHANNEL[a] for a in cfg_required_anats if a in V5_DATASET532_PROB_CHANNEL}
+            if not cfg_required_channels:
+                raise RuntimeError(f"Ds{ds_id} cfg.anatomies={cfg_required_anats} 에 해당하는 prob 채널이 없음")
+            if probs.shape[0] <= max(cfg_required_channels.values()):
                 raise RuntimeError(
-                    f"Dataset532 context for case {cid:03d} has {probs.shape[0]} channels; "
-                    f"need anatomy channels {V5_DATASET532_PROB_CHANNEL}"
+                    f"foundation dataset context for case {cid:03d} has {probs.shape[0]} channels; "
+                    f"need anatomy channels {cfg_required_channels}"
                 )
-            for anatomy, prob_channel in V5_DATASET532_PROB_CHANNEL.items():
+            for anatomy, prob_channel in cfg_required_channels.items():
                 prob = np.asarray(probs[int(prob_channel)], dtype=np.float32)
                 context_probs[anatomy] = prob
-        for anatomy in V5_ANATOMY_RANGES:
+        # [V0.x][FIX:B2][2026-05-31] cfg.anatomies 기반 반복 (Femur 포함 시 4개).
+        # 이전: 하드코딩 V5_ANATOMY_RANGES (3 anatomies) — Femur 미지원.
+        # 현재: cfg["anatomies"] 의 4-anatomy (Dataset538) 또는 3-anatomy (Dataset537) 양쪽 동작.
+        # bbox 가 비어있을 경우, femur-only 케이스에서 Sacrum/LH/RH 의 빈 ROI 가 발생할 수 있으므로
+        # raise 대신 continue 로 건너뛴다 (Dataset538 "all" filter 동작).
+        cfg_anatomies = list(cfg["anatomies"]) if cfg["anatomies"] else list(V5_ANATOMY_RANGES_WITH_FEMUR)
+        for anatomy in cfg_anatomies:
+            if anatomy not in V5_ANATOMY_RANGES_WITH_FEMUR:
+                raise ValueError(f"Ds{ds_id} unknown anatomy {anatomy!r}; supported: {sorted(V5_ANATOMY_RANGES_WITH_FEMUR)}")
             sample_id = f"PENGWIN_{cid:03d}_{anatomy}"
             out_imgs = [images_dir / f"{sample_id}_{idx:04d}.mha" for idx in range(len(channel_names))]
             out_lbl = labels_dir / f"{sample_id}.mha"
@@ -1377,8 +1398,10 @@ def build_bicm_v5_dataset(ds_id: int,
             anat_mask = anatomy_mask_from_instances(inst_full, anatomy)
             bbox = bbox_from_mask(anat_mask, pad_vox=pad_vox)
             if bbox is None:
-                raise RuntimeError(f"Ds{ds_id} case {cid:03d} {anatomy}: empty anatomy ROI")
-            lo, hi = V5_ANATOMY_RANGES[anatomy]
+                # cfg.filter="all" 시 femur-only 케이스에서 pelvic 빈 ROI 발생 가능.
+                # 또는 pelvic-only 케이스에서 Femur 빈 ROI 발생 가능. 양쪽 모두 정상 skip.
+                continue
+            lo, hi = V5_ANATOMY_RANGES_WITH_FEMUR[anatomy]
             inst_roi = inst_full[bbox]
             inst_roi = np.where((inst_roi >= lo) & (inst_roi <= hi), inst_roi, 0).astype(np.uint16, copy=False)
             target = compute_bicm_v5_target(inst_roi, spacing_zyx=spacing_zyx, params=params)
@@ -1393,18 +1416,18 @@ def build_bicm_v5_dataset(ds_id: int,
             if uses_anatomy_context:
                 prob = context_probs[anatomy]
                 # [DATA][Leakage]
-                # The selected anatomy channels are cropped by the same GT ROI
-                # as the CT for this six-case overfit diagnostic. They are not
-                # used to create targets; production fold0 must switch the cache
-                # to out-of-fold anatomy predictions before this profile can be
-                # considered promotion evidence.
+                # 선택된 anatomy 채널은 이번 6-케이스 overfit 진단을 위해 CT와
+                # 동일한 GT ROI로 crop된다. 타겟 생성에는 쓰이지 않지만, 이
+                # 프로파일을 정식 승격(promotion) 근거로 쓰려면 production
+                # fold0에서는 캐시를 out-of-fold anatomy prediction으로 반드시
+                # 교체해야 한다.
                 crop_save_mha(prob, img, bbox, out_imgs[1], dtype=np.float32)
                 prob_roi = prob[bbox]
                 # [QC][Perf:roi_sdf]
-                # Full-volume EDT on six large CTs is several minutes and does
-                # not change the experiment question. Compute SDF only inside
-                # the materialized ROI because the model never sees voxels
-                # outside this crop.
+                # 6개의 큰 CT 전체 볼륨에 대해 EDT를 돌리면 수 분이 걸리는데,
+                # 실험의 결론에는 영향을 주지 않는다. 모델은 이 crop 밖의 voxel을
+                # 절대 보지 않으므로, 실제 materialize된 ROI 내부에서만 SDF를
+                # 계산해 시간을 아낀다.
                 sdf_roi = _selected_anatomy_sdf_from_prob(prob_roi, spacing_zyx=spacing_zyx)
                 save_crop_array_mha(sdf_roi, img, bbox, out_imgs[2], dtype=np.float32)
                 row_extra = {
@@ -1426,7 +1449,13 @@ def build_bicm_v5_dataset(ds_id: int,
     ds_json = {
         "channel_names": channel_names,
         "labels": dict(V5_LABELS),
-        "numTraining": len(cases) * len(V5_ANATOMY_RANGES),
+        # [V0.x][FIX:NT][2026-06-03] numTraining 은 실제 written ROI 수(len(rows)).
+        # 이전: len(cases) * len(cfg_anatomies) — pelvic 케이스엔 Femur ROI 가 없고
+        # femur 케이스엔 pelvic 3-anat ROI 가 없어 빈 ROI 가 skip 되므로 과대계산되어
+        # nnUNetv2_plan_and_preprocess --verify_dataset_integrity 가 실패했다
+        # (subset 3×4=12 vs 실제 5; full 340×4=1360 vs 실제 680). rows 는 위 루프에서
+        # 실제로 기록된 ROI 샘플만 모으므로 dataset.json 의 파일 수와 정확히 일치한다.
+        "numTraining": len(rows),
         "file_ending": ".mha",
         "v5_contract": {
             "input": v5_input,
@@ -1437,13 +1466,15 @@ def build_bicm_v5_dataset(ds_id: int,
             ),
             "anatomy_context": {
                 "enabled": uses_anatomy_context,
-                "dataset": DATASETS[532]["name"] if uses_anatomy_context else None,
+                # [V0.x][FIX:B3][2026-05-31] foundation_dataset 동적 기록.
+                "dataset": DATASETS[int(cfg["foundation_dataset"] or 532)]["name"] if uses_anatomy_context else None,
+                "foundation_dataset_id": int(cfg["foundation_dataset"] or 532) if uses_anatomy_context else None,
                 "checkpoint": context_checkpoint if uses_anatomy_context else None,
                 "cache_root": str(context_root) if uses_anatomy_context and context_root is not None else None,
                 "channel_map": V5_DATASET532_PROB_CHANNEL if uses_anatomy_context else None,
                 "sdf_clip_mm": 40.0 if uses_anatomy_context else None,
             },
-            "anatomies": list(V5_ANATOMY_RANGES),
+            "anatomies": list(cfg_anatomies),
             "target_params": {
                 "exterior_mm": params.exterior_mm,
                 "core_mm": params.core_mm,
@@ -1479,7 +1510,11 @@ def build_bicm_v5_dataset(ds_id: int,
     }, indent=2))
     print(f"  raw audit: {audit_path}")
     print(f"  ✅ {cfg['name']} ready")
-    return len(cases) * len(V5_ANATOMY_RANGES)
+    # [V0.x][FIX:B2][2026-05-31] 실제 written sample 수 (rows) 반환.
+    # 이전: len(cases) × 3 (V5_ANATOMY_RANGES 길이) — Femur 누락 + skip 미반영.
+    # 현재: 실제 빌드된 sample 수. Dataset538 "all" 시 femur-only 케이스에서
+    # pelvic 3 anat skip 되므로 정확한 count 반환.
+    return len(rows)
 
 
 
@@ -1497,24 +1532,6 @@ def build_dataset(ds_id: int,
     cfg = DATASETS[ds_id]
     if cfg["kind"] == "anatomy_semantic":
         return build_anatomy_semantic_dataset(ds_id, force=force)
-    if cfg["kind"] == "abbc_official":
-        return build_abbc_official_dataset(ds_id, force=force)
-    if cfg["kind"] == "boundary_fragment":
-        return build_boundary_fragment_v3_dataset(
-            ds_id,
-            force=force,
-            v3_input=v3_input,
-            case_subset=case_subset,
-        )
-    if cfg["kind"] == "contact_instance":
-        return build_contact_instance_dataset(ds_id, force=force)
-    if cfg["kind"] == "factorized_instance":
-        return build_factorized_instance_v4_dataset(
-            ds_id,
-            force=force,
-            v4_input=v4_input,
-            case_subset=case_subset,
-        )
     if cfg["kind"] == "bicm_v5":
         return build_bicm_v5_dataset(
             ds_id,
@@ -1529,822 +1546,42 @@ def build_dataset(ds_id: int,
     raise ValueError(f"Unknown dataset kind: {cfg['kind']}")
 
 
-def audit_nnunet_raw_datasets(ds_ids: list[int] | None = None,
-                              out_json: Path | None = None,
-                              fail_on_mixed_orientation: bool = True) -> dict:
-    """Audit generated nnU-Net raw datasets after conversion.
-
-    The rebuild gate is intentionally strict: every image channel must be LPS,
-    every dataset must have `dataset.json`, and channel counts must match
-    labels. This catches exactly the previous failure mode where code claimed
-    canonicalization but generated raw files remained mixed LPS/RAS.
-    """
-    ds_ids = ds_ids or sorted(DATASETS)
-    audit = {"datasets": {}, "ok": True}
-    for ds_id in ds_ids:
-        cfg = DATASETS[ds_id]
-        dst = NN_RAW / cfg["name"]
-        images = sorted((dst / "imagesTr").glob("*.mha"))
-        labels = sorted((dst / "labelsTr").glob("*.mha"))
-        case_to_channels: dict[str, list[str]] = defaultdict(list)
-        orientation_counts = Counter()
-        geometry_errors = []
-        label_values_seen = set()
-        invalid_label_cases = []
-        subject_label_violations = []
-        empty_foreground_cases = []
-        source_type_counts = Counter()
-        audited_label_cases = set()
-        for img_path in images:
-            stem = img_path.stem
-            case_key = stem.rsplit("_", 1)[0] if "_" in stem else stem
-            case_to_channels[case_key].append(img_path.name)
-            img_info = _read_image_info(img_path)
-            code = img_info["orientation"]
-            orientation_counts[code] += 1
-            if case_key in audited_label_cases:
-                continue
-            audited_label_cases.add(case_key)
-            label_path = dst / "labelsTr" / f"{case_key}.mha"
-            if not label_path.exists():
-                continue
-            lbl_info = _read_image_info(label_path)
-            if not _geometry_tuples_match(img_info, lbl_info):
-                geometry_errors.append({
-                    "case": case_key,
-                    "error": "image/label geometry mismatch",
-                    "image": img_info,
-                    "label": lbl_info,
-                })
-            lbl = sitk.ReadImage(str(label_path))
-            arr = sitk.GetArrayFromImage(lbl)
-            values = set(int(v) for v in np.unique(arr))
-            label_values_seen.update(values)
-            allowed = set(range(int(cfg["n_classes"])))
-            invalid = sorted(values - allowed)
-            if invalid:
-                invalid_label_cases.append({"case": case_key, "invalid_values": invalid})
-            if not (arr > 0).any():
-                empty_foreground_cases.append(case_key)
-            try:
-                cid = int(case_key.replace("PENGWIN_", ""))
-            except ValueError:
-                cid = -1
-            source_type = case_subject_type(cid)
-            source_type_counts[source_type] += 1
-            if cfg["kind"] == "anatomy_semantic":
-                expected_subject = cfg["filter"].capitalize() if cfg["filter"] in {"pelvic", "femur"} else None
-                if expected_subject and source_type != expected_subject:
-                    subject_label_violations.append({
-                        "case": case_key,
-                        "subject_type": source_type,
-                        "expected_subject_type": expected_subject,
-                        "values": sorted(values),
-                    })
-        n_cases = len(case_to_channels)
-        dataset_json_path = dst / "dataset.json"
-        if dataset_json_path.exists():
-            expected_channels = len(json.loads(dataset_json_path.read_text()).get("channel_names", {"0": "CT"}))
-        else:
-            expected_channels = 1
-        bad_channel_cases = {
-            k: sorted(v) for k, v in case_to_channels.items()
-            if len(v) != expected_channels
-        }
-        if dataset_json_path.exists():
-            expected_cases = int(json.loads(dataset_json_path.read_text()).get(
-                "numTraining",
-                len(list_cases(case_filter=None if cfg["filter"] == "all" else cfg["filter"])),
-            ))
-        else:
-            expected_cases = len(list_cases(case_filter=None if cfg["filter"] == "all" else cfg["filter"]))
-        entry = {
-            "dataset_id": ds_id,
-            "name": cfg["name"],
-            "kind": cfg["kind"],
-            "dataset_json": (dst / "dataset.json").exists(),
-            "n_images": len(images),
-            "n_labels": len(labels),
-            "n_cases": n_cases,
-            "expected_cases": expected_cases,
-            "expected_channels": expected_channels,
-            "bad_channel_cases": bad_channel_cases,
-            "orientation_counts": dict(orientation_counts),
-            "source_type_counts": dict(source_type_counts),
-            "label_values": sorted(label_values_seen),
-            "geometry_errors": geometry_errors,
-            "invalid_label_cases": invalid_label_cases,
-            "subject_label_violations": subject_label_violations,
-            "empty_foreground_cases": empty_foreground_cases,
-        }
-        entry["ok"] = (
-            entry["dataset_json"]
-            and n_cases == expected_cases
-            and len(labels) == n_cases
-            and not bad_channel_cases
-            and set(orientation_counts) == {"LPS"}
-            and not geometry_errors
-            and not invalid_label_cases
-            and not subject_label_violations
-            and not empty_foreground_cases
-        )
-        audit["datasets"][str(ds_id)] = entry
-        audit["ok"] = bool(audit["ok"] and entry["ok"])
-
-    if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(audit, indent=2))
-    if fail_on_mixed_orientation and not audit["ok"]:
-        failed = [k for k, v in audit["datasets"].items() if not v["ok"]]
-        raise RuntimeError(f"nnUNet raw dataset audit failed: {failed}")
-    return audit
 
 
-def _audit_abbc_target_case_worker(args: tuple[int, str, str]) -> dict:
-    """Audit one ABBC target case for multiprocessing."""
-    ds_id, cid, target_path_str = args
-    cfg = DATASETS[ds_id]
-    case_dir = find_case_dir(cid)
-    if case_dir is None:
-        return {"case": cid, "source_case_missing": True}
-    source = sitk.GetArrayFromImage(canonicalize_sitk(sitk.ReadImage(str(case_dir / "label.mha"))))
-    target = sitk.GetArrayFromImage(sitk.ReadImage(str(target_path_str)))
-    values = set(int(v) for v in np.unique(target))
-    allowed = _abbc_allowed_values(ds_id)
-    invalid = sorted(values - allowed)
-    case_audit = audit_official_target(source, target)
-    counts = np.bincount(target.ravel(), minlength=int(cfg["n_classes"]))
-    return {
-        "case": cid,
-        "source_case_missing": False,
-        "invalid_values": invalid,
-        "case_audit": case_audit,
-        "label_counts": {str(k): int(counts[int(k)]) for k in sorted(allowed)},
-    }
 
 
-def audit_abbc_targets(ds_ids: list[int] | None = None,
-                       out_json: Path | None = None,
-                       fail_on_error: bool = True) -> dict:
-    """Audit Contact-Energy ABBC raw labels before training.
-
-    Checks the generated target-side seed contract for active ABBC datasets:
-        - label values are exactly within {0,1,2,3};
-        - class order is `[boundary_shell, core, contact_surface]`;
-        - every pelvic GT fragment has one target core connected component;
-        - no core voxel leaks outside pelvic fragment labels 1..150;
-        - core/contact overlap and tiny-fragment seed coverage are tracked.
-    """
-    selected_ids = [
-        ds_id for ds_id in (ds_ids or sorted(DATASETS))
-        if DATASETS[ds_id]["kind"] == "abbc_official"
-    ]
-    audit = {"datasets": {}, "ok": True}
-    for ds_id in selected_ids:
-        cfg = DATASETS[ds_id]
-        raw_root = NN_RAW / cfg["name"]
-        label_paths = {p.stem.replace("PENGWIN_", ""): p for p in sorted((raw_root / "labelsTr").glob("*.mha"))}
-        per_case = {}
-        invalid_label_cases = []
-        zero_core = []
-        multi_core = []
-        core_leak = []
-        label_voxels = Counter()
-        core_cc_hist = Counter()
-        fragment_count = 0
-        workers = max(1, int(os.environ.get("PENGWIN_ABBC_AUDIT_WORKERS", "8")))
-        workers = min(workers, max(1, len(label_paths)))
-        items = [(ds_id, cid, str(target_path)) for cid, target_path in sorted(label_paths.items())]
-        if workers == 1:
-            rows = [_audit_abbc_target_case_worker(item) for item in items]
-        else:
-            rows = []
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(_audit_abbc_target_case_worker, item) for item in items]
-                for future in as_completed(futures):
-                    rows.append(future.result())
-            rows.sort(key=lambda row: row["case"])
-
-        for row in rows:
-            cid = row["case"]
-            if row.get("source_case_missing"):
-                zero_core.append({"case": cid, "error": "source_case_missing"})
-                continue
-            invalid = row["invalid_values"]
-            if invalid:
-                invalid_label_cases.append({"case": cid, "invalid_values": invalid})
-            case_audit = row["case_audit"]
-            per_case[cid] = case_audit
-            fragment_count += int(case_audit["n_fragments"])
-            for k, v in row["label_counts"].items():
-                label_voxels[int(k)] += int(v)
-            for k, v in case_audit["core_cc_hist"].items():
-                core_cc_hist[int(k)] += int(v)
-            for fragment_id in case_audit["zero_core"]:
-                zero_core.append({"case": cid, "fragment_id": int(fragment_id)})
-            for row in case_audit["multi_core"]:
-                row = dict(row)
-                row["case"] = cid
-                multi_core.append(row)
-            if case_audit["core_leak_voxels"]:
-                core_leak.append({"case": cid, "voxels": int(case_audit["core_leak_voxels"])})
-
-        expected_cases = len(list_cases(case_filter=cfg["filter"]))
-        total_voxels = sum(label_voxels.values())
-        labels = _abbc_labels_for_dataset(ds_id)
-        entry = {
-            "dataset_id": ds_id,
-            "name": cfg["name"],
-            "kind": cfg["kind"],
-            "anatomies": cfg["anatomies"],
-            "global_label_range": list(cfg["global_label_range"] or (1, 150)),
-            "n_labels": len(label_paths),
-            "expected_cases": expected_cases,
-            "n_fragments": fragment_count,
-            "label_values_allowed": sorted(labels.values()),
-            "label_contract": {str(v): k for k, v in labels.items()},
-            "abbc_official": json.loads((NN_RAW / cfg["name"] / "dataset.json").read_text()).get(
-                "abbc_official", {}
-            ) if (NN_RAW / cfg["name"] / "dataset.json").exists() else {},
-            "target_label_voxels": {
-                str(k): int(label_voxels.get(k, 0))
-                for k in sorted(labels.values())
-            },
-            "target_label_fractions": {
-                str(k): float(label_voxels.get(k, 0)) / max(1, total_voxels)
-                for k in sorted(labels.values())
-            },
-            "target_qc_note": (
-                "Contact-Energy ABBC pseudo dice excludes background and maps to "
-                "[boundary_shell, core, contact_surface"
-                f"{', contact_hard_negative' if int(cfg['n_classes']) >= 5 else ''}]. "
-                "Class 3 is the separator target; class 4 is negative supervision only."
-            ),
-            "core_cc_hist": {str(k): int(v) for k, v in sorted(core_cc_hist.items())},
-            "zero_core": zero_core,
-            "multi_core": multi_core,
-            "core_leak": core_leak,
-            "invalid_label_cases": invalid_label_cases,
-            "per_case": per_case,
-        }
-        entry["ok"] = (
-            len(label_paths) == expected_cases
-            and not zero_core
-            and not multi_core
-            and not core_leak
-            and not invalid_label_cases
-        )
-        audit["datasets"][str(ds_id)] = entry
-        audit["ok"] = bool(audit["ok"] and entry["ok"])
-
-    if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(audit, indent=2))
-    if fail_on_error and not audit["ok"]:
-        failed = [k for k, v in audit["datasets"].items() if not v["ok"]]
-        raise RuntimeError(f"ABBC target audit failed: {failed}")
-    return audit
 
 
-def audit_boundary_fragment_targets(ds_ids: list[int] | None = None,
-                                    out_json: Path | None = None,
-                                    fail_on_error: bool = True) -> dict:
-    """Audit Dataset537 V3 raw target invariants."""
-    selected_ids = [
-        ds_id for ds_id in (ds_ids or sorted(DATASETS))
-        if DATASETS[ds_id]["kind"] == "boundary_fragment"
-    ]
-    audit = {"datasets": {}, "ok": True}
-    for ds_id in selected_ids:
-        cfg = DATASETS[ds_id]
-        raw_root = NN_RAW / cfg["name"]
-        label_paths = sorted((raw_root / "labelsTr").glob("*.mha"))
-        label_voxels = Counter()
-        invalid_cases = []
-        overlap_cases = []
-        zero_core_cases = []
-        external_inside_cases = []
-        for path in label_paths:
-            arr = sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
-            values = set(int(v) for v in np.unique(arr))
-            invalid = sorted(values - set(BFV3_LABELS.values()))
-            if invalid:
-                invalid_cases.append({"case": path.stem, "invalid_values": invalid})
-            counts = np.bincount(arr.ravel(), minlength=5)
-            for i in range(5):
-                label_voxels[i] += int(counts[i])
-            if int(counts[4]) == 0:
-                zero_core_cases.append(path.stem)
-            # A class label cannot literally overlap another class in an argmax
-            # target, but these fields make the contract explicit in the audit.
-            if ((arr == 1) & ((arr == 2) | (arr == 3) | (arr == 4))).any():
-                external_inside_cases.append(path.stem)
-            if ((arr == 1) & (arr == 2)).any():
-                overlap_cases.append(path.stem)
-        total = sum(label_voxels.values())
-        entry = {
-            "dataset_id": ds_id,
-            "name": cfg["name"],
-            "kind": cfg["kind"],
-            "n_labels": len(label_paths),
-            "label_contract": {str(v): k for k, v in BFV3_LABELS.items()},
-            "label_voxels": {str(k): int(label_voxels.get(k, 0)) for k in range(5)},
-            "label_fractions": {str(k): float(label_voxels.get(k, 0)) / max(1, total) for k in range(5)},
-            "invalid_cases": invalid_cases,
-            "class1_class2_overlap_cases": overlap_cases,
-            "class1_inside_support_cases": external_inside_cases,
-            "zero_core_cases": zero_core_cases,
-            "target_qc_note": (
-                "V3.1 uses class2 as a thin contact ridge and class4 as decoder seed. "
-                "Every case must have class4; class1 must never be fragment support."
-            ),
-        }
-        entry["ok"] = bool(
-            label_paths
-            and not invalid_cases
-            and not overlap_cases
-            and not external_inside_cases
-            and not zero_core_cases
-        )
-        audit["datasets"][str(ds_id)] = entry
-        audit["ok"] = bool(audit["ok"] and entry["ok"])
-    if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(audit, indent=2))
-    if fail_on_error and not audit["ok"]:
-        failed = [k for k, v in audit["datasets"].items() if not v["ok"]]
-        raise RuntimeError(f"BoundaryFragment target audit failed: {failed}")
-    return audit
 
 
-def _geometry_tuple(img: sitk.Image) -> tuple:
-    """Compact geometry tuple for exact source->raw orientation contract checks."""
-    return (
-        tuple(int(v) for v in img.GetSize()),
-        tuple(round(float(v), 6) for v in img.GetSpacing()),
-        tuple(round(float(v), 5) for v in img.GetOrigin()),
-        tuple(round(float(v), 6) for v in img.GetDirection()),
-    )
 
 
-def _read_image_info(path: Path) -> dict:
-    """Read MHA geometry metadata without loading the voxel array."""
-    reader = sitk.ImageFileReader()
-    reader.SetFileName(str(path))
-    reader.ReadImageInformation()
-    direction = tuple(float(v) for v in reader.GetDirection())
-    return {
-        "path": str(path),
-        "orientation": sitk.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(direction),
-        "size": tuple(int(v) for v in reader.GetSize()),
-        "spacing": tuple(float(v) for v in reader.GetSpacing()),
-        "origin": tuple(float(v) for v in reader.GetOrigin()),
-        "direction": direction,
-    }
 
 
-def _geometry_tuple_from_info(info: dict) -> tuple:
-    """Compact geometry tuple from `_read_image_info` output."""
-    return (
-        tuple(int(v) for v in info["size"]),
-        tuple(round(float(v), 6) for v in info["spacing"]),
-        tuple(round(float(v), 5) for v in info["origin"]),
-        tuple(round(float(v), 6) for v in info["direction"]),
-    )
 
 
-def _geometry_tuples_match(a: dict, b: dict) -> bool:
-    return (
-        tuple(a["size"]) == tuple(b["size"])
-        and np.allclose(a["spacing"], b["spacing"], rtol=0, atol=1e-5)
-        and np.allclose(a["origin"], b["origin"], rtol=0, atol=1e-4)
-        and np.allclose(a["direction"], b["direction"], rtol=0, atol=1e-5)
-    )
 
 
-def _geometry_tuple_matches_info(geom: tuple, info: dict) -> bool:
-    return (
-        tuple(geom[0]) == tuple(info["size"])
-        and np.allclose(geom[1], info["spacing"], rtol=0, atol=1e-5)
-        and np.allclose(geom[2], info["origin"], rtol=0, atol=1e-4)
-        and np.allclose(geom[3], info["direction"], rtol=0, atol=1e-5)
-    )
 
 
-def audit_orientation_contract(ds_ids: list[int] | None = None,
-                               out_json: Path | None = None,
-                               fail_on_error: bool = True) -> dict:
-    """Audit the training/inference orientation contract for active datasets.
-
-    The critical invariant is stronger than "raw files are LPS": for every
-    source case, `canonicalize_sitk(source image, LPS)` must have the same
-    geometry as the generated nnU-Net raw image. This catches the exact failure
-    mode where training consumed LPS raw files but standalone inference copied
-    original RAS source bytes into nnU-Net.
-    """
-    ds_ids = ds_ids or sorted(DATASETS)
-    audit = {
-        "contract_version": "lps_ct_v1",
-        "canonical_orientation": "LPS",
-        "source_orientation_counts": {},
-        "non_lps_source_cases": [],
-        "datasets": {},
-        "ok": True,
-    }
-    global_source_counts = Counter()
-    global_non_lps: dict[str, dict] = {}
-
-    for ds_id in ds_ids:
-        cfg = DATASETS[ds_id]
-        dst = NN_RAW / cfg["name"]
-        cases = list_cases(case_filter=None if cfg["filter"] == "all" else cfg["filter"])
-        source_counts = Counter()
-        raw_image_counts = Counter()
-        raw_label_counts = Counter()
-        raw_geometry_errors = []
-        canonical_geometry_errors = []
-        missing_raw_cases = []
-        image_label_geometry_errors = []
-
-        for cd in cases:
-            cid = cd.name.zfill(3)
-            source_img_info = _read_image_info(cd / "image.mha")
-            source_lbl_info = _read_image_info(cd / "label.mha")
-            source_code = source_img_info["orientation"]
-            source_counts[source_code] += 1
-            global_source_counts[source_code] += 1
-            if source_code != "LPS":
-                global_non_lps[cid] = {
-                    "case": cid,
-                    "source_orientation": source_code,
-                    "subject_type": case_subject_type(int(cid)),
-                    "source_path": str(cd / "image.mha"),
-                }
-
-            raw_img_path = dst / "imagesTr" / f"PENGWIN_{cid}_0000.mha"
-            raw_lbl_path = dst / "labelsTr" / f"PENGWIN_{cid}.mha"
-            if not raw_img_path.exists() or not raw_lbl_path.exists():
-                missing_raw_cases.append({
-                    "case": cid,
-                    "missing_image": not raw_img_path.exists(),
-                    "missing_label": not raw_lbl_path.exists(),
-                })
-                continue
-
-            raw_img_info = _read_image_info(raw_img_path)
-            raw_lbl_info = _read_image_info(raw_lbl_path)
-            raw_image_counts[raw_img_info["orientation"]] += 1
-            raw_label_counts[raw_lbl_info["orientation"]] += 1
-            if not _geometry_tuples_match(raw_img_info, raw_lbl_info):
-                image_label_geometry_errors.append({
-                    "case": cid,
-                    "error": "raw image/label geometry mismatch",
-                    "raw_image": raw_img_info,
-                    "raw_label": raw_lbl_info,
-                })
-
-            if source_code == "LPS":
-                canonical_source_img_tuple = _geometry_tuple_from_info(source_img_info)
-            else:
-                canonical_source_img_tuple = _geometry_tuple(canonicalize_sitk(
-                    sitk.ReadImage(str(cd / "image.mha"))
-                ))
-            if source_lbl_info["orientation"] == "LPS":
-                canonical_source_lbl_tuple = _geometry_tuple_from_info(source_lbl_info)
-            else:
-                canonical_source_lbl_tuple = _geometry_tuple(canonicalize_sitk(
-                    sitk.ReadImage(str(cd / "label.mha"))
-                ))
-
-            if not _geometry_tuple_matches_info(canonical_source_img_tuple, raw_img_info):
-                canonical_geometry_errors.append({
-                    "case": cid,
-                    "kind": "image",
-                    "source_orientation": source_code,
-                    "raw_orientation": raw_img_info["orientation"],
-                    "error": "canonical source image geometry does not match raw imagesTr",
-                })
-            if not _geometry_tuple_matches_info(canonical_source_lbl_tuple, raw_lbl_info):
-                canonical_geometry_errors.append({
-                    "case": cid,
-                    "kind": "label",
-                    "source_orientation": source_lbl_info["orientation"],
-                    "raw_orientation": raw_lbl_info["orientation"],
-                    "error": "canonical source label geometry does not match raw labelsTr",
-                })
-            if raw_img_info["orientation"] != "LPS" or raw_lbl_info["orientation"] != "LPS":
-                raw_geometry_errors.append({
-                    "case": cid,
-                    "raw_image_orientation": raw_img_info["orientation"],
-                    "raw_label_orientation": raw_lbl_info["orientation"],
-                })
-
-        entry = {
-            "dataset_id": ds_id,
-            "name": cfg["name"],
-            "n_cases": len(cases),
-            "source_orientation_counts": dict(source_counts),
-            "raw_image_orientation_counts": dict(raw_image_counts),
-            "raw_label_orientation_counts": dict(raw_label_counts),
-            "non_lps_source_cases": [
-                case for case, meta in sorted(global_non_lps.items())
-                if case in {cd.name.zfill(3) for cd in cases}
-            ],
-            "missing_raw_cases": missing_raw_cases,
-            "raw_non_lps_cases": raw_geometry_errors,
-            "image_label_geometry_errors": image_label_geometry_errors,
-            "source_to_raw_geometry_errors": canonical_geometry_errors,
-        }
-        entry["ok"] = (
-            not missing_raw_cases
-            and not raw_geometry_errors
-            and not image_label_geometry_errors
-            and not canonical_geometry_errors
-            and set(raw_image_counts) == {"LPS"}
-            and set(raw_label_counts) == {"LPS"}
-        )
-        audit["datasets"][str(ds_id)] = entry
-        audit["ok"] = bool(audit["ok"] and entry["ok"])
-
-    audit["source_orientation_counts"] = dict(global_source_counts)
-    audit["non_lps_source_cases"] = list(sorted(global_non_lps.values(), key=lambda x: x["case"]))
-    if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(audit, indent=2))
-    if fail_on_error and not audit["ok"]:
-        failed = [k for k, v in audit["datasets"].items() if not v["ok"]]
-        raise RuntimeError(f"orientation contract audit failed: {failed}")
-    return audit
 
 
-def _training_identifiers_from_raw(ds_id: int) -> list[str]:
-    """Return nnU-Net case identifiers from raw labelsTr.
-
-    nnU-Net stores split identifiers without channel suffixes and without file
-    endings, for example `PENGWIN_003`. Using labelsTr as the source keeps
-    labelsTr is the authoritative source for one split identifier per case.
-    """
-    cfg = DATASETS[ds_id]
-    labels = sorted((NN_RAW / cfg["name"] / "labelsTr").glob("*.mha"))
-    return [p.stem for p in labels]
 
 
-def _case_int_from_identifier(identifier: str) -> int:
-    """Convert nnU-Net identifier to the source integer case ID.
-
-    [DATA][Risk:High][Scope:split_leakage]
-    V5 uses per-anatomy identifiers such as `PENGWIN_003_LeftHip`. Splits must
-    still be grouped by source case `003`, otherwise Sacrum can be in train
-    while LeftHip from the same CT is in validation.
-    """
-    stem = identifier.replace("PENGWIN_", "")
-    return int(stem.split("_", 1)[0])
 
 
-def _identifier_sort_key(identifier: str) -> tuple[int, str]:
-    return _case_int_from_identifier(identifier), identifier
 
 
-def _source_fragment_count(identifier: str) -> int:
-    """Return original GT fragment count for stratified split balancing."""
-    cid = f"{_case_int_from_identifier(identifier):03d}"
-    case_dir = find_case_dir(cid)
-    if case_dir is None:
-        raise FileNotFoundError(f"source case missing for split generation: {identifier}")
-    lbl = canonicalize_sitk(sitk.ReadImage(str(case_dir / "label.mha")))
-    arr = sitk.GetArrayFromImage(lbl)
-    return int(len([v for v in np.unique(arr) if int(v) > 0]))
 
 
-def _round_robin_by_fragment_count(identifiers: list[str],
-                                   n_splits: int) -> list[list[str]]:
-    """Distribute high-fragment source cases across folds.
-
-    [DATA][Leakage:patient_case]
-    Multiple nnU-Net identifiers can share one source CT in Dataset537 V5
-    (`PENGWIN_003_Sacrum`, `PENGWIN_003_LeftHip`, ...). Keep those identifiers
-    in the same fold so validation remains source-case isolated.
-    """
-    by_case: dict[int, list[str]] = defaultdict(list)
-    for identifier in identifiers:
-        by_case[_case_int_from_identifier(identifier)].append(identifier)
-    rows = [
-        (_source_fragment_count(group[0]), cid, sorted(group, key=_identifier_sort_key))
-        for cid, group in by_case.items()
-    ]
-    rows.sort(key=lambda x: (-x[0], x[1]))
-    folds: list[list[str]] = [[] for _ in range(n_splits)]
-    for i, (_n_frag, _cid, group) in enumerate(rows):
-        folds[i % n_splits].extend(group)
-    return [sorted(fold, key=_identifier_sort_key) for fold in folds]
 
 
-def _generate_split_anatomy_splits(train_identifiers: list[str],
-                                   n_splits: int = 5) -> list[dict[str, list[str]]]:
-    """Generate fragment-count-balanced folds for split anatomy datasets.
-
-    Within each subject group we sort by GT fragment count and round-robin
-    distribute, which keeps high-fragment hard cases spread out.
-    """
-    pelvic = [i for i in train_identifiers if is_pelvic(_case_int_from_identifier(i))]
-    femur = [i for i in train_identifiers if is_femur(_case_int_from_identifier(i))]
-    if pelvic and femur:
-        groups = [
-            _round_robin_by_fragment_count(pelvic, n_splits),
-            _round_robin_by_fragment_count(femur, n_splits),
-        ]
-    else:
-        groups = [_round_robin_by_fragment_count(train_identifiers, n_splits)]
-    all_ids = set(train_identifiers)
-    splits = []
-    for fold_idx in range(n_splits):
-        val = sorted([identifier for group in groups for identifier in group[fold_idx]],
-                     key=_identifier_sort_key)
-        train = sorted(all_ids - set(val), key=_identifier_sort_key)
-        splits.append({"train": train, "val": val})
-    return splits
 
 
-def _generate_crossval_splits(train_identifiers: list[str],
-                              seed: int = 12345,
-                              n_splits: int = 5) -> list[dict[str, list[str]]]:
-    """Generate the same style of split file nnU-Net expects.
-
-    Prefer nnU-Net's own helper when importable. The deterministic fallback is
-    intentionally simple and only used for audit bootstrapping if the helper is
-    unavailable in a stripped environment.
-    """
-    try:
-        from nnunetv2.utilities.crossval_split import generate_crossval_split
-        return generate_crossval_split(train_identifiers, seed=seed, n_splits=n_splits)
-    except Exception:
-        rng = np.random.RandomState(seed)
-        ids = np.array(train_identifiers)
-        perm = rng.permutation(len(ids))
-        folds = np.array_split(perm, n_splits)
-        out = []
-        for i in range(n_splits):
-            val_idx = set(int(x) for x in folds[i])
-            train = [str(ids[j]) for j in range(len(ids)) if j not in val_idx]
-            val = [str(ids[j]) for j in range(len(ids)) if j in val_idx]
-            out.append({"train": train, "val": val})
-        return out
 
 
-def ensure_splits_final(ds_id: int, overwrite: bool = False) -> Path:
-    """Create `splits_final.json` for a preprocessed dataset if missing.
-
-    nnU-Net normally creates this lazily at training time. The Task1 rebuild
-    gate wants the file before training so the fold schedule is auditable and
-    stable. This helper writes the standard 5-fold split from rebuilt raw
-    `labelsTr` identifiers.
-    """
-    cfg = DATASETS[ds_id]
-    dst = NN_PREP / cfg["name"] / "splits_final.json"
-    if dst.exists() and not overwrite:
-        return dst
-    if cfg["kind"] in {"abbc_official", "contact_instance", "boundary_fragment"} and cfg["foundation_dataset"] is not None:
-        foundation_cfg = DATASETS[int(cfg["foundation_dataset"])]
-        foundation_split = NN_PREP / foundation_cfg["name"] / "splits_final.json"
-        if foundation_split.exists():
-            # Full Dataset537 uses the same pelvic case set as Dataset532, but
-            # root-cause mini builds can contain only six cases. Copy the
-            # foundation split only when the identifiers match exactly.
-            ids_here = set(_training_identifiers_from_raw(ds_id))
-            foundation_splits = json.loads(foundation_split.read_text())
-            ids_foundation = set()
-            for split in foundation_splits:
-                ids_foundation.update(split.get("train", []))
-                ids_foundation.update(split.get("val", []))
-            if ids_here == ids_foundation:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_text(foundation_split.read_text())
-                return dst
-    ids = _training_identifiers_from_raw(ds_id)
-    if len(ids) < 5:
-        raise RuntimeError(f"Ds{ds_id}: need at least 5 labelsTr cases for 5-fold split")
-    if cfg["kind"] in {"anatomy_semantic", "abbc_official", "contact_instance", "boundary_fragment", "bicm_v5"}:
-        splits = _generate_split_anatomy_splits(ids, n_splits=5)
-    else:
-        splits = _generate_crossval_splits(ids, seed=12345, n_splits=5)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(json.dumps(splits, indent=2))
-    return dst
 
 
-def audit_nnunet_preprocessed_datasets(ds_ids: list[int] | None = None,
-                                       out_json: Path | None = None,
-                                       ensure_splits: bool = False,
-                                       fail_on_missing: bool = True) -> dict:
-    """Audit planned/preprocessed nnU-Net datasets after plan_and_preprocess.
-
-    Checks the concrete artifacts needed before training:
-        - `dataset_fingerprint.json` from fingerprint extraction;
-        - `nnUNetResEncUNetLPlans.json` from planning;
-        - `nnUNetPlans_3d_fullres/*.npz` count matching raw labels;
-        - `splits_final.json` for a stable fold schedule.
-
-    Preprocessed arrays are `.npz/.pkl`, so physical orientation is no longer
-    represented there. The orientation gate is therefore enforced at raw audit
-    time, before nnU-Net resampling strips image direction metadata.
-    """
-    ds_ids = ds_ids or sorted(DATASETS)
-    audit = {"datasets": {}, "ok": True}
-    for ds_id in ds_ids:
-        cfg = DATASETS[ds_id]
-        root = NN_PREP / cfg["name"]
-        config_dir = root / "nnUNetPlans_3d_fullres"
-        ids = _training_identifiers_from_raw(ds_id)
-        if ensure_splits and root.exists():
-            ensure_splits_final(ds_id, overwrite=False)
-        npz_files = sorted(config_dir.glob("*.npz")) if config_dir.is_dir() else []
-        pkl_files = sorted(config_dir.glob("*.pkl")) if config_dir.is_dir() else []
-        splits_path = root / "splits_final.json"
-        split_summary = None
-        if splits_path.exists():
-            splits = json.loads(splits_path.read_text())
-            split_summary = {
-                "n_folds": len(splits),
-                "fold_sizes": [
-                    {
-                        "train": len(s.get("train", [])),
-                        "val": len(s.get("val", [])),
-                        "val_pelvic": sum(
-                            1 for identifier in s.get("val", [])
-                            if is_pelvic(_case_int_from_identifier(identifier))
-                        ),
-                        "val_femur": sum(
-                            1 for identifier in s.get("val", [])
-                            if is_femur(_case_int_from_identifier(identifier))
-                        ),
-                    }
-                    for s in splits
-                ],
-            }
-        split_balanced = False
-        if split_summary is not None and split_summary["n_folds"] > 0:
-            # Six-case root-cause datasets are intentionally tiny. A correct
-            # five-fold split is therefore 2/1/1/1/1 validation cases, not the
-            # same integer count in every fold. Audit balanced fold sizes
-            # instead of enforcing a single value.
-            n_folds = int(split_summary["n_folds"])
-            low = len(ids) // n_folds
-            high = (len(ids) + n_folds - 1) // n_folds
-            val_sizes = [int(item["val"]) for item in split_summary["fold_sizes"]]
-            split_balanced = (
-                sum(val_sizes) == len(ids)
-                and all(low <= size <= high for size in val_sizes)
-                and (max(val_sizes) - min(val_sizes) <= 1 if val_sizes else False)
-            )
-        entry = {
-            "dataset_id": ds_id,
-            "name": cfg["name"],
-            "kind": cfg["kind"],
-            "expected_cases": len(ids),
-            "dataset_json": (root / "dataset.json").exists(),
-            "fingerprint": (root / "dataset_fingerprint.json").exists(),
-            "plans": (root / "nnUNetResEncUNetLPlans.json").exists(),
-            "config_3d_fullres": config_dir.is_dir(),
-            "n_npz": len(npz_files),
-            "n_pkl": len(pkl_files),
-            "splits_final": splits_path.exists(),
-            "split_summary": split_summary,
-        }
-        entry["ok"] = (
-            entry["dataset_json"]
-            and entry["fingerprint"]
-            and entry["plans"]
-            and entry["config_3d_fullres"]
-            and entry["n_npz"] == entry["expected_cases"]
-            and entry["n_pkl"] == entry["expected_cases"]
-            and entry["splits_final"]
-            and (
-                cfg["kind"] not in {"anatomy_semantic", "abbc_official", "contact_instance", "boundary_fragment"}
-                or (
-                    split_summary is not None
-                    and split_balanced
-                    and (
-                        cfg["filter"] != "pelvic"
-                        or all(item["val_pelvic"] == item["val"] and item["val_femur"] == 0
-                               for item in split_summary["fold_sizes"])
-                    )
-                    and (
-                        cfg["filter"] != "femur"
-                        or all(item["val_femur"] == item["val"] and item["val_pelvic"] == 0
-                               for item in split_summary["fold_sizes"])
-                    )
-                )
-            )
-        )
-        audit["datasets"][str(ds_id)] = entry
-        audit["ok"] = bool(audit["ok"] and entry["ok"])
-    if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(audit, indent=2))
-    if fail_on_missing and not audit["ok"]:
-        failed = [k for k, v in audit["datasets"].items() if not v["ok"]]
-        raise RuntimeError(f"nnUNet preprocessed dataset audit failed: {failed}")
-    return audit
 
 
 BOUNDARY_SAMPLING_DISTRIBUTIONS = {
@@ -2353,258 +1590,66 @@ BOUNDARY_SAMPLING_DISTRIBUTIONS = {
 }
 
 
-def _preprocessed_3d_fullres_folder(ds_id: int) -> Path:
-    root = NN_PREP / DATASETS[ds_id]["name"]
-    preferred = root / "nnUNetPlans_3d_fullres"
-    if preferred.exists():
-        return preferred
-    candidates = sorted(p for p in root.iterdir() if p.is_dir() and p.name.endswith("_3d_fullres"))
-    if candidates:
-        return candidates[0]
-    raise FileNotFoundError(f"no preprocessed 3d_fullres folder found under {root}")
 
 
-def _plans_patch_size(ds_id: int, configuration: str = "3d_fullres") -> np.ndarray:
-    root = NN_PREP / DATASETS[ds_id]["name"]
-    plans_candidates = sorted(root.glob("*Plans.json"))
-    if not plans_candidates:
-        raise FileNotFoundError(f"plans json missing under {root}")
-    plans = json.loads(plans_candidates[-1].read_text())
-    cfg = plans.get("configurations", {}).get(configuration)
-    if not cfg:
-        raise KeyError(f"configuration {configuration!r} missing in {plans_candidates[-1]}")
-    return np.asarray(cfg["patch_size"], dtype=np.int64)
 
 
-def _class_location_key(class_locations: dict, label: int):
-    for key, value in class_locations.items():
-        try:
-            if int(key) == int(label) and len(value) > 0:
-                return key
-        except (TypeError, ValueError):
-            continue
-    return None
 
 
-def audit_boundary_sampling(ds_id: int = 537,
-                            profile: str = "boundary_fragment_v3_ridge80",
-                            batches: int = 100,
-                            batch_size: int = 2,
-                            cases: list[str] | None = None,
-                            out_json: Path | None = None,
-                            seed: int = 537031) -> dict:
-    """Simulate BoundaryFragment forced crops and count class coverage.
-
-    This intentionally avoids trainer initialization. It reads nnU-Net
-    preprocessed segmentations and properties, then applies the same forced-class
-    distribution used by the trainer to verify that the sparse class-2 ridge is
-    actually present in sampled patches before spending GPU time.
-    """
-
-    if profile not in BOUNDARY_SAMPLING_DISTRIBUTIONS:
-        raise ValueError(f"unknown sampling profile {profile!r}")
-    from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
-
-    folder = _preprocessed_3d_fullres_folder(ds_id)
-    patch = _plans_patch_size(ds_id)
-    case_ids = None
-    if cases:
-        case_ids = []
-        for case in cases:
-            text = str(case).strip()
-            case_ids.append(text if text.startswith("PENGWIN_") else f"PENGWIN_{int(text):03d}")
-    dataset = nnUNetDataset(str(folder), case_ids, num_images_properties_loading_threshold=0)
-    keys = sorted(dataset.keys())
-    if not keys:
-        raise RuntimeError(f"no cases available for sampling audit in {folder}")
-    case_cache = {}
-    for key in keys:
-        _data, seg, props = dataset.load_case(key)
-        case_cache[str(key)] = {
-            "labels": seg[0].astype(np.int16, copy=False),
-            "class_locations": props.get("class_locations", {}),
-        }
-
-    rng = np.random.default_rng(int(seed))
-    distribution = BOUNDARY_SAMPLING_DISTRIBUTIONS[profile]
-    rows = []
-    aggregate_counts = np.zeros(5, dtype=np.int64)
-    class2_present = 0
-    forced_label_counts: dict[str, int] = defaultdict(int)
-    for _ in range(int(batches) * int(batch_size)):
-        key = str(rng.choice(keys))
-        cached = case_cache[key]
-        labels = cached["labels"]
-        class_locations = cached["class_locations"]
-        available = [(label, prob) for label, prob in distribution if _class_location_key(class_locations, label) is not None]
-        if not available:
-            chosen_label = 0
-            center = np.asarray(labels.shape, dtype=np.int64) // 2
-        else:
-            label_values = [x[0] for x in available]
-            probs = np.asarray([x[1] for x in available], dtype=np.float64)
-            probs /= probs.sum()
-            chosen_label = int(rng.choice(label_values, p=probs))
-            loc_key = _class_location_key(class_locations, chosen_label)
-            locs = np.asarray(class_locations[loc_key])
-            center = np.asarray(locs[int(rng.integers(0, locs.shape[0]))], dtype=np.int64)
-            # nnU-Net properties may store class locations as (channel, z, y, x).
-            # Sampling audits operate in segmentation voxel coordinates, so only
-            # the final spatial triplet is meaningful for patch extraction.
-            if center.size > 3:
-                center = center[-3:]
-        lo = np.maximum(center - patch // 2, 0)
-        hi = np.minimum(lo + patch, np.asarray(labels.shape, dtype=np.int64))
-        lo = np.maximum(hi - patch, 0)
-        crop = labels[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
-        counts = np.bincount(crop.ravel().clip(0, 4), minlength=5).astype(np.int64)
-        aggregate_counts += counts
-        if counts[2] > 0:
-            class2_present += 1
-        forced_label_counts[str(chosen_label)] += 1
-        rows.append({
-            "case": key,
-            "forced_label": int(chosen_label),
-            "center_zyx": [int(v) for v in center],
-            "label_counts": {str(i): int(counts[i]) for i in range(5)},
-        })
-
-    class2_counts = [int(row["label_counts"]["2"]) for row in rows]
-    class1_counts = [int(row["label_counts"]["1"]) for row in rows]
-    class3_counts = [int(row["label_counts"]["3"]) for row in rows]
-    audit = {
-        "dataset_id": int(ds_id),
-        "name": DATASETS[ds_id]["name"],
-        "profile": profile,
-        "distribution": {str(k): float(v) for k, v in distribution},
-        "cases": keys,
-        "patch_size": [int(v) for v in patch],
-        "n_patches": int(len(rows)),
-        "class2_present_patch_ratio": float(class2_present / max(1, len(rows))),
-        "class2_voxels_mean": float(np.mean(class2_counts)) if class2_counts else 0.0,
-        "class2_voxels_median": float(np.median(class2_counts)) if class2_counts else 0.0,
-        "class1_voxels_mean": float(np.mean(class1_counts)) if class1_counts else 0.0,
-        "class3_voxels_mean": float(np.mean(class3_counts)) if class3_counts else 0.0,
-        "forced_label_counts": dict(sorted(forced_label_counts.items())),
-        "aggregate_label_counts": {str(i): int(aggregate_counts[i]) for i in range(5)},
-        "rows": rows,
-    }
-    if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(audit, indent=2))
-    return audit
 
 
 CONTACT_INSTANCE_SIDECAR_DIR = "contact_instance_targets"
 BICM_V5_INSTANCE_SIDECAR_DIR = "bicm_v5_instance_targets"
+BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR = "boundary_fragment_v3_targets"
 
 
-def _preprocessed_config_dir(ds_id: int, plans: str = "nnUNetPlans_3d_fullres") -> Path:
-    return NN_PREP / DATASETS[ds_id]["name"] / plans
+PENGWIN_BICM_V5_SIDECAR_MAX_LOCATIONS = int(
+    os.environ.get("PENGWIN_BICM_V5_SIDECAR_MAX_LOCATIONS", "30000")
+)
 
 
-def _raw_bicm_v5_instance_roi(sample_id: str) -> tuple[np.ndarray, str]:
-    """Return the original fragment instance ROI for one materialized V5 sample.
+def _instance_centers_and_sizes(inst: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-fragment (MAX_INSTANCE_ID+1, 3) centroids and voxel counts.
 
-    Args:
-        sample_id: nnU-Net sample key, for example `PENGWIN_003_LeftHip`.
-
-    Returns:
-        `(instance_roi, anatomy_name)` in the raw V5 sample geometry.
-
-    Raises:
-        FileNotFoundError: If the raw V5 sample or source PENGWIN GT label is
-            missing.
-        ValueError: If the sample name is not a V5 per-anatomy identifier.
-
-    [AUDIT][Risk:High][Scope:target_traceability]
-    V5 raw labels are semantic BICM labels (`0..4`), so the trainer cannot
-    derive true cross-fragment edges from `_seg.npy` alone. This helper restores
-    the source GT instance IDs by resampling the original case label into the
-    exact raw ROI geometry already materialized by `build_bicm_v5_dataset`.
-    That keeps Dataset537's public label contract unchanged while making the
-    V38 edge-affinity target auditable and reproducible.
+    Index 0 is reserved for background and stays NaN/0. Indices outside the valid
+    1..MAX_INSTANCE_ID range (registry: Sacrum 1-50 ... Femur 151-200) are also
+    left as NaN/0 so the sidecar contract matches the BICM V5 sidecar loader which
+    addresses fragments by global PENGWIN fragment ID. Sized to the full registry
+    range so per-anatomy Femur ROIs (IDs 151-200) no longer overflow the array.
     """
-    parts = str(sample_id).split("_")
-    if len(parts) != 3 or parts[0] != "PENGWIN":
-        raise ValueError(f"expected V5 sample id PENGWIN_<case>_<anatomy>, got {sample_id!r}")
-    case_id = str(parts[1]).zfill(3)
-    anatomy = str(parts[2])
-    lo, hi = anatomy_range(anatomy)
-    raw_ref_path = NN_RAW / DATASETS[537]["name"] / "labelsTr" / f"{sample_id}.mha"
-    if not raw_ref_path.exists():
-        raise FileNotFoundError(f"raw V5 label missing for sidecar generation: {raw_ref_path}")
-    case_map = {cd.name.zfill(3): cd for cd in list_cases("pelvic")}
-    if case_id not in case_map:
-        raise FileNotFoundError(f"source pelvic case {case_id} missing under {DATA_RAW}")
-    raw_ref = sitk.ReadImage(str(raw_ref_path))
-    source_label = canonicalize_sitk(sitk.ReadImage(str(case_map[case_id] / "label.mha")))
-    inst_img = sitk.Resample(
-        source_label,
-        raw_ref,
-        sitk.Transform(),
-        sitk.sitkNearestNeighbor,
-        0,
-        sitk.sitkUInt16,
-    )
-    inst = sitk.GetArrayFromImage(inst_img).astype(np.uint16, copy=False)
-    inst = np.where((inst >= lo) & (inst <= hi), inst, 0).astype(np.uint16, copy=False)
-    return inst, anatomy
-
-
-def _resample_raw_seg_to_preprocessed(raw_seg: np.ndarray,
-                                      target_shape: tuple[int, int, int],
-                                      props: dict,
-                                      plans_json: dict) -> np.ndarray:
-    """Match a raw ROI segmentation to nnU-Net's `_seg.npy` geometry.
-
-    [QC][Invariant:resampling_contract]
-    The V5 sidecar must align with training crops loaded from preprocessed
-    `_seg.npy`, not with the raw MHA. Use nnU-Net's own segmentation resampler
-    and the same current/new spacing metadata recorded during preprocessing.
-    A mismatch here would silently corrupt edge targets and invalidate every
-    V38 metric.
-    """
-    from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
-
-    current_spacing = props.get("spacing")
-    new_spacing = plans_json["configurations"]["3d_fullres"]["spacing"]
-    if current_spacing is None or len(current_spacing) != 3:
-        raise RuntimeError(f"invalid nnU-Net preprocessing spacing in properties: {current_spacing!r}")
-    resampled = resample_data_or_seg_to_shape(
-        raw_seg.astype(np.int16, copy=False)[None],
-        tuple(int(v) for v in target_shape),
-        current_spacing,
-        new_spacing,
-        is_seg=True,
-        order=1,
-        order_z=0,
-        force_separate_z=None,
-    )[0]
-    return np.where((resampled >= 1) & (resampled <= 150), resampled, 0).astype(np.uint16, copy=False)
-
-
-def _sample_locations(mask: np.ndarray,
-                      max_locations: int,
-                      seed: int) -> np.ndarray:
-    coords = np.argwhere(mask)
-    if coords.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.int32)
-    if coords.shape[0] > int(max_locations):
-        rng = np.random.default_rng(int(seed))
-        idx = rng.choice(coords.shape[0], size=int(max_locations), replace=False)
-        coords = coords[idx]
-    return coords.astype(np.int32, copy=False)
+    n_slots = MAX_INSTANCE_ID + 1
+    centers = np.full((n_slots, 3), np.nan, dtype=np.float32)
+    sizes = np.zeros((n_slots,), dtype=np.int64)
+    valid = valid_instance_mask(inst)
+    if not valid.any():
+        return centers, sizes
+    flat_ids = inst[valid].astype(np.int64, copy=False)
+    coords = np.argwhere(valid).astype(np.float32, copy=False)
+    sizes_view = np.bincount(flat_ids, minlength=n_slots).astype(np.int64, copy=False)
+    sizes[: sizes_view.shape[0]] = sizes_view[: sizes.shape[0]]
+    sum_z = np.bincount(flat_ids, weights=coords[:, 0], minlength=n_slots)
+    sum_y = np.bincount(flat_ids, weights=coords[:, 1], minlength=n_slots)
+    sum_x = np.bincount(flat_ids, weights=coords[:, 2], minlength=n_slots)
+    nonzero = np.flatnonzero(sizes_view[:n_slots] > 0)
+    nonzero = nonzero[valid_instance_mask(nonzero)]
+    if nonzero.size > 0:
+        denom = sizes_view[nonzero].astype(np.float32)
+        centers[nonzero, 0] = (sum_z[nonzero] / denom).astype(np.float32)
+        centers[nonzero, 1] = (sum_y[nonzero] / denom).astype(np.float32)
+        centers[nonzero, 2] = (sum_x[nonzero] / denom).astype(np.float32)
+    return centers, sizes
 
 
 def _fast_same_anatomy_contact_mask(inst: np.ndarray) -> np.ndarray:
-    """Fast sidecar contact sampler: adjacent different fragments, same anatomy.
+    """Same-anatomy adjacency contact mask on a single anatomy ROI.
 
-    The trainer computes crop-level contact targets again. This full-volume map
-    is only used to choose useful crop centers, so 6-neighbor fragment contact is
-    enough and avoids the expensive morphology used by the legacy ABBC target.
+    Each V5 raw sample is already cropped to one anatomy (Sacrum / LeftHip /
+    RightHip), so any pair of nonzero fragment voxels touching across a
+    6-neighbor face is by construction same-anatomy. Keeping the same-anatomy
+    guard makes the helper safe even when called on a full-pelvic instance
+    array.
     """
-    inst = inst.astype(np.uint16, copy=False)
+    inst = inst.astype(np.int32, copy=False)
     out = np.zeros(inst.shape, dtype=bool)
     for axis in range(3):
         a_sl = [slice(None), slice(None), slice(None)]
@@ -2615,7 +1660,7 @@ def _fast_same_anatomy_contact_mask(inst: np.ndarray) -> np.ndarray:
         b = inst[tuple(b_sl)]
         same_anatomy = (
             (a > 0) & (b > 0) & (a != b)
-            & (((a.astype(np.int32) - 1) // 50) == ((b.astype(np.int32) - 1) // 50))
+            & (((a - 1) // 50) == ((b - 1) // 50))
         )
         if same_anatomy.any():
             out_a = out[tuple(a_sl)]
@@ -2627,698 +1672,711 @@ def _fast_same_anatomy_contact_mask(inst: np.ndarray) -> np.ndarray:
     return out
 
 
-def _instance_centers_and_sizes(inst: np.ndarray) -> tuple[np.ndarray, np.ndarray, list[int]]:
-    """Return centroid per fragment in preprocessed voxel coordinates."""
-    centers = np.full((151, 3), np.nan, dtype=np.float32)
-    sizes = np.zeros(151, dtype=np.int64)
-    zero_center = []
-    for fragment_id in [int(v) for v in np.unique(inst) if 1 <= int(v) <= 150]:
-        coords = np.argwhere(inst == fragment_id)
-        sizes[fragment_id] = int(coords.shape[0])
-        if coords.shape[0] == 0:
-            zero_center.append(fragment_id)
-            continue
-        centers[fragment_id] = coords.mean(axis=0).astype(np.float32)
-    return centers, sizes, zero_center
+def _sample_locations(mask: np.ndarray,
+                      max_locations: int = PENGWIN_BICM_V5_SIDECAR_MAX_LOCATIONS,
+                      rng: np.random.Generator | None = None) -> np.ndarray:
+    """Deterministically sample up to `max_locations` (z, y, x) coords from `mask`.
 
-
-def generate_contact_instance_sidecars(ds_id: int = 537,
-                                       plans: str = "nnUNetPlans_3d_fullres",
-                                       force: bool = False,
-                                       out_json: Path | None = None,
-                                       fail_on_error: bool = True) -> dict:
-    """Generate compact sidecars from preprocessed instance labels.
-
-    The sidecars intentionally store metadata and crop-sampling coordinates
-    rather than full dense offset volumes. Dense support/core/contact/offset
-    targets are deterministic functions of the resampled instance crop and are
-    created in the trainer dataloader, which keeps Dataset537 from growing by
-    another very large target tree.
+    Returns an (N, 3) int32 array. The sampler shrinks the mask down to a cap
+    so the sidecar stays bounded for very large ROIs without losing positional
+    diversity.
     """
-    cfg = DATASETS[ds_id]
-    if cfg["kind"] not in {"contact_instance", "factorized_instance"}:
-        raise ValueError(f"Dataset{ds_id} is not a contact/factorized instance dataset")
-    config_dir = _preprocessed_config_dir(ds_id, plans=plans)
-    if not config_dir.is_dir():
-        raise FileNotFoundError(f"preprocessed config missing: {config_dir}")
-    sidecar_name = FACTOR_INSTANCE_SIDECAR_DIR if cfg["kind"] == "factorized_instance" else CONTACT_INSTANCE_SIDECAR_DIR
-    sidecar_dir = config_dir / sidecar_name
-    sidecar_dir.mkdir(parents=True, exist_ok=True)
-    rows = []
-    ok = True
-    max_locations = int(os.environ.get("PENGWIN_INSTANCE_SIDECAR_MAX_LOCATIONS", "30000"))
-    case_names = sorted({p.name.replace("_seg.npy", "") for p in config_dir.glob("*_seg.npy")})
-    case_names.extend(
-        p.stem for p in sorted(config_dir.glob("*.npz"))
-        if p.stem not in set(case_names)
-    )
-    for case in case_names:
-        seg_path = config_dir / f"{case}_seg.npy"
-        npz_path = config_dir / f"{case}.npz"
-        out_path = sidecar_dir / f"{case}.npz"
-        if out_path.exists() and not force:
-            try:
-                data = np.load(out_path)
-                rows.append(json.loads(str(data["audit_json"].item())))
-                continue
-            except Exception:
-                pass
-        if seg_path.exists():
-            seg = np.load(seg_path, "r")[0].astype(np.uint16, copy=False)
-        elif npz_path.exists():
-            seg = np.load(npz_path)["seg"][0].astype(np.uint16, copy=False)
-        else:
-            raise FileNotFoundError(f"missing preprocessed seg for {case} in {config_dir}")
-        support = seg > 0
-        contact = _fast_same_anatomy_contact_mask(seg)
-        from scipy import ndimage as ndi
+    if mask.size == 0 or not np.any(mask):
+        return np.zeros((0, 3), dtype=np.int32)
+    coords = np.argwhere(mask).astype(np.int32, copy=False)
+    cap = int(max(0, max_locations))
+    if cap <= 0 or coords.shape[0] <= cap:
+        return coords
+    rng = rng if rng is not None else np.random.default_rng(0)
+    idx = rng.choice(coords.shape[0], size=cap, replace=False)
+    idx.sort()
+    return coords[idx]
 
-        outside = ~support
-        distance_to_support = ndi.distance_transform_edt(outside) if support.any() else np.zeros_like(support, dtype=float)
-        hard_negative = outside & (distance_to_support <= 3.0)
-        centers, sizes, zero_center = _instance_centers_and_sizes(seg)
-        tiny_ids = [int(i) for i in np.where((sizes > 0) & (sizes < 1000))[0]]
-        tiny_mask = np.isin(seg, tiny_ids) if tiny_ids else np.zeros_like(support, dtype=bool)
-        cid_int = int(case.split("_")[-1])
-        contact_locations = _sample_locations(contact, max_locations, seed=cid_int * 17 + 3)
-        hard_locations = _sample_locations(hard_negative, max_locations, seed=cid_int * 17 + 5)
-        tiny_locations = _sample_locations(tiny_mask, max_locations, seed=cid_int * 17 + 7)
-        support_locations = _sample_locations(support, max_locations, seed=cid_int * 17 + 11)
-        audit = {
-            "case": case,
-            "shape": [int(v) for v in seg.shape],
-            "fragment_count": int(np.count_nonzero(sizes)),
-            "support_voxels": int(support.sum()),
-            "contact_voxels": int(contact.sum()),
-            "hard_negative_voxels": int(hard_negative.sum()),
-            "tiny_fragment_ids": tiny_ids,
-            "zero_center_fragments": [int(v) for v in zero_center],
-            "offset_finite_inside_support": not zero_center,
-            "contact_fraction_of_support": float(contact.sum()) / max(1, int(support.sum())),
-            "hard_negative_overlaps_contact": int((hard_negative & contact).sum()),
-        }
-        ok = bool(ok and not zero_center and audit["hard_negative_overlaps_contact"] == 0)
-        np.savez_compressed(
-            out_path,
-            centers_zyx=centers.astype(np.float32),
-            fragment_sizes=sizes.astype(np.int64),
-            contact_locations=contact_locations,
-            hard_negative_locations=hard_locations,
-            tiny_locations=tiny_locations,
-            support_locations=support_locations,
-            audit_json=np.array(json.dumps(audit)),
+
+def _resample_instance_to_preprocessed(inst_roi: np.ndarray,
+                                       raw_label_img: sitk.Image,
+                                       pkl_properties: dict,
+                                       target_shape_zyx: tuple[int, int, int],
+                                       target_spacing_zyx: tuple[float, float, float]) -> np.ndarray:
+    """Resample an anatomy-ROI instance ID array to the preprocessed grid.
+
+    The instance ID grid is aligned in voxel space to the raw V5 label MHA
+    (since both come from the same anatomy bbox). nnUNet preprocessing changes
+    spacing/shape but keeps origin/direction. We mirror that by constructing a
+    reference image at the preprocessed spacing/shape with the same origin and
+    direction, then nearest-neighbor resampling.
+
+    `target_shape_zyx` is the preprocessed grid shape (matches the `seg` tensor
+    in the preprocessed `.npz`) and `target_spacing_zyx` is the plan spacing
+    from `nnUNetPlans.json`. Both must be passed explicitly because the per-
+    sample pkl stores only the *source* spacing of the original case.
+    """
+    src = sitk.GetImageFromArray(inst_roi.astype(np.uint16, copy=False))
+    src.SetSpacing(raw_label_img.GetSpacing())
+    src.SetOrigin(raw_label_img.GetOrigin())
+    src.SetDirection(raw_label_img.GetDirection())
+
+    target_spacing_xyz = (
+        float(target_spacing_zyx[2]),
+        float(target_spacing_zyx[1]),
+        float(target_spacing_zyx[0]),
+    )
+    out_size_xyz = (
+        int(target_shape_zyx[2]),
+        int(target_shape_zyx[1]),
+        int(target_shape_zyx[0]),
+    )
+
+    bbox = pkl_properties.get("bbox_used_for_cropping")
+    if bbox is not None:
+        crop_lo_zyx = (int(bbox[0][0]), int(bbox[1][0]), int(bbox[2][0]))
+    else:
+        crop_lo_zyx = (0, 0, 0)
+    direction = raw_label_img.GetDirection()
+    direction_mat = np.array(direction, dtype=np.float64).reshape(3, 3)
+    # bbox_used_for_cropping is in (z, y, x); convert to (x, y, z) for sitk origin shift.
+    crop_lo_xyz = np.array(
+        [crop_lo_zyx[2], crop_lo_zyx[1], crop_lo_zyx[0]], dtype=np.float64
+    )
+    raw_spacing_xyz = np.array(raw_label_img.GetSpacing(), dtype=np.float64)
+    shift_world = direction_mat @ (crop_lo_xyz * raw_spacing_xyz)
+    new_origin = tuple(float(o + s) for o, s in zip(raw_label_img.GetOrigin(), shift_world))
+
+    ref = sitk.Image(out_size_xyz, sitk.sitkUInt16)
+    ref.SetSpacing(target_spacing_xyz)
+    ref.SetOrigin(new_origin)
+    ref.SetDirection(direction)
+
+    resampled = sitk.Resample(
+        src,
+        ref,
+        sitk.Transform(),
+        sitk.sitkNearestNeighbor,
+        0,
+        sitk.sitkUInt16,
+    )
+    return sitk.GetArrayFromImage(resampled).astype(np.uint16, copy=False)
+
+
+def _build_one_bicm_v5_instance_sidecar(sample_id: str,
+                                        raw_label_path: Path,
+                                        source_case_dir: Path,
+                                        preprocessed_pkl: Path,
+                                        preprocessed_npz: Path,
+                                        out_path: Path,
+                                        max_locations: int,
+                                        plan_target_spacing_zyx: tuple[float, float, float]) -> dict:
+    """Build the .npz sidecar for one anatomy ROI sample."""
+    import pickle
+
+    parts = sample_id.split("_")
+    if len(parts) < 3:
+        raise ValueError(f"unexpected sample_id format: {sample_id!r}")
+    cid = int(parts[1])
+    anatomy = "_".join(parts[2:])
+    # Full 4-anatomy view: Ds538 builds a Femur ROI sample (anatomy="Femur",
+    # IDs 151-200). Ds537 (pelvic-only) simply never passes "Femur", so the
+    # superset is safe and the femur ROI is no longer rejected here.
+    if anatomy not in V5_ANATOMY_RANGES_WITH_FEMUR:
+        raise ValueError(f"{sample_id}: anatomy {anatomy!r} not in {sorted(V5_ANATOMY_RANGES_WITH_FEMUR)}")
+    lo, hi = V5_ANATOMY_RANGES_WITH_FEMUR[anatomy]
+
+    raw_lbl_img = canonicalize_sitk(sitk.ReadImage(str(raw_label_path)))
+    raw_v5_arr = sitk.GetArrayFromImage(raw_lbl_img)
+
+    src_lbl_img = canonicalize_sitk(sitk.ReadImage(str(source_case_dir / "label.mha")))
+    inst_full = sitk.GetArrayFromImage(src_lbl_img).astype(np.uint16, copy=False)
+    anat_mask = anatomy_mask_from_instances(inst_full, anatomy)
+    pad_vox = int(os.environ.get("PENGWIN_V5_ROI_PAD_VOX", "24"))
+    bbox = bbox_from_mask(anat_mask, pad_vox=pad_vox)
+    if bbox is None:
+        raise RuntimeError(f"{sample_id}: empty anatomy ROI")
+    inst_roi = inst_full[bbox]
+    inst_roi = np.where((inst_roi >= lo) & (inst_roi <= hi), inst_roi, 0).astype(np.uint16, copy=False)
+    if inst_roi.shape != raw_v5_arr.shape:
+        raise RuntimeError(
+            f"{sample_id}: raw instance ROI shape {inst_roi.shape} != raw V5 label "
+            f"shape {raw_v5_arr.shape} (bbox replay mismatch)"
         )
-        rows.append(audit)
-    audit_payload = {
-        "dataset_id": int(ds_id),
-        "name": cfg["name"],
-        "plans": plans,
-        "sidecar_dir": str(sidecar_dir),
-        "sidecar_policy": (
-            "compact metadata; dense crop targets generated by "
-            + ("PengwinTrainerFactorizedInstanceV4" if cfg["kind"] == "factorized_instance" else "PengwinTrainerLegacyTopologyV1")
-        ),
-        "n_cases": len(rows),
-        "ok": bool(ok and len(rows) > 0),
-        "cases": rows,
-        "summary": {
-            "zero_center_case_count": int(sum(1 for r in rows if r["zero_center_fragments"])),
-            "mean_contact_fraction_of_support": float(np.mean([r["contact_fraction_of_support"] for r in rows])) if rows else 0.0,
-            "total_contact_voxels": int(sum(r["contact_voxels"] for r in rows)),
-            "total_hard_negative_voxels": int(sum(r["hard_negative_voxels"] for r in rows)),
+
+    with open(preprocessed_pkl, "rb") as fh:
+        props = pickle.load(fh)
+    preprocessed = np.load(preprocessed_npz)
+    seg = np.asarray(preprocessed["seg"])
+    if seg.ndim == 4:
+        seg = seg[0]
+    seg = seg.astype(np.int16, copy=False)
+
+    target_shape_zyx = tuple(int(v) for v in seg.shape)
+    instance = _resample_instance_to_preprocessed(
+        inst_roi, raw_lbl_img, props,
+        target_shape_zyx=target_shape_zyx,
+        target_spacing_zyx=plan_target_spacing_zyx,
+    )
+    if instance.shape != seg.shape:
+        raise RuntimeError(
+            f"{sample_id}: resampled instance shape {instance.shape} != preprocessed seg shape {seg.shape}"
+        )
+    # The V5 raw target labels (0..4) define support/exterior/contact regions and
+    # are the source of truth for the spatial location pools below. Instance IDs
+    # add fragment identity but do not redefine the location masks.
+    bg = V5_LABELS["background"]
+    ext = V5_LABELS["exterior_context"]
+    shell = V5_LABELS["interior_shell"]
+    core = V5_LABELS["core"]
+    contact = V5_LABELS["contact_surface"]
+    support_mask = (seg == shell) | (seg == core) | (seg == contact)
+    contact_mask = (seg == contact)
+    edge_mask = _fast_same_anatomy_contact_mask(instance)
+    if not contact_mask.any() and edge_mask.any():
+        # Some V5 target profiles emit no `contact_surface` voxels even when
+        # adjacent same-anatomy fragments touch; treat the adjacency mask as a
+        # contact-location fallback in that case so the sidecar pool is never
+        # empty for multi-fragment ROIs.
+        contact_mask = edge_mask
+    hard_negative_mask = (seg == ext)
+    # Tiny fragments: per-fragment support below a small voxel threshold.
+    centers_zyx, fragment_sizes = _instance_centers_and_sizes(instance)
+    tiny_threshold = int(os.environ.get("PENGWIN_BICM_V5_TINY_FRAGMENT_VOXELS", "512"))
+    tiny_mask = np.zeros_like(support_mask, dtype=bool)
+    if support_mask.any():
+        for fid in range(1, MAX_INSTANCE_ID + 1):
+            sz = int(fragment_sizes[fid])
+            if 0 < sz <= tiny_threshold:
+                tiny_mask |= (instance == fid)
+
+    rng = np.random.default_rng(int(cid) * 1000 + (lo // 50))
+    contact_locations = _sample_locations(contact_mask, max_locations, rng)
+    tiny_locations = _sample_locations(tiny_mask, max_locations, rng)
+    support_locations = _sample_locations(support_mask & ~contact_mask, max_locations, rng)
+    hard_negative_locations = _sample_locations(hard_negative_mask, max_locations, rng)
+    edge_locations = _sample_locations(edge_mask, max_locations, rng)
+
+    valid_fragments = [int(fid) for fid in range(1, MAX_INSTANCE_ID + 1) if int(fragment_sizes[fid]) > 0]
+    audit = {
+        "sample_id": sample_id,
+        "case_id": f"{cid:03d}",
+        "anatomy": anatomy,
+        "anatomy_range": [int(lo), int(hi)],
+        "raw_v5_shape": list(int(v) for v in raw_v5_arr.shape),
+        "preprocessed_shape": list(int(v) for v in seg.shape),
+        "fragment_count": len(valid_fragments),
+        "valid_fragment_ids": valid_fragments,
+        "voxel_counts": {
+            "support": int(support_mask.sum()),
+            "contact": int(contact_mask.sum()),
+            "edge_adjacency": int(edge_mask.sum()),
+            "tiny": int(tiny_mask.sum()),
+            "hard_negative": int(hard_negative_mask.sum()),
+            "background": int((seg == bg).sum()),
+        },
+        "location_counts": {
+            "contact_locations": int(contact_locations.shape[0]),
+            "tiny_locations": int(tiny_locations.shape[0]),
+            "support_locations": int(support_locations.shape[0]),
+            "hard_negative_locations": int(hard_negative_locations.shape[0]),
+            "edge_locations": int(edge_locations.shape[0]),
+        },
+        "tiny_fragment_voxel_threshold": tiny_threshold,
+        "max_locations": int(max_locations),
+        "v5_label_map": dict(V5_LABELS),
+        "validations": {
+            "instance_shape_matches_seg": bool(instance.shape == seg.shape),
+            "support_covers_all_instance_voxels": bool(((instance > 0) & ~support_mask).sum() == 0),
         },
     }
-    if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(audit_payload, indent=2))
-    if fail_on_error and not audit_payload["ok"]:
-        raise RuntimeError(f"contact-instance sidecar audit failed for Dataset{ds_id}")
-    return audit_payload
+    audit_json = np.array(json.dumps(audit, sort_keys=True), dtype=object)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # np.savez appends `.npz` to filenames without that suffix; write to a
+    # `.partial.npz` next to the final path so concurrent writers cannot read
+    # a half-written sidecar.
+    tmp_stem = out_path.with_suffix("")
+    tmp_path = tmp_stem.with_name(tmp_stem.name + ".partial")
+    tmp_npz = tmp_path.with_suffix(".partial.npz")
+    if tmp_npz.exists():
+        tmp_npz.unlink()
+    np.savez(
+        str(tmp_path),
+        centers_zyx=centers_zyx,
+        fragment_sizes=fragment_sizes,
+        contact_locations=contact_locations,
+        hard_negative_locations=hard_negative_locations,
+        tiny_locations=tiny_locations,
+        support_locations=support_locations,
+        edge_locations=edge_locations,
+        instance=instance,
+        audit_json=audit_json,
+    )
+    os.replace(str(tmp_npz), str(out_path))
+    return audit
 
 
-def generate_bicm_v5_instance_sidecars(ds_id: int = 537,
-                                       plans: str = "nnUNetPlans_3d_fullres",
-                                       force: bool = False,
-                                       out_json: Path | None = None,
-                                       fail_on_error: bool = True) -> dict:
-    """Generate V5 sidecars with instance IDs aligned to preprocessed crops.
+def build_bicm_v5_instance_sidecars(ds_id: int = 537,
+                                    force: bool = False,
+                                    case_subset: list[str] | None = None,
+                                    plan_configuration: str = "nnUNetPlans_3d_fullres",
+                                    ) -> dict:
+    """Build BICM V5 per-sample instance sidecars for the requested dataset.
 
-    The active V5 dataset stores semantic labels because its public nnU-Net
-    contract is a simple BICM target. V38 needs an additional relational target:
-    whether neighboring voxels belong to different fragments in the same ROI.
-    This function builds that supervision as a sidecar from the original GT
-    labels without changing `labelsTr` or the V5 evaluator.
+    For each `PENGWIN_<cid>_<anatomy>.mha` in the raw `labelsTr` directory the
+    function:
+      1. Reads the raw V5 target MHA (the cropped anatomy ROI label, values 0..4).
+      2. Reads the original case `label.mha` and rebuilds the anatomy-ROI
+         instance ID array using the same bbox/pad_vox contract as
+         `build_bicm_v5_dataset`.
+      3. Resamples the instance ID ROI onto the preprocessed grid recorded in
+         `nnUNetPlans_3d_fullres/<sample_id>.pkl` (nearest-neighbor).
+      4. Combines the resampled instance map with the preprocessed V5 seg
+         (`<sample_id>.npz['seg']`) to derive centers, sizes, and contact /
+         tiny / support / hard-negative / edge location pools.
+      5. Saves the sidecar `.npz` under
+         `<preprocessed>/<plan_configuration>/bicm_v5_instance_targets/`.
 
-    [DATA][Leakage]
-    These sidecars are generated only from training GT labels for the locked
-    overfit/root-cause dataset. They must not be generated for test/inference
-    cases, and they are not model inputs.
-
-    [QA][Gate:v38_before_training]
-    Training with edge-affinity supervision is blocked unless this audit reports
-    support alignment with semantic `_seg.npy`, nonzero contact/edge positives
-    for the expected contact-positive ROIs, and zero invalid instance IDs.
+    Returns a dict with `dataset_id`, `output_dir`, list of written `samples`,
+    and `audit_path` pointing at the per-sample audit JSON.
     """
     cfg = DATASETS[ds_id]
     if cfg["kind"] != "bicm_v5":
         raise ValueError(f"Dataset{ds_id} is not a BICM V5 dataset")
-    config_dir = _preprocessed_config_dir(ds_id, plans=plans)
-    if not config_dir.is_dir():
-        raise FileNotFoundError(f"preprocessed config missing: {config_dir}")
-    plans_path = NN_PREP / cfg["name"] / "nnUNetResEncUNetLPlans.json"
+
+    preprocessed_root = NN_PREP / cfg["name"]
+
+    # Resolve the plan, then take the preprocessed-DATA directory from the plan's
+    # `data_identifier` — never assume the data dir name equals the plan name.
+    # nnUNet's ResEnc planners reuse the DEFAULT preprocessor, so the plan FILE
+    # (e.g. nnUNetResEncUNetLPlans.json) and the preprocessed-data dir
+    # (data_identifier, e.g. "nnUNetPlans_3d_fullres") have DIFFERENT names. The
+    # old code hardcoded "nnUNetPlans.json" + used plan_configuration as the data
+    # dir, which (a) missed the ResEncL plan's spacing and (b) on a ResEncL-only
+    # tree (no nnUNetPlans.json) failed outright. plan_configuration names the
+    # PLAN: "<plans_name>_<config>" (e.g. "nnUNetResEncUNetLPlans_3d_fullres").
+    if "_" in plan_configuration:
+        plans_name, plan_cfg_key = plan_configuration.split("_", 1)
+    else:
+        plans_name, plan_cfg_key = "nnUNetPlans", plan_configuration
+    plans_path = preprocessed_root / f"{plans_name}.json"
     if not plans_path.exists():
-        raise FileNotFoundError(f"plans JSON missing: {plans_path}")
-    plans_json = json.loads(plans_path.read_text())
-    sidecar_dir = config_dir / BICM_V5_INSTANCE_SIDECAR_DIR
-    sidecar_dir.mkdir(parents=True, exist_ok=True)
-    case_names = sorted({p.name.replace("_seg.npy", "") for p in config_dir.glob("*_seg.npy")})
-    rows: list[dict] = []
-    ok = bool(case_names)
-    max_locations = int(os.environ.get("PENGWIN_BICM_V5_SIDECAR_MAX_LOCATIONS", "30000"))
-    for sample_id in case_names:
-        seg_path = config_dir / f"{sample_id}_seg.npy"
-        pkl_path = config_dir / f"{sample_id}.pkl"
-        out_path = sidecar_dir / f"{sample_id}.npz"
+        raise FileNotFoundError(f"Missing {plans_name}.json under {preprocessed_root}")
+    plans = json.loads(plans_path.read_text())
+    plan_cfg = plans.get("configurations", {}).get(plan_cfg_key)
+    if plan_cfg is None:
+        raise KeyError(
+            f"Plan configuration {plan_cfg_key!r} not found in {plans_path}; "
+            f"available: {sorted(plans.get('configurations', {}))}"
+        )
+    plan_target_spacing_zyx = tuple(float(v) for v in plan_cfg["spacing"])
+    data_identifier = plan_cfg.get("data_identifier", plan_configuration)
+
+    raw_labels_dir = NN_RAW / cfg["name"] / "labelsTr"
+    preprocessed_dir = preprocessed_root / data_identifier
+    output_dir = preprocessed_dir / BICM_V5_INSTANCE_SIDECAR_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_label_files = sorted(raw_labels_dir.glob("PENGWIN_*.mha"))
+    if case_subset:
+        wanted = {str(c).zfill(3) for c in case_subset}
+        raw_label_files = [
+            p for p in raw_label_files
+            if p.name.split("_")[1] in wanted
+        ]
+    if not raw_label_files:
+        raise FileNotFoundError(
+            f"No raw V5 label MHA found under {raw_labels_dir} for subset={case_subset!r}"
+        )
+
+    max_locations = PENGWIN_BICM_V5_SIDECAR_MAX_LOCATIONS
+    log.info(
+        "[bicm_v5_sidecars] Ds%d %s — %d samples → %s (max_locations=%d)",
+        ds_id, cfg["name"], len(raw_label_files), output_dir, max_locations,
+    )
+
+    audits: list[dict] = []
+    written = 0
+    skipped = 0
+    for raw_lbl in raw_label_files:
+        sample_id = raw_lbl.stem  # PENGWIN_003_LeftHip
+        out_path = output_dir / f"{sample_id}.npz"
         if out_path.exists() and not force:
-            try:
-                data = np.load(out_path)
-                rows.append(json.loads(str(data["audit_json"].item())))
-                continue
-            except Exception:
-                pass
-        if not seg_path.exists() or not pkl_path.exists():
-            raise FileNotFoundError(f"missing preprocessed seg/properties for {sample_id}")
-        import pickle
+            skipped += 1
+            continue
+        cid_str = sample_id.split("_")[1]
+        case_dir = find_case_dir(cid_str)
+        if case_dir is None:
+            raise FileNotFoundError(f"{sample_id}: source case {cid_str} not found under {DATA_RAW}")
+        preprocessed_pkl = preprocessed_dir / f"{sample_id}.pkl"
+        preprocessed_npz = preprocessed_dir / f"{sample_id}.npz"
+        if not preprocessed_pkl.exists() or not preprocessed_npz.exists():
+            raise FileNotFoundError(
+                f"{sample_id}: missing preprocessed pkl/npz under {preprocessed_dir}; "
+                "run `nnUNetv2_plan_and_preprocess` for the dataset first."
+            )
+        audit = _build_one_bicm_v5_instance_sidecar(
+            sample_id=sample_id,
+            raw_label_path=raw_lbl,
+            source_case_dir=case_dir,
+            preprocessed_pkl=preprocessed_pkl,
+            preprocessed_npz=preprocessed_npz,
+            out_path=out_path,
+            max_locations=max_locations,
+            plan_target_spacing_zyx=plan_target_spacing_zyx,
+        )
+        audits.append(audit)
+        written += 1
+        log.info("  [%d/%d] %s", written + skipped, len(raw_label_files), sample_id)
 
-        semantic = np.load(seg_path, "r")[0].astype(np.uint8, copy=False)
-        with open(pkl_path, "rb") as f:
-            props = pickle.load(f)
-        raw_inst, anatomy = _raw_bicm_v5_instance_roi(sample_id)
-        inst = _resample_raw_seg_to_preprocessed(
-            raw_inst,
-            target_shape=tuple(int(v) for v in semantic.shape),
-            props=props,
-            plans_json=plans_json,
-        )
-        support_from_instance = inst > 0
-        support_from_semantic = np.isin(
-            semantic,
-            [
-                V5_LABELS["interior_shell"],
-                V5_LABELS["core"],
-                V5_LABELS["contact_surface"],
-            ],
-        )
-        support_mismatch = int(np.count_nonzero(support_from_instance != support_from_semantic))
-        support_mismatch_fraction = float(support_mismatch) / max(1, int(support_from_semantic.sum()))
-        contact = _fast_same_anatomy_contact_mask(inst)
-        edge_break, edge_valid = _instance_edge_break_target(inst)
-        centers, sizes, zero_center = _instance_centers_and_sizes(inst)
-        tiny_ids = [int(i) for i in np.where((sizes > 0) & (sizes < 1000))[0]]
-        tiny_mask = np.isin(inst, tiny_ids) if tiny_ids else np.zeros_like(support_from_instance, dtype=bool)
-        from scipy import ndimage as ndi
-
-        hard_negative = (~support_from_instance) & (
-            ndi.distance_transform_edt(~support_from_instance) <= 3.0
-        ) if support_from_instance.any() else np.zeros_like(support_from_instance, dtype=bool)
-        seed_base = sum(ord(ch) for ch in sample_id)
-        contact_locations = _sample_locations(contact, max_locations, seed=seed_base + 3)
-        hard_locations = _sample_locations(hard_negative, max_locations, seed=seed_base + 5)
-        tiny_locations = _sample_locations(tiny_mask, max_locations, seed=seed_base + 7)
-        support_locations = _sample_locations(support_from_instance, max_locations, seed=seed_base + 11)
-        edge_locations = _sample_locations(edge_break.any(axis=0), max_locations, seed=seed_base + 13)
-        invalid_ids = sorted(int(v) for v in np.unique(inst) if int(v) < 0 or int(v) > 150)
-        row = {
-            "sample": sample_id,
-            "anatomy": anatomy,
-            "shape": [int(v) for v in inst.shape],
-            "fragment_count": int(np.count_nonzero(sizes)),
-            "instance_support_voxels": int(support_from_instance.sum()),
-            "semantic_support_voxels": int(support_from_semantic.sum()),
-            "support_mismatch_voxels": support_mismatch,
-            "support_mismatch_fraction": support_mismatch_fraction,
-            "contact_voxels": int(contact.sum()),
-            "edge_break_voxels": int((edge_break > 0.5).sum()),
-            "edge_valid_voxels": int((edge_valid > 0.5).sum()),
-            "edge_break_fraction_valid": float((edge_break > 0.5).sum()) / max(1, int((edge_valid > 0.5).sum())),
-            "contact_fraction_support": float(contact.sum()) / max(1, int(support_from_instance.sum())),
-            "tiny_fragment_ids": tiny_ids,
-            "zero_center_fragments": [int(v) for v in zero_center],
-            "invalid_instance_ids": invalid_ids,
-        }
-        # [QC][Invariant:alignment]
-        # Support mismatch is expected to be near zero, but not exactly zero:
-        # semantic BICM labels and restored instance IDs are resampled through
-        # separate nearest-neighbor label maps. Tiny boundary differences are
-        # acceptable for edge-affinity QA; larger drift would mean V38 is
-        # supervising topology on a different foreground than the support head.
-        # The 0.5% cap is intentionally stricter than a metric tolerance because
-        # this is a target-alignment guard, not a model-performance threshold.
-        ok = bool(
-            ok
-            and support_mismatch_fraction <= 0.005
-            and not invalid_ids
-            and not zero_center
-            and int(support_from_instance.sum()) > 0
-        )
-        np.savez_compressed(
-            out_path,
-            instance=inst.astype(np.uint16, copy=False),
-            centers_zyx=centers.astype(np.float32),
-            fragment_sizes=sizes.astype(np.int64),
-            contact_locations=contact_locations,
-            edge_locations=edge_locations,
-            hard_negative_locations=hard_locations,
-            tiny_locations=tiny_locations,
-            support_locations=support_locations,
-            audit_json=np.array(json.dumps(row)),
-        )
-        rows.append(row)
-    contact_positive = [r for r in rows if int(r["contact_voxels"]) > 0]
-    audit_payload = {
-        "dataset_id": int(ds_id),
-        "name": cfg["name"],
-        "plans": plans,
-        "sidecar_dir": str(sidecar_dir),
-        "sidecar_policy": (
-            "V5 semantic labels stay public; sidecars store resampled original "
-            "instance IDs and edge/contact sampling metadata for V38 root-cause training."
-        ),
-        "n_samples": len(rows),
-        "ok": bool(ok and rows),
-        "summary": {
-            "support_mismatch_sample_count": int(sum(1 for r in rows if r["support_mismatch_voxels"])),
-            "max_support_mismatch_fraction": float(max([r["support_mismatch_fraction"] for r in rows], default=0.0)),
-            "zero_center_sample_count": int(sum(1 for r in rows if r["zero_center_fragments"])),
-            "contact_positive_sample_count": int(len(contact_positive)),
-            "total_edge_break_voxels": int(sum(r["edge_break_voxels"] for r in rows)),
-            "mean_edge_break_fraction_valid": float(np.mean([r["edge_break_fraction_valid"] for r in rows])) if rows else 0.0,
-        },
-        "samples": rows,
+    audit_path = RESULT_REPORT / f"build_bicm_v5_instance_sidecars_ds{ds_id}_{RESULT_DATE}.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(json.dumps({
+        "dataset_id": ds_id,
+        "dataset_name": cfg["name"],
+        "output_dir": str(output_dir),
+        "plan_configuration": plan_configuration,
+        "max_locations": max_locations,
+        "force": bool(force),
+        "case_subset": case_subset,
+        "written": written,
+        "skipped": skipped,
+        "samples": audits,
+    }, indent=2))
+    log.info(
+        "[bicm_v5_sidecars] wrote=%d skipped=%d audit=%s",
+        written, skipped, audit_path,
+    )
+    return {
+        "dataset_id": ds_id,
+        "output_dir": str(output_dir),
+        "written": written,
+        "skipped": skipped,
+        "samples": audits,
+        "audit_path": str(audit_path),
     }
-    if out_json is not None:
-        out_json.parent.mkdir(parents=True, exist_ok=True)
-        out_json.write_text(json.dumps(audit_payload, indent=2))
-    if fail_on_error and not audit_payload["ok"]:
-        raise RuntimeError(f"BICM V5 instance sidecar audit failed for Dataset{ds_id}")
-    return audit_payload
+
+
+def generate_boundary_fragment_v3_target_sidecars(
+    ds_id: int = 537,
+    force: bool = False,
+    case_subset: list[str] | None = None,
+    plan_configuration: str = "nnUNetPlans_3d_fullres",
+) -> dict:
+    """Build BoundaryFragment V3 (5-class) target sidecars on the preprocessed ROI grid.
+
+    For each preprocessed sample `PENGWIN_<cid>_<anatomy>.npz` the function:
+      1. Loads the per-sample BICM V5 instance sidecar (`bicm_v5_instance_targets/<sample_id>.npz`)
+         whose `instance` array is the global PENGWIN fragment-ID grid already
+         resampled onto the preprocessed plan spacing.
+      2. Calls `compute_boundary_fragment_target` with the plan target spacing
+         to derive the dense V3 semantic target
+         (0=background, 1=external_context, 2=fracture_barrier,
+          3=fragment_shell, 4=fragment_core).
+      3. Validates that every emitted label is within {0..4} and that every GT
+         fragment receives at least one core voxel (same invariant the raw
+         per-case worker enforces).
+      4. Saves the sidecar `.npz` containing `target` (uint8, shape matches the
+         preprocessed seg grid) under
+         `<preprocessed>/<plan_configuration>/boundary_fragment_v3_targets/`.
+
+    Returns a dict with `dataset_id`, `output_dir`, the list of written
+    `samples`, and `audit_path` pointing at the per-sample audit JSON.
+    """
+    cfg = DATASETS[ds_id]
+    if cfg["kind"] != "bicm_v5":
+        raise ValueError(
+            f"Dataset{ds_id} ({cfg['name']}) is not a BICM V5 dataset; cannot "
+            "derive BoundaryFragment V3 targets from instance sidecars."
+        )
+
+    preprocessed_root = NN_PREP / cfg["name"]
+
+    # Resolve plan, then take the data dir from the plan's data_identifier (see
+    # build_bicm_v5_instance_sidecars: under ResEnc the plan-file name and the
+    # data-dir name differ). plan_configuration names the PLAN "<plans_name>_<config>".
+    if "_" in plan_configuration:
+        plans_name, plan_cfg_key = plan_configuration.split("_", 1)
+    else:
+        plans_name, plan_cfg_key = "nnUNetPlans", plan_configuration
+    plans_path = preprocessed_root / f"{plans_name}.json"
+    if not plans_path.exists():
+        raise FileNotFoundError(f"Missing {plans_name}.json under {preprocessed_root}")
+    plans = json.loads(plans_path.read_text())
+    plan_cfg = plans.get("configurations", {}).get(plan_cfg_key)
+    if plan_cfg is None:
+        raise KeyError(
+            f"Plan configuration {plan_cfg_key!r} not found in {plans_path}; "
+            f"available: {sorted(plans.get('configurations', {}))}"
+        )
+    plan_target_spacing_zyx = tuple(float(v) for v in plan_cfg["spacing"])
+    data_identifier = plan_cfg.get("data_identifier", plan_configuration)
+
+    preprocessed_dir = preprocessed_root / data_identifier
+    instance_dir = preprocessed_dir / BICM_V5_INSTANCE_SIDECAR_DIR
+    output_dir = preprocessed_dir / BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not instance_dir.is_dir():
+        raise FileNotFoundError(
+            f"BICM V5 instance sidecar directory missing: {instance_dir}. "
+            "Run `build-instance-sidecars` before deriving BoundaryFragment V3 targets."
+        )
+    instance_files = sorted(instance_dir.glob("PENGWIN_*.npz"))
+    if case_subset:
+        wanted = {str(c).zfill(3) for c in case_subset}
+        instance_files = [
+            p for p in instance_files
+            if p.name.split("_")[1] in wanted
+        ]
+    if not instance_files:
+        raise FileNotFoundError(
+            f"No BICM V5 instance sidecars found under {instance_dir} for subset={case_subset!r}"
+        )
+
+    params = BoundaryFragmentParams()
+    log.info(
+        "[bfv3_targets] Ds%d %s — %d samples → %s (spacing_zyx=%s)",
+        ds_id, cfg["name"], len(instance_files), output_dir, plan_target_spacing_zyx,
+    )
+
+    audits: list[dict] = []
+    written = 0
+    skipped = 0
+    for inst_path in instance_files:
+        sample_id = inst_path.stem  # PENGWIN_003_LeftHip
+        out_path = output_dir / f"{sample_id}.npz"
+        if out_path.exists() and not force:
+            skipped += 1
+            continue
+
+        preprocessed_npz = preprocessed_dir / f"{sample_id}.npz"
+        if not preprocessed_npz.exists():
+            raise FileNotFoundError(
+                f"{sample_id}: missing preprocessed npz {preprocessed_npz}; "
+                "run `nnUNetv2_plan_and_preprocess` for the dataset first."
+            )
+
+        with np.load(inst_path) as payload:
+            if "instance" not in payload:
+                raise KeyError(
+                    f"{inst_path} does not contain `instance`; rebuild bicm_v5 sidecars."
+                )
+            instance = np.asarray(payload["instance"], dtype=np.uint16)
+
+        # Sanity-check the instance grid shape against the preprocessed seg.
+        with np.load(preprocessed_npz) as prep:
+            seg = np.asarray(prep["seg"])
+        if seg.ndim == 4:
+            seg = seg[0]
+        if instance.shape != seg.shape:
+            raise RuntimeError(
+                f"{sample_id}: instance sidecar shape {instance.shape} != "
+                f"preprocessed seg shape {seg.shape}"
+            )
+
+        target, target_audit = compute_boundary_fragment_target(
+            instance,
+            spacing_zyx=plan_target_spacing_zyx,
+            params=params,
+        )
+        target = target.astype(np.uint8, copy=False)
+        if target.shape != instance.shape:
+            raise RuntimeError(
+                f"{sample_id}: BFV3 target shape {target.shape} != instance shape {instance.shape}"
+            )
+        invalid = set(int(v) for v in np.unique(target)) - set(BFV3_LABELS.values())
+        if invalid:
+            raise RuntimeError(
+                f"{sample_id}: invalid BFV3 labels {sorted(invalid)} (allowed {sorted(BFV3_LABELS.values())})"
+            )
+        if (instance > 0).any() and not (target == BFV3_LABELS["fragment_core"]).any():
+            raise RuntimeError(
+                f"{sample_id}: no class-4 core voxels emitted for a non-empty instance ROI"
+            )
+
+        audit = {
+            "sample_id": sample_id,
+            "preprocessed_shape": list(int(v) for v in target.shape),
+            "plan_target_spacing_zyx": list(float(v) for v in plan_target_spacing_zyx),
+            "target_audit": target_audit,
+        }
+        audit_json = np.array(json.dumps(audit, sort_keys=True), dtype=object)
+
+        # Atomic write via `.partial.npz` so concurrent readers never see a
+        # half-written sidecar (mirrors the BICM V5 sidecar contract).
+        tmp_stem = out_path.with_suffix("")
+        tmp_path = tmp_stem.with_name(tmp_stem.name + ".partial")
+        tmp_npz = tmp_path.with_suffix(".partial.npz")
+        if tmp_npz.exists():
+            tmp_npz.unlink()
+        np.savez(
+            str(tmp_path),
+            target=target,
+            audit_json=audit_json,
+        )
+        os.replace(str(tmp_npz), str(out_path))
+
+        audits.append(audit)
+        written += 1
+        if written % 25 == 0 or (written + skipped) == len(instance_files):
+            log.info("  [%d/%d] %s", written + skipped, len(instance_files), sample_id)
+
+    audit_path = RESULT_REPORT / f"build_boundary_fragment_v3_target_sidecars_ds{ds_id}_{RESULT_DATE}.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(json.dumps({
+        "dataset_id": ds_id,
+        "dataset_name": cfg["name"],
+        "output_dir": str(output_dir),
+        "plan_configuration": plan_configuration,
+        "plan_target_spacing_zyx": list(float(v) for v in plan_target_spacing_zyx),
+        "force": bool(force),
+        "case_subset": case_subset,
+        "written": written,
+        "skipped": skipped,
+        "params": {
+            "target_profile": params.target_profile,
+            "contact_search_mm": float(params.contact_search_mm),
+            "contact_ridge_mm": float(params.contact_ridge_mm),
+            "contact_same_anatomy_only": bool(params.contact_same_anatomy_only),
+            "external_band_mm": float(params.external_band_mm),
+            "shell_mm": float(params.shell_mm),
+            "tiny_core_radius_mm": float(params.tiny_core_radius_mm),
+        },
+        "samples": audits,
+    }, indent=2))
+    log.info(
+        "[bfv3_targets] wrote=%d skipped=%d audit=%s",
+        written, skipped, audit_path,
+    )
+    return {
+        "dataset_id": ds_id,
+        "output_dir": str(output_dir),
+        "written": written,
+        "skipped": skipped,
+        "samples": audits,
+        "audit_path": str(audit_path),
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # =============================================================================
 # Unpack (.npz → .npy after nnUNet preprocess)
 # =============================================================================
-def unpack_dataset(ds_id: int, plans: str = "nnUNetPlans_3d_fullres",
-                   num_processes: int = 8):
-    """Convert nnUNet .npz to .npy for fast training loading."""
-    from nnunetv2.training.dataloading.utils import unpack_dataset as _unpack
-    name = DATASETS[ds_id]["name"]
-    folder = NN_PREP / name / plans
-    if not folder.is_dir():
-        print(f"  ⚠ skip Ds{ds_id} — {folder} does not exist")
-        return
-    print(f"[unpack] {folder}")
-    t0 = time.time()
-    _unpack(str(folder), unpack_segmentation=True, overwrite_existing=False,
-            num_processes=num_processes)
-    n_npy = len(list(folder.glob("*.npy")))
-    print(f"  done in {time.time() - t0:.1f}s. .npy = {n_npy}")
 
 
 # =============================================================================
 # Statistics (analyze_dataset 통합)
 # =============================================================================
-def case_stats(case_dir: Path):
-    img_path = case_dir / "image.mha"
-    lbl_path = case_dir / "label.mha"
-    if not (img_path.exists() and lbl_path.exists()):
-        return None
-    img = sitk.ReadImage(str(img_path))
-    lbl = sitk.ReadImage(str(lbl_path))
-    arr = sitk.GetArrayFromImage(lbl)
-    img_arr = sitk.GetArrayFromImage(img)
-    fg_ids = sorted(int(v) for v in np.unique(arr) if v > 0)
-    per_anat = {}
-    for name, lo, hi in ANATOMY_RANGES:
-        ids = [v for v in fg_ids if lo <= v <= hi]
-        vox = int(((arr >= lo) & (arr <= hi)).sum())
-        per_anat[name] = {"n_fragments": len(ids), "voxels": vox, "ids": ids}
-    cid = int(case_dir.name)
-    return {
-        "case_id": case_dir.name, "case_int": cid,
-        "subject_type": case_subject_type(cid),
-        "n_fragments": len(fg_ids),
-        "spacing_xyz": list(img.GetSpacing()),
-        "size_xyz": list(img.GetSize()),
-        "intensity": {"min": float(img_arr.min()), "max": float(img_arr.max()),
-                      "mean": float(img_arr.mean()), "std": float(img_arr.std())},
-        "per_anatomy": per_anat,
-        "fg_voxels": int((arr > 0).sum()),
-    }
 
 
-def aggregate_stats(rows: list) -> dict:
-    by_type = defaultdict(list)
-    for r in rows:
-        by_type[r["subject_type"]].append(r)
-    summary = {}
-    for stype, recs in by_type.items():
-        n_frags = [r["n_fragments"] for r in recs]
-        anat_hist = Counter()
-        anat_voxels = defaultdict(list)
-        for r in recs:
-            for k, v in r["per_anatomy"].items():
-                if v["n_fragments"] > 0:
-                    anat_hist[k] += 1
-                    anat_voxels[k].append(v["voxels"])
-        spacings = np.array([r["spacing_xyz"] for r in recs])
-        sizes = np.array([r["size_xyz"] for r in recs])
-        summary[stype] = {
-            "n_cases": len(recs),
-            "fragments": {"min": int(np.min(n_frags)), "max": int(np.max(n_frags)),
-                          "mean": float(np.mean(n_frags)), "median": float(np.median(n_frags)),
-                          "histogram": dict(Counter(n_frags).most_common())},
-            "anatomy_presence": {k: f"{anat_hist[k]}/{len(recs)}" for k in ANATOMY_NAMES},
-            "anatomy_voxels_mean": {k: int(np.mean(v)) if v else 0
-                                       for k, v in anat_voxels.items()},
-            "spacing_xyz_median": [float(x) for x in np.median(spacings, axis=0)],
-            "size_xyz_median": [int(x) for x in np.median(sizes, axis=0)],
-        }
-    return summary
 
 
-def run_stats(out_path: Path):
-    """Scan all cases, compute per-case stats, aggregate to summary, save JSON.
-
-    Catches only I/O / ITK-image errors (FileNotFoundError, OSError, RuntimeError)
-    so that programming bugs (KeyError, AttributeError, TypeError) still propagate.
-    """
-    cases = list_cases()
-    print(f"scanning {len(cases)} cases ...")
-    rows = []
-    for i, cd in enumerate(cases):
-        try:
-            r = case_stats(cd)
-            if r:
-                rows.append(r)
-                if (i + 1) % 50 == 0:
-                    print(f"  {i+1}/{len(cases)}")
-        except (FileNotFoundError, OSError, RuntimeError) as e:
-            # I/O / ITK errors only — let logic bugs (KeyError, etc.) crash loud.
-            print(f"  ERR {cd.name}: {e}")
-    summary = aggregate_stats(rows)
-    out = {"per_case": rows, "summary": summary}
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(out, indent=2))
-    print(f"\n✅ saved {out_path}")
-    for stype, s in summary.items():
-        print(f"\n=== {stype} (n={s['n_cases']}) ===")
-        print(f"  fragments  : min={s['fragments']['min']}  med={s['fragments']['median']}  max={s['fragments']['max']}")
-        print(f"  anatomy_presence: {s['anatomy_presence']}")
 
 
 # =============================================================================
 # Sanity case inspection (absorbed from data/preprocess/inspect_cases.py)
 # =============================================================================
-def inspect_sanity_cases(out_text: Path) -> None:
-    """Inspect sanity cases and write a compact text table."""
-    sanity = Path("/workspace/nnunet/raw/Dataset999_PENGWIN_Sanity")
-    out_text.parent.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for img_path in sorted(sanity.glob("imagesTs/PENGWIN_*.mha")):
-        cid = img_path.stem.replace("PENGWIN_", "").replace("_0000", "")
-        lbl_path = sanity / "labelsTs" / f"PENGWIN_{cid}.mha"
-        if not lbl_path.exists():
-            continue
-        img = sitk.ReadImage(str(img_path))
-        lbl = sitk.GetArrayFromImage(sitk.ReadImage(str(lbl_path)))
-        uniq = np.unique(lbl)
-        region = {"Sacrum": 0, "L Hip": 0, "R Hip": 0, "Femur": 0}
-        for v in uniq:
-            if v == 0: continue
-            if 1 <= v <= 50: region["Sacrum"] += 1
-            elif 51 <= v <= 100: region["L Hip"] += 1
-            elif 101 <= v <= 150: region["R Hip"] += 1
-            elif 151 <= v <= 200: region["Femur"] += 1
-        rows.append({
-            "case": cid,
-            "size": list(img.GetSize()),
-            "spacing": [round(s, 3) for s in img.GetSpacing()],
-            "n_fragments": len(uniq) - 1,
-            "fragments_by_region": region,
-            "label_values": [int(v) for v in uniq if v != 0],
-        })
-    print(json.dumps(rows, indent=2, ensure_ascii=False))
-    with open(out_text, "w") as f:
-        f.write("| Case | Region | Size (X×Y×Z) | Spacing (mm) | # frag | SA/LH/RH/FE | Labels |\n")
-        f.write("|---|---|---|---|---|---|---|\n")
-        for r in rows:
-            sa = r["fragments_by_region"]
-            region = "Femur" if sa["Femur"] > 0 and sa["Sacrum"] == 0 else "Pelvic"
-            f.write(f"| {r['case']} | {region} | {r['size'][0]}×{r['size'][1]}×{r['size'][2]} | "
-                    f"{r['spacing']} | {r['n_fragments']} | "
-                    f"{sa['Sacrum']}/{sa['L Hip']}/{sa['R Hip']}/{sa['Femur']} | {r['label_values']} |\n")
-    print(f"Saved: {out_text}")
 
 
 # =============================================================================
 # CLI
 # =============================================================================
-def main():
-    p = argparse.ArgumentParser()
-    sub = p.add_subparsers(dest="cmd", required=True)
 
-    p_build = sub.add_parser("build", help="convert raw → nnUNet raw")
-    p_build.add_argument("--dataset", default="all",
-                         help="active dataset id (532/533/537) or 'all'")
-    p_build.add_argument("--force", action="store_true",
-                         help="rewrite existing imagesTr/labelsTr files")
-    p_build.add_argument("--abbc-official", action="store_true",
-                         help="legacy compatibility flag; ignored by active V5 builder")
-    p_build.add_argument("--v3-input", choices=V3_INPUT_VARIANTS, default="ct_hu",
-                         help="legacy compatibility flag; ignored by active V5 builder")
-    p_build.add_argument("--v4-input", choices=V4_INPUT_VARIANTS, default="ct_lut",
-                         help="legacy compatibility flag; ignored by active V5 builder")
-    p_build.add_argument("--v5-input", choices=V5_INPUT_VARIANTS, default="ct_lut",
-                         help="Dataset537 V5 per-anatomy BICM input contract")
-    p_build.add_argument("--v5-target-profile", choices=V5_TARGET_PROFILES, default="v5_tiny_marker",
-                         help="Dataset537 V5 target profile; v5_core_body is the connected-core V5.2 ablation")
-    p_build.add_argument("--v5-core-ball-radius-mm", type=float, default=2.5,
-                         help="physical core radius for --v5-target-profile v5_core_ball")
-    p_build.add_argument("--v5-core-body-mm", type=float, default=3.0,
-                         help="minimum interior distance for --v5-target-profile v5_core_body")
-    p_build.add_argument("--v5-contact-band-mm", type=float, default=2.0,
-                         help="support-limited contact band radius for --v5-target-profile v5_core_body_contact_band")
-    p_build.add_argument("--case-subset", nargs="*", default=None,
-                         help="optional zero-padded case IDs for root-cause mini datasets")
-    p_build.add_argument("--no-audit", action="store_true",
-                         help="skip strict generated raw dataset audit")
 
-    p_unpack = sub.add_parser("unpack", help=".npz → .npy after nnUNet preprocess")
-    p_unpack.add_argument("--dataset", required=True, type=int)
-    p_unpack.add_argument("--plans", default="nnUNetPlans_3d_fullres")
-
-    p_stats = sub.add_parser("stats", help="dataset statistics")
-    p_stats.add_argument("--out", default=str(RESULT_REPORT / "dataset_stats.json"))
-
-    p_audit = sub.add_parser("audit-raw", help="audit generated nnUNet raw datasets")
-    p_audit.add_argument("--dataset", default="all")
-    p_audit.add_argument("--out", default=str(RESULT_REPORT / f"audit_dataset_rebuild_{RESULT_DATE}.json"))
-
-    p_audit_orientation = sub.add_parser(
-        "audit-orientation",
-        help="audit source->raw LPS canonicalization contract for active datasets",
+def main(argv: list[str] | None = None) -> int:
+    """Command-line dispatcher for preprocessing utilities."""
+    parser = argparse.ArgumentParser(
+        prog="preprocessing",
+        description="PENGWIN 2026 Task 1 preprocessing utilities.",
     )
-    p_audit_orientation.add_argument("--dataset", default="all")
-    p_audit_orientation.add_argument(
-        "--out",
-        default=str(RESULT_REPORT / f"orientation_contract_audit_{RESULT_DATE}.json"),
-    )
-
-    p_inspect = sub.add_parser("inspect-sanity",
-                               help="inspect sanity case sizes/labels (absorbed from data/preprocess/inspect_cases.py)")
-    p_inspect.add_argument("--out", default="/workspace/_scratch/sanity_inspect.txt")
-
-    p_audit_pre = sub.add_parser("audit-preprocessed",
-                                 help="audit planned/preprocessed nnUNet datasets")
-    p_audit_pre.add_argument("--dataset", default="all")
-    p_audit_pre.add_argument("--out", default=str(RESULT_REPORT / f"audit_preprocessed_{RESULT_DATE}.json"))
-    p_audit_pre.add_argument("--ensure-splits", action="store_true",
-                             help="create standard 5-fold splits_final.json if missing")
-    p_audit_pre.add_argument("--allow-incomplete", action="store_true",
-                             help="write audit JSON without raising on missing artifacts")
-
-    p_audit_abbc = sub.add_parser(
-        "audit-abbc-targets",
-        help="audit official/contact ABBC target seed contract for active ABBC datasets",
-    )
-    p_audit_abbc.add_argument("--dataset", nargs="*", type=int, default=None,
-                              help="official ABBC dataset ids; default all active ABBC datasets")
-    p_audit_abbc.add_argument("--out", default=str(RESULT_REPORT / f"audit_abbc_targets_{RESULT_DATE}.json"))
-    p_audit_abbc.add_argument("--allow-fail", action="store_true")
-
-    p_audit_bfv3 = sub.add_parser(
-        "audit-boundary-targets",
-        help="audit Dataset537 BoundaryFragment V3 target invariants",
-    )
-    p_audit_bfv3.add_argument("--dataset", nargs="*", type=int, default=None,
-                              help="BoundaryFragment dataset ids; default all active V3 datasets")
-    p_audit_bfv3.add_argument("--out", default=str(RESULT_REPORT / f"audit_boundary_fragment_targets_{RESULT_DATE}.json"))
-    p_audit_bfv3.add_argument("--allow-fail", action="store_true")
-
-    p_audit_sampling = sub.add_parser(
-        "audit-boundary-sampling",
-        help="simulate Dataset537 BoundaryFragment V3 forced crop sampling",
-    )
-    p_audit_sampling.add_argument("--dataset", type=int, default=537)
-    p_audit_sampling.add_argument("--profile", choices=sorted(BOUNDARY_SAMPLING_DISTRIBUTIONS),
-                                  default="boundary_fragment_v3_ridge80")
-    p_audit_sampling.add_argument("--batches", type=int, default=100)
-    p_audit_sampling.add_argument("--batch-size", type=int, default=2)
-    p_audit_sampling.add_argument("--cases", nargs="*", default=None)
-    p_audit_sampling.add_argument("--seed", type=int, default=537031)
-    p_audit_sampling.add_argument("--out", default=str(RESULT_REPORT / f"audit_boundary_sampling_{RESULT_DATE}.json"))
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_sidecar = sub.add_parser(
         "build-instance-sidecars",
-        help="generate compact Dataset537 Contact-Instance sidecars after nnU-Net preprocessing",
-        aliases=["build-factorized-sidecars"],
+        help="Build BICM V5 instance sidecars under <preprocessed>/<plan>/bicm_v5_instance_targets/.",
     )
-    p_sidecar.add_argument("--dataset", type=int, default=537)
-    p_sidecar.add_argument("--plans", default="nnUNetPlans_3d_fullres")
-    p_sidecar.add_argument("--force", action="store_true")
-    p_sidecar.add_argument("--out", default=str(RESULT_REPORT / f"audit_factorized_instance_targets_{RESULT_DATE}.json"))
-    p_sidecar.add_argument("--allow-fail", action="store_true")
-
-    p_audit_inst = sub.add_parser(
-        "audit-instance-targets",
-        help="audit compact Contact-Instance sidecars and target invariants",
-        aliases=["audit-factorized-targets"],
+    p_sidecar.add_argument("--dataset", type=int, default=537, help="nnUNet dataset ID (default 537).")
+    p_sidecar.add_argument("--force", action="store_true", help="Overwrite existing sidecars.")
+    p_sidecar.add_argument(
+        "--case-subset",
+        nargs="*",
+        default=None,
+        help="Optional list of source case IDs (zero-padded) to restrict the build.",
     )
-    p_audit_inst.add_argument("--dataset", type=int, default=537)
-    p_audit_inst.add_argument("--plans", default="nnUNetPlans_3d_fullres")
-    p_audit_inst.add_argument("--out", default=str(RESULT_REPORT / f"audit_factorized_instance_targets_{RESULT_DATE}.json"))
-    p_audit_inst.add_argument("--allow-fail", action="store_true")
-
-    p_bicm_sidecar = sub.add_parser(
-        "build-bicm-v5-sidecars",
-        help="generate Dataset537 V5 instance/edge sidecars for V38 root-cause experiments",
-        aliases=["audit-bicm-v5-sidecars"],
+    p_sidecar.add_argument(
+        "--plan-configuration",
+        default="nnUNetPlans_3d_fullres",
+        help="Preprocessed plan configuration subfolder (default nnUNetPlans_3d_fullres).",
     )
-    p_bicm_sidecar.add_argument("--dataset", type=int, default=537)
-    p_bicm_sidecar.add_argument("--plans", default="nnUNetPlans_3d_fullres")
-    p_bicm_sidecar.add_argument("--force", action="store_true")
-    p_bicm_sidecar.add_argument("--out", default=str(RESULT_REPORT / f"audit_bicm_v5_instance_sidecars_{RESULT_DATE}.json"))
-    p_bicm_sidecar.add_argument("--allow-fail", action="store_true")
 
-    args = p.parse_args()
+    p_bfv3 = sub.add_parser(
+        "build-boundary-fragment-v3-sidecars",
+        help=(
+            "Build BoundaryFragment V3 (5-class) target sidecars under "
+            "<preprocessed>/<plan>/boundary_fragment_v3_targets/."
+        ),
+    )
+    p_bfv3.add_argument("--dataset", type=int, default=537, help="nnUNet dataset ID (default 537).")
+    p_bfv3.add_argument("--force", action="store_true", help="Overwrite existing sidecars.")
+    p_bfv3.add_argument(
+        "--case-subset",
+        nargs="*",
+        default=None,
+        help="Optional list of source case IDs (zero-padded) to restrict the build.",
+    )
+    p_bfv3.add_argument(
+        "--plan-configuration",
+        default="nnUNetPlans_3d_fullres",
+        help="Preprocessed plan configuration subfolder (default nnUNetPlans_3d_fullres).",
+    )
 
-    if args.cmd == "build":
-        if args.dataset == "all":
-            for ds_id in sorted(DATASETS):
-                build_dataset(
-                    ds_id,
-                    force=args.force,
-                    abbc_official=args.abbc_official,
-                    v3_input=args.v3_input,
-                    v4_input=args.v4_input,
-                    v5_input=args.v5_input,
-                    v5_target_profile=args.v5_target_profile,
-                    v5_core_ball_radius_mm=args.v5_core_ball_radius_mm,
-                    v5_core_body_mm=args.v5_core_body_mm,
-                    v5_contact_band_mm=args.v5_contact_band_mm,
-                    case_subset=args.case_subset if ds_id == 537 else None,
-                )
-            if not args.no_audit:
-                audit_nnunet_raw_datasets(sorted(DATASETS),
-                                          RESULT_REPORT / f"audit_dataset_rebuild_{RESULT_DATE}.json")
-        else:
-            build_dataset(
-                int(args.dataset),
-                force=args.force,
-                abbc_official=args.abbc_official,
-                v3_input=args.v3_input,
-                v4_input=args.v4_input,
-                v5_input=args.v5_input,
-                v5_target_profile=args.v5_target_profile,
-                v5_core_ball_radius_mm=args.v5_core_ball_radius_mm,
-                v5_core_body_mm=args.v5_core_body_mm,
-                v5_contact_band_mm=args.v5_contact_band_mm,
-                case_subset=args.case_subset if int(args.dataset) == 537 else None,
-            )
-            if not args.no_audit:
-                audit_name = (
-                    f"audit_dataset_rebuild_537_{args.v5_input}_{RESULT_DATE}.json"
-                    if int(args.dataset) == 537 else
-                    f"audit_dataset_rebuild_{RESULT_DATE}.json"
-                )
-                audit_nnunet_raw_datasets([int(args.dataset)],
-                                          RESULT_REPORT / audit_name)
-    elif args.cmd == "unpack":
-        unpack_dataset(args.dataset, args.plans)
-    elif args.cmd == "stats":
-        run_stats(Path(args.out))
-    elif args.cmd == "audit-raw":
-        ds_ids = sorted(DATASETS) if args.dataset == "all" else [int(args.dataset)]
-        audit = audit_nnunet_raw_datasets(ds_ids, Path(args.out))
-        print(json.dumps(audit, indent=2))
-    elif args.cmd == "audit-orientation":
-        ds_ids = sorted(DATASETS) if args.dataset == "all" else [int(args.dataset)]
-        audit = audit_orientation_contract(ds_ids, Path(args.out))
-        print(json.dumps(audit, indent=2))
-    elif args.cmd == "audit-preprocessed":
-        ds_ids = sorted(DATASETS) if args.dataset == "all" else [int(args.dataset)]
-        audit = audit_nnunet_preprocessed_datasets(
-            ds_ids, Path(args.out),
-            ensure_splits=args.ensure_splits,
-            fail_on_missing=not args.allow_incomplete,
+    args = parser.parse_args(argv)
+
+    if args.cmd == "build-instance-sidecars":
+        result = build_bicm_v5_instance_sidecars(
+            ds_id=int(args.dataset),
+            force=bool(args.force),
+            case_subset=args.case_subset,
+            plan_configuration=args.plan_configuration,
         )
-        print(json.dumps(audit, indent=2))
-    elif args.cmd == "audit-abbc-targets":
-        audit = audit_abbc_targets(
-            args.dataset,
-            Path(args.out),
-            fail_on_error=not args.allow_fail,
+        print(json.dumps({
+            "dataset_id": result["dataset_id"],
+            "output_dir": result["output_dir"],
+            "written": result["written"],
+            "skipped": result["skipped"],
+            "audit_path": result["audit_path"],
+        }, indent=2))
+        return 0
+    if args.cmd == "build-boundary-fragment-v3-sidecars":
+        result = generate_boundary_fragment_v3_target_sidecars(
+            ds_id=int(args.dataset),
+            force=bool(args.force),
+            case_subset=args.case_subset,
+            plan_configuration=args.plan_configuration,
         )
-        print(json.dumps(audit, indent=2))
-    elif args.cmd == "audit-boundary-targets":
-        audit = audit_boundary_fragment_targets(
-            args.dataset,
-            Path(args.out),
-            fail_on_error=not args.allow_fail,
-        )
-        print(json.dumps(audit, indent=2))
-    elif args.cmd == "audit-boundary-sampling":
-        audit = audit_boundary_sampling(
-            ds_id=args.dataset,
-            profile=args.profile,
-            batches=args.batches,
-            batch_size=args.batch_size,
-            cases=args.cases,
-            out_json=Path(args.out),
-            seed=args.seed,
-        )
-        print(json.dumps(audit, indent=2))
-    elif args.cmd in {"build-instance-sidecars", "build-factorized-sidecars", "audit-instance-targets", "audit-factorized-targets"}:
-        audit = generate_contact_instance_sidecars(
-            ds_id=args.dataset,
-            plans=args.plans,
-            force=args.force if args.cmd in {"build-instance-sidecars", "build-factorized-sidecars"} else False,
-            out_json=Path(args.out),
-            fail_on_error=not args.allow_fail,
-        )
-        print(json.dumps(audit, indent=2))
-    elif args.cmd in {"build-bicm-v5-sidecars", "audit-bicm-v5-sidecars"}:
-        audit = generate_bicm_v5_instance_sidecars(
-            ds_id=args.dataset,
-            plans=args.plans,
-            force=args.force if args.cmd == "build-bicm-v5-sidecars" else False,
-            out_json=Path(args.out),
-            fail_on_error=not args.allow_fail,
-        )
-        print(json.dumps(audit, indent=2))
-    elif args.cmd == "inspect-sanity":
-        inspect_sanity_cases(Path(args.out))
+        print(json.dumps({
+            "dataset_id": result["dataset_id"],
+            "output_dir": result["output_dir"],
+            "written": result["written"],
+            "skipped": result["skipped"],
+            "audit_path": result["audit_path"],
+        }, indent=2))
+        return 0
+    parser.error(f"unknown command: {args.cmd!r}")
+    return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

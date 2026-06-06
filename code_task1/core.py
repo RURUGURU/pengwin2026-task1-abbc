@@ -24,19 +24,23 @@ from typing import Literal
 # tree by exporting PENGWIN_ROOT before importing any code_task1 modules.
 ROOT = Path(os.environ.get("PENGWIN_ROOT", "/workspace"))
 DATA_RAW = ROOT / "data/task1_2/extracted"
-NN_RAW = ROOT / "nnunet/raw"
-NN_PREP = ROOT / "nnunet/preprocessed"
-NN_RES = ROOT / "nnunet/results"
+# nnUNet 출력 root 를 code_task1/result/ 아래로 통합 (2026-05-31 정리).
+# 이전: ROOT/nnunet/{raw,preprocessed,results} — workspace 루트에 분산.
+# 현재: ROOT/code_task1/result/{raw,preprocessed,results} — code_task1 내부에서 자급자족.
+# 변경 이유: code_task1 이 독립 작업 디렉토리가 되도록 — 모든 산출물이 한 곳에 모이게.
+NN_RAW = ROOT / "code_task1/result/raw"
+NN_PREP = ROOT / "code_task1/result/preprocessed"
+NN_RES = ROOT / "code_task1/result/results"
 RESULT = ROOT / "code_task1/result"
-# Result artifacts are task/date scoped. All active Task 1 evidence, including
-# old split-anatomy reports, lives under
-# `task1_active/<UTC YYYYMMDD>/{reports,weights,visualize}` so parallel task1
-# result roots and cleanup-only layouts are not recreated.
+# Result artifacts 의 평면화 (2026-05-31 정리).
+# 이전: task1_active/<UTC YYYYMMDD>/{reports,weights,visualize} — date partition.
+# 현재: reports/ 단일 폴더 — 시간 정보는 파일명의 RESULT_DATE 접미사로 표현.
+# 변경 이유: code_task1/ 내부 중복 prefix (task1_active) 제거, day-partition 으로 인한
+# 디스크 분산 및 GC 부담 회피.
 RESULT_DATE = os.environ.get("PENGWIN_RESULT_DATE", time.strftime("%Y%m%d", time.gmtime()))
-RESULT_ACTIVE = RESULT / "task1_active" / RESULT_DATE
-RESULT_REPORT = RESULT_ACTIVE / "reports"
-RESULT_WEIGHT = RESULT_ACTIVE / "weights"
-RESULT_VISUALIZE = RESULT_ACTIVE / "visualize"
+RESULT_REPORT = RESULT / "reports"
+RESULT_WEIGHT = RESULT / "weights"
+RESULT_VISUALIZE = RESULT / "visualize"
 
 
 def configure_nnunet_env(force: bool = False) -> dict[str, str]:
@@ -86,18 +90,44 @@ configure_nnunet_env()
 
 
 # =============================================================================
-# PENGWIN label scheme (대회 공식)
+# PENGWIN label scheme (대회 공식) — single source of truth in anatomy_registry
 # =============================================================================
-# 4 anatomy × 50 fragment IDs each
-ANATOMY_RANGES = [
-    ("Sacrum",   1,   50),
-    ("LeftHip",  51,  100),
-    ("RightHip", 101, 150),
-    ("Femur",    151, 200),
-]
-ANATOMY_NAMES = [a[0] for a in ANATOMY_RANGES]
-ANATOMY_RANGE_DICT = {name: (lo, hi) for name, lo, hi in ANATOMY_RANGES}
-ANATOMY_TO_INDEX = {name: i + 1 for i, name in enumerate(ANATOMY_NAMES)}  # 1-indexed (bg=0)
+# Instance IDs encode anatomy via fixed 50-wide blocks (Sacrum 1-50, LeftHip
+# 51-100, RightHip 101-150, Femur 151-200). The canonical registry AND every
+# instance-ID arithmetic helper now live in `anatomy_registry`, re-exported here
+# so existing `from core import ANATOMY_RANGES` / `core.<x>` references keep
+# resolving unchanged. Add or modify an anatomy THERE (one row), never here.
+#
+# DECOY WARNING: the case-ID helpers below (is_pelvic/is_femur, 1-120/151-200/
+# 251-420) and HU/probability thresholds elsewhere are a DIFFERENT namespace that
+# happens to share the digits 150/200/50 — they must NOT route through the registry.
+from anatomy_registry import (  # noqa: E402  (beside the constants it replaces)
+    Anatomy,
+    ANATOMY_REGISTRY,
+    ANATOMY_RANGES,
+    ANATOMY_NAMES,
+    ANATOMY_RANGE_DICT,
+    ANATOMY_TO_INDEX,
+    PELVIC_ANATOMY_INDICES,
+    NUM_ANATOMIES,
+    MIN_INSTANCE_ID,
+    MAX_INSTANCE_ID,
+    PELVIC_MAX_INSTANCE_ID,
+    INSTANCE_CAPACITY,
+    anatomy_by_index,
+    anatomy_by_name,
+    anatomy_of_id,
+    id_range,
+    all_anatomy_ranges,
+    anatomy_start_ids,
+    anatomy_ranges_by_name,
+    global_to_local,
+    local_to_global,
+    valid_instance_mask,
+    clip_to_valid_instances,
+    anatomy_index_array,
+    same_anatomy,
+)
 
 
 # =============================================================================
@@ -562,6 +592,34 @@ DATASETS: dict[int, DatasetCfg] = {
         global_label_range=(1, 150),
         foundation_dataset=532,
     ),
+    # [V0.x][FIX:B2][2026-05-31] Dataset538 — Dataset537 의 4-anatomy 버전.
+    # filter="all" 로 170 pelvic + 170 femur (총 340) 케이스 모두 포함.
+    # global_label_range=(1, 200) 로 femur fragment ID (151-200) 까지 커버.
+    # anatomies=[..., "Femur"] 로 빌드 시점에 4 ROI 생성.
+    # foundation_dataset=539 — Stage E inference 시 Dataset539 의 5-class
+    # anatomy probability 를 입력 채널로 사용.
+    538: DatasetCfg(
+        "Dataset538_PelvicFemurBICMFragmentV5",
+        "bicm_v5",
+        "all",
+        5,
+        "PengwinTrainerBICMCoreStableEdgePrecisionV81",
+        anatomies=["Sacrum", "LeftHip", "RightHip", "Femur"],
+        anatomy=None,
+        global_label_range=(1, 200),
+        foundation_dataset=539,
+    ),
+    # [V0.x][FIX:B1][2026-05-31] Dataset539 — Dataset532 의 5-class 버전.
+    # 베이스라인 Dataset001 과 호환되는 5-class semantic anatomy (Femur 포함).
+    # filter="all" 로 340 케이스 모두 학습 — 170 femur-only 케이스 구제.
+    539: DatasetCfg(
+        "Dataset539_PelvicFemurAnatomyV3",
+        "anatomy_semantic",
+        "all",
+        5,
+        "PengwinTrainer",
+        anatomies=["Sacrum", "LeftHip", "RightHip", "Femur"],
+    ),
 }
 
 
@@ -626,12 +684,36 @@ from nnunetv2.utilities.helpers import dummy_context
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 
+# [V0.x][WARN-FIX:#3][2026-06-02] nnUNet 2.5.2 가 deprecated `torch.cuda.amp.GradScaler()`
+# 를 nnUNetTrainer.initialize() 의 GradScaler() 호출(line 164)에서 생성하며 FutureWarning
+# 을 띄운다. 경고는 *생성 시점*에 발생하므로 사후 교체로는 못 막는다. nnUNet 트레이너 모듈
+# 네임스페이스의 GradScaler 심볼을 신 API(torch.amp.GradScaler('cuda')) 팩토리로 교체해
+# 생성 자체를 modern API 로 바꾼다(억제 아님, 근본 수정). 모든 trainer 에 적용.
+try:
+    import torch.amp as _torch_amp
+    import nnunetv2.training.nnUNetTrainer.nnUNetTrainer as _nnunet_trainer_mod
+
+    def _modern_grad_scaler(*_a, **_k):
+        return _torch_amp.GradScaler("cuda", *_a, **_k)
+
+    _nnunet_trainer_mod.GradScaler = _modern_grad_scaler
+except Exception:  # pragma: no cover
+    pass
+
 # Make helper modules importable when nnU-Net imports the native PengwinTrainer
 # module from its supported `nnUNetTrainer/variants` package path.
 _ROOT = Path(os.environ.get("PENGWIN_ROOT", "/workspace"))
 _CODE_TASK1 = _ROOT / "code_task1"
 if str(_CODE_TASK1) not in sys.path:
     sys.path.insert(0, str(_CODE_TASK1))
+# [V0.x][2026-06-01] STU-Net 백본 (vendored, Apache-2.0) — TotalSegmentator 뼈 사전학습 전이용.
+try:
+    from stunet import STUNet, STUNET_VARIANTS
+    _STUNET_AVAILABLE = True
+except Exception:  # pragma: no cover
+    STUNet = None
+    STUNET_VARIANTS = {}
+    _STUNET_AVAILABLE = False
 try:
     from loss import (
         BoundaryFragmentV3Loss,
@@ -879,246 +961,6 @@ except ImportError:
     _FUSEFORMER_AVAILABLE = False
 
 
-class _CoordConvInputWrapper(nn.Module):
-    """Append deterministic z/y/x coordinate channels inside model forward.
-
-    입력은 기존 nnU-Net preprocessed tensor `[B,C,Z,Y,X]` 그대로 받는다. 내부 base
-    network만 `[B,C+3,Z,Y,X]`를 보므로 prediction/export 경로의 channel contract는
-    기존 데이터셋과 호환된다.
-    """
-
-    def __init__(self, network: nn.Module):
-        super().__init__()
-        self.network = network
-
-    @property
-    def decoder(self):
-        # [QC][Invariant:nnunet_trainer_api]
-        # nnU-Net trainer는 train start에서 `network.decoder.deep_supervision`을
-        # 직접 토글한다. wrapper가 decoder를 숨기면 training loop 진입 전에 깨진다.
-        return self.network.decoder
-
-    @property
-    def encoder(self):
-        # [QC][Invariant:nnunet_trainer_api]
-        # 일부 nnU-Net utility는 encoder/decoder attribute 존재를 전제로 한다.
-        # CoordConv는 forward 입력만 바꾸므로 base module attribute를 그대로 노출한다.
-        return self.network.encoder
-
-    @staticmethod
-    def _coordinate_channels(x: torch.Tensor) -> torch.Tensor:
-        # [QC][Invariant:shape_dtype_device]
-        # CoordConv 좌표는 batch와 spatial shape만 공유하고, dtype/device는 입력과
-        # 반드시 같아야 mixed precision 및 nnU-Net sliding-window inference에서
-        # silent CPU/GPU mismatch가 나지 않는다.
-        if x.ndim != 5:
-            raise ValueError(f"CoordConv wrapper expects input [B,C,Z,Y,X], got {tuple(x.shape)}")
-        bsz, _channels, depth, height, width = (int(v) for v in x.shape)
-        z = torch.linspace(0.0, 1.0, steps=max(depth, 1), device=x.device, dtype=x.dtype).view(1, 1, depth, 1, 1)
-        y = torch.linspace(0.0, 1.0, steps=max(height, 1), device=x.device, dtype=x.dtype).view(1, 1, 1, height, 1)
-        x_coord = torch.linspace(0.0, 1.0, steps=max(width, 1), device=x.device, dtype=x.dtype).view(1, 1, 1, 1, width)
-        coords = torch.cat(
-            [
-                z.expand(bsz, 1, depth, height, width),
-                y.expand(bsz, 1, depth, height, width),
-                x_coord.expand(bsz, 1, depth, height, width),
-            ],
-            dim=1,
-        )
-        return coords
-
-    def forward(self, x: torch.Tensor):
-        # [AUDIT][Risk:High][Scope:v279_coordconv_representation]
-        # V271 learned logits collapsed to one embedding point per anatomy despite
-        # contrastive loss. 여기서는 contact를 되살리지 않고, normalized sink target을
-        # 표현하기 위해 필요한 절대 ROI 좌표만 입력에 추가한다.
-        return self.network(torch.cat([x, self._coordinate_channels(x)], dim=1))
-
-
-class PengwinBorderBoostDataLoader3D(nnUNetDataLoader3D):
-    """3D dataloader that centers forced-foreground crops on class-3 contacts.
-
-    nnU-Net's normal foreground oversampling picks one nonempty foreground class
-    uniformly. Contact-Energy V2 keeps the official class ID but narrows class 3
-    to a contact/fracture surface, so forced-foreground crops prefer it when
-    present.
-    """
-
-    def __init__(self, *args,
-                 border_label: int = ABBC_CONTACT_LABEL,
-                 border_center_probability: float = 0.8,
-                 hard_negative_label: int | None = None,
-                 hard_negative_center_probability: float = 0.0,
-                 **kwargs):
-        super().__init__(*args, **kwargs)
-        self.border_label = int(border_label)
-        self.border_center_probability = float(border_center_probability)
-        self.hard_negative_label = None if hard_negative_label is None else int(hard_negative_label)
-        self.hard_negative_center_probability = float(hard_negative_center_probability)
-
-    def _class_key(self, class_locations, label: int | None):
-        if label is None:
-            return None
-        if not class_locations:
-            return None
-        for key, locations in class_locations.items():
-            try:
-                is_match = int(key) == int(label)
-            except (TypeError, ValueError):
-                is_match = False
-            if is_match and len(locations) > 0:
-                return key
-        return None
-
-    def _border_key(self, class_locations):
-        return self._class_key(class_locations, self.border_label)
-
-    def get_bbox(self, data_shape: np.ndarray, force_fg: bool,
-                 class_locations: dict | None,
-                 overwrite_class=None, verbose: bool = False):
-        border_key = self._border_key(class_locations)
-        hard_negative_key = self._class_key(class_locations, self.hard_negative_label)
-        if (
-            force_fg
-            and overwrite_class is None
-        ):
-            draw = np.random.random()
-            if (
-                hard_negative_key is not None
-                and draw < self.hard_negative_center_probability
-            ):
-                overwrite_class = hard_negative_key
-            elif (
-                border_key is not None
-                and draw < self.hard_negative_center_probability + self.border_center_probability
-            ):
-                overwrite_class = border_key
-        return super().get_bbox(
-            data_shape, force_fg, class_locations,
-            overwrite_class=overwrite_class, verbose=verbose,
-        )
-
-
-class PengwinBICMV5DataLoader3D(nnUNetDataLoader3D):
-    """V5 dataloader that centers crops on sparse decoder-critical labels.
-
-    Dataset537 V5 keeps a simple 5-class semantic target. The first 003 overfit
-    showed that default nnU-Net foreground crops learn shell/support but never
-    see enough core/contact voxels to make a marker-based decoder work. This
-    dataloader changes only the forced-foreground class choice; transforms,
-    padding, batching, and validation remain native nnU-Net behavior.
-    """
-
-    SPARSE_CLASS_DISTRIBUTION = (
-        (3, 0.55),  # core marker: required for every decoded fragment seed
-        (4, 0.30),  # contact surface: required to split same-anatomy fragments
-        (2, 0.10),  # shell: high-volume support near-negative
-        (1, 0.05),  # exterior context: suppress support leakage
-    )
-    SUPPORT_MIXED_CLASS_DISTRIBUTION = (
-        # [DATA][Risk:High][Scope:case003_support_fp]
-        # V6.2 removed contact supervision and still produced support masks
-        # roughly 2-3x larger than GT. That isolates the next question to
-        # sampling: the sparse profile always forces a positive foreground crop
-        # and mostly centers core/contact, so the support head rarely sees
-        # exterior/context-dominated negatives. This profile keeps marker/core
-        # exposure but deliberately spends much more forced-foreground budget on
-        # class 1 and class 2 boundaries; the remaining non-forced batches come
-        # from oversample_foreground_percent < 1.0 in the trainer.
-        (1, 0.40),  # exterior context: support negative adjacent to bone
-        (2, 0.30),  # shell/support: positive support geometry
-        (3, 0.25),  # core marker: preserve seed coverage
-        (4, 0.05),  # contact: kept only as rare support-positive context
-    )
-    CONTACT_MIXED_CLASS_DISTRIBUTION = (
-        # [DATA][Risk:High][Scope:contact_recall]
-        # V7 anatomy-context support passed full-volume HD95, but contact recall
-        # stayed low when only 5% of forced crops were class-4 centered. This
-        # profile changes only crop centers for the next ablation: contact gets
-        # enough positive patches while exterior/shell/core remain represented so
-        # broad support/contact FP does not become invisible to the loss.
-        (4, 0.35),  # contact: decoder split ridge
-        (1, 0.25),  # exterior context: contact/support negative
-        (2, 0.25),  # shell/support: support non-contact near-negative
-        (3, 0.15),  # core marker: seed stability
-    )
-    CONTACT15_MIXED_CLASS_DISTRIBUTION = (
-        # [DATA][Risk:High][Scope:single_variable_sampling]
-        # `bicm_v7_contact_mixed` at 35% contact centers destabilized support
-        # and collapsed contact in patch validation. This middle profile tests
-        # whether the original 5% contact exposure was simply too sparse while
-        # keeping most crop budget on exterior/shell/core context.
-        (1, 0.35),  # exterior context: suppress broad support/contact
-        (2, 0.25),  # shell/support: support non-contact near-negative
-        (3, 0.25),  # core marker: seed stability
-        (4, 0.15),  # contact: moderate positive exposure
-    )
-    CONTACT_ROI_CLASS_DISTRIBUTION = (
-        # [DATA][Risk:High][Scope:contact_positive_exposure]
-        # V10 full-volume case003 had good support/core but predicted zero
-        # contact even in LeftHip, the only ROI with GT contact. V11 changes
-        # exposure, not target or decoder: when a contact-positive ROI is
-        # sampled, most forced foreground crops are centered on class 4. The
-        # trainer-level ROI weighting below still keeps no-contact ROIs in the
-        # stream so absent-contact negatives remain visible.
-        (4, 0.60),  # contact: make the positive ridge visible to the head
-        (2, 0.20),  # shell/support: support-local non-contact near-negative
-        (3, 0.15),  # core marker: seed stability
-        (1, 0.05),  # exterior context: suppress support/contact leakage
-    )
-
-    def __init__(self, *args, forced_class_distribution=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.forced_class_distribution = tuple(forced_class_distribution or self.SPARSE_CLASS_DISTRIBUTION)
-
-    @staticmethod
-    def _class_key(class_locations: dict, label: int):
-        if not class_locations:
-            return None
-        for key, value in class_locations.items():
-            try:
-                if int(key) == int(label) and len(value) > 0:
-                    return key
-            except (TypeError, ValueError):
-                continue
-        return None
-
-    def _pick_forced_class(self, class_locations: dict):
-        available = [
-            (label, prob)
-            for label, prob in self.forced_class_distribution
-            if self._class_key(class_locations, label) is not None
-        ]
-        if not available:
-            return None
-        labels = [label for label, _ in available]
-        probs = np.asarray([prob for _, prob in available], dtype=np.float64)
-        probs = probs / probs.sum()
-        return self._class_key(class_locations, int(np.random.choice(labels, p=probs)))
-
-    def get_bbox(self, data_shape: np.ndarray, force_fg: bool,
-                 class_locations: dict | None,
-                 overwrite_class=None, verbose: bool = False):
-        # [DATA][Risk:Major][Scope:sampling]
-        # Core/contact targets can be single-digit voxels per ROI. When a crop
-        # is already forced to foreground, choosing the rare class explicitly is
-        # the least invasive way to test whether collapse was caused by sample
-        # density rather than target topology or model architecture.
-        if force_fg and overwrite_class is None and class_locations:
-            overwrite_class = self._pick_forced_class(class_locations)
-        return super().get_bbox(
-            data_shape,
-            force_fg,
-            class_locations,
-            overwrite_class=overwrite_class,
-            verbose=verbose,
-        )
-
-
-BICM_V6_OUTPUT_CHANNELS = 4
-BICM_V8_OUTPUT_CHANNELS = 5
-
-
 def _pelvic_same_anatomy_contact_mask(inst: np.ndarray) -> np.ndarray:
     """Narrow contact target: 6-neighbor different fragments in the same bone.
 
@@ -1167,7 +1009,7 @@ def _instance_core_heatmap(inst: np.ndarray,
     profile = os.environ.get("PENGWIN_FACTOR_CORE_TARGET", "edt_heatmap").strip().lower()
     radius = max(0, int(os.environ.get("PENGWIN_FACTOR_CORE_RADIUS_VOX", "2")))
     sigma = max(1e-3, float(os.environ.get("PENGWIN_FACTOR_CORE_SIGMA_VOX", "6.0")))
-    for fragment_id in [int(v) for v in np.unique(inst) if 1 <= int(v) <= 150]:
+    for fragment_id in [int(v) for v in np.unique(inst) if 1 <= int(v) <= MAX_INSTANCE_ID]:
         mask = inst == fragment_id
         if not mask.any():
             continue
@@ -1238,7 +1080,7 @@ def _instance_offset_target(inst: np.ndarray,
     origin = np.asarray(crop_lbs, dtype=np.float32).reshape(3, 1, 1, 1)
     abs_grid = grid + origin
     scale = float(offset_scale)
-    for fragment_id in [int(v) for v in np.unique(inst) if 1 <= int(v) <= 150]:
+    for fragment_id in [int(v) for v in np.unique(inst) if 1 <= int(v) <= MAX_INSTANCE_ID]:
         if fragment_id >= len(centers_zyx):
             continue
         center = centers_zyx[fragment_id]
@@ -1264,7 +1106,7 @@ def _instance_edge_break_target(inst: np.ndarray) -> tuple[np.ndarray, np.ndarra
     overfit set, so training uses a small support-limited dilation controlled
     by `PENGWIN_EDGE_BREAK_DILATION` (default: 1 voxel).
     """
-    inst = np.where((inst >= 1) & (inst <= 150), inst, 0).astype(np.int16, copy=False)
+    inst = np.where((inst >= 1) & (inst <= MAX_INSTANCE_ID), inst, 0).astype(np.int16, copy=False)
     edge_break = np.zeros((3, *inst.shape), dtype=np.float32)
     edge_valid = np.zeros((3, *inst.shape), dtype=np.float32)
     support_touch = np.zeros((3, *inst.shape), dtype=bool)
@@ -1308,7 +1150,7 @@ def _instance_hard_negative_mask(inst: np.ndarray,
     """
     from scipy import ndimage as ndi
 
-    support = (inst >= 1) & (inst <= 150)
+    support = (inst >= 1) & (inst <= MAX_INSTANCE_ID)
     outside = ~support
     if not support.any():
         return np.zeros_like(support, dtype=bool)
@@ -1540,7 +1382,7 @@ class PengwinLegacyTopologyDataLoader3D(nnUNetDataLoader3D):
                         f"does not match preprocessed shape {tuple(shape)}"
                     )
                 instance_source, _ = self._crop_pad(dense_instance, bbox_lbs, bbox_ubs, pad_value=0)
-            inst = np.where((instance_source >= 1) & (instance_source <= 150), instance_source, 0).astype(np.uint16, copy=False)
+            inst = np.where((instance_source >= 1) & (instance_source <= MAX_INSTANCE_ID), instance_source, 0).astype(np.uint16, copy=False)
             support = inst > 0
             contact = _pelvic_same_anatomy_contact_mask(inst)
             hard = _instance_hard_negative_mask(inst, data_crop) & ~contact
@@ -1577,6 +1419,148 @@ class PengwinLegacyTopologyDataLoader3D(nnUNetDataLoader3D):
             },
             "keys": selected_keys,
         }
+
+
+def _present_fragment_slices(inst: np.ndarray) -> list:
+    """[(fid, bbox_slices), ...] for valid fragment ids via ONE ndimage.find_objects pass.
+
+    Hot-path optimization: the per-fragment target builders (`_fragment_center_core`,
+    `_fragment_seed_centers`, `_fragment_spatial_embedding_targets`) used to do
+    ``for fid in np.unique(inst): np.argwhere(inst == fid)`` — an O(n_fragments × patch
+    volume) full-volume rescan costing ~0.5-1.0 s/sample and starving the GPU. This
+    returns each fragment's bounding box in a single pass; callers then scan only the
+    bbox. Voxel coords found inside the bbox plus the bbox offset are BIT-IDENTICAL
+    (same C-order) to ``np.argwhere(inst == fid)``, so every target is unchanged — only
+    the access pattern is faster (verified by the bit-exact audit).
+    """
+    from scipy import ndimage as ndi
+
+    inst_i = np.ascontiguousarray(inst, dtype=np.int32)
+    maxv = int(inst_i.max(initial=0))
+    if maxv <= 0:
+        return []
+    objs = ndi.find_objects(inst_i, max_label=min(maxv, MAX_INSTANCE_ID))
+    return [(idx + 1, sl) for idx, sl in enumerate(objs) if sl is not None]
+
+
+class PengwinBICMV5DataLoader3D(nnUNetDataLoader3D):
+    """V5 dataloader that centers crops on sparse decoder-critical labels.
+
+    Dataset537 V5 keeps a simple 5-class semantic target. The first 003 overfit
+    showed that default nnU-Net foreground crops learn shell/support but never
+    see enough core/contact voxels to make a marker-based decoder work. This
+    dataloader changes only the forced-foreground class choice; transforms,
+    padding, batching, and validation remain native nnU-Net behavior.
+    """
+
+    SPARSE_CLASS_DISTRIBUTION = (
+        (3, 0.55),  # core marker: required for every decoded fragment seed
+        (4, 0.30),  # contact surface: required to split same-anatomy fragments
+        (2, 0.10),  # shell: high-volume support near-negative
+        (1, 0.05),  # exterior context: suppress support leakage
+    )
+    SUPPORT_MIXED_CLASS_DISTRIBUTION = (
+        # [DATA][Risk:High][Scope:case003_support_fp]
+        # V6.2 removed contact supervision and still produced support masks
+        # roughly 2-3x larger than GT. That isolates the next question to
+        # sampling: the sparse profile always forces a positive foreground crop
+        # and mostly centers core/contact, so the support head rarely sees
+        # exterior/context-dominated negatives. This profile keeps marker/core
+        # exposure but deliberately spends much more forced-foreground budget on
+        # class 1 and class 2 boundaries; the remaining non-forced batches come
+        # from oversample_foreground_percent < 1.0 in the trainer.
+        (1, 0.40),  # exterior context: support negative adjacent to bone
+        (2, 0.30),  # shell/support: positive support geometry
+        (3, 0.25),  # core marker: preserve seed coverage
+        (4, 0.05),  # contact: kept only as rare support-positive context
+    )
+    CONTACT_MIXED_CLASS_DISTRIBUTION = (
+        # [DATA][Risk:High][Scope:contact_recall]
+        # V7 anatomy-context support passed full-volume HD95, but contact recall
+        # stayed low when only 5% of forced crops were class-4 centered. This
+        # profile changes only crop centers for the next ablation: contact gets
+        # enough positive patches while exterior/shell/core remain represented so
+        # broad support/contact FP does not become invisible to the loss.
+        (4, 0.35),  # contact: decoder split ridge
+        (1, 0.25),  # exterior context: contact/support negative
+        (2, 0.25),  # shell/support: support non-contact near-negative
+        (3, 0.15),  # core marker: seed stability
+    )
+    CONTACT15_MIXED_CLASS_DISTRIBUTION = (
+        # [DATA][Risk:High][Scope:single_variable_sampling]
+        # `bicm_v7_contact_mixed` at 35% contact centers destabilized support
+        # and collapsed contact in patch validation. This middle profile tests
+        # whether the original 5% contact exposure was simply too sparse while
+        # keeping most crop budget on exterior/shell/core context.
+        (1, 0.35),  # exterior context: suppress broad support/contact
+        (2, 0.25),  # shell/support: support non-contact near-negative
+        (3, 0.25),  # core marker: seed stability
+        (4, 0.15),  # contact: moderate positive exposure
+    )
+    CONTACT_ROI_CLASS_DISTRIBUTION = (
+        # [DATA][Risk:High][Scope:contact_positive_exposure]
+        # V10 full-volume case003 had good support/core but predicted zero
+        # contact even in LeftHip, the only ROI with GT contact. V11 changes
+        # exposure, not target or decoder: when a contact-positive ROI is
+        # sampled, most forced foreground crops are centered on class 4. The
+        # trainer-level ROI weighting below still keeps no-contact ROIs in the
+        # stream so absent-contact negatives remain visible.
+        (4, 0.60),  # contact: make the positive ridge visible to the head
+        (2, 0.20),  # shell/support: support-local non-contact near-negative
+        (3, 0.15),  # core marker: seed stability
+        (1, 0.05),  # exterior context: suppress support/contact leakage
+    )
+
+    def __init__(self, *args, forced_class_distribution=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.forced_class_distribution = tuple(forced_class_distribution or self.SPARSE_CLASS_DISTRIBUTION)
+
+    @staticmethod
+    def _class_key(class_locations: dict, label: int):
+        if not class_locations:
+            return None
+        for key, value in class_locations.items():
+            try:
+                if int(key) == int(label) and len(value) > 0:
+                    return key
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _pick_forced_class(self, class_locations: dict):
+        available = [
+            (label, prob)
+            for label, prob in self.forced_class_distribution
+            if self._class_key(class_locations, label) is not None
+        ]
+        if not available:
+            return None
+        labels = [label for label, _ in available]
+        probs = np.asarray([prob for _, prob in available], dtype=np.float64)
+        probs = probs / probs.sum()
+        return self._class_key(class_locations, int(np.random.choice(labels, p=probs)))
+
+    def get_bbox(self, data_shape: np.ndarray, force_fg: bool,
+                 class_locations: dict | None,
+                 overwrite_class=None, verbose: bool = False):
+        # [DATA][Risk:Major][Scope:sampling]
+        # Core/contact targets can be single-digit voxels per ROI. When a crop
+        # is already forced to foreground, choosing the rare class explicitly is
+        # the least invasive way to test whether collapse was caused by sample
+        # density rather than target topology or model architecture.
+        if force_fg and overwrite_class is None and class_locations:
+            overwrite_class = self._pick_forced_class(class_locations)
+        return super().get_bbox(
+            data_shape,
+            force_fg,
+            class_locations,
+            overwrite_class=overwrite_class,
+            verbose=verbose,
+        )
+
+
+BICM_V6_OUTPUT_CHANNELS = 4
+BICM_V8_OUTPUT_CHANNELS = 5
 
 
 class PengwinBICMV5EdgeAffinityDataLoader3D(PengwinLegacyTopologyDataLoader3D):
@@ -1616,13 +1600,11 @@ class PengwinBICMV5EdgeAffinityDataLoader3D(PengwinLegacyTopologyDataLoader3D):
         radius = max(float(radius_vox), 0.0)
         rad_i = int(np.ceil(radius))
         bbox = np.asarray(bbox_lbs, dtype=np.float32)
-        for frag_id in np.unique(inst):
-            fid = int(frag_id)
-            if fid <= 0 or fid > 150:
-                continue
-            coords = np.argwhere(inst == fid)
+        for fid, _sl in _present_fragment_slices(inst):
+            coords = np.argwhere(inst[_sl] == fid)
             if coords.size == 0:
                 continue
+            coords = coords + np.asarray([s.start for s in _sl], dtype=coords.dtype)
             center_global = centers[fid] if fid < centers.shape[0] else np.asarray(coords.mean(axis=0), dtype=np.float32)
             if not np.isfinite(center_global).all() or np.allclose(center_global, 0.0):
                 center_local = coords.mean(axis=0)
@@ -1676,7 +1658,7 @@ class PengwinBICMV5EdgeAffinityDataLoader3D(PengwinLegacyTopologyDataLoader3D):
             data_crop, _crop_lbs = self._crop_pad(data, bbox_lbs, bbox_ubs, pad_value=0)
             sem_crop, _ = self._crop_pad(seg[0], bbox_lbs, bbox_ubs, pad_value=0)
             inst_crop, _ = self._crop_pad(inst_full, bbox_lbs, bbox_ubs, pad_value=0)
-            inst = np.where((inst_crop >= 1) & (inst_crop <= 150), inst_crop, 0).astype(np.uint16, copy=False)
+            inst = np.where((inst_crop >= 1) & (inst_crop <= MAX_INSTANCE_ID), inst_crop, 0).astype(np.uint16, copy=False)
             support = inst > 0
             contact = _pelvic_same_anatomy_contact_mask(inst)
             edge_break, edge_valid = _instance_edge_break_target(inst)
@@ -1733,15 +1715,101 @@ class PengwinBICMV5EdgeAffinityDataLoader3D(PengwinLegacyTopologyDataLoader3D):
         }
 
 
-class PengwinTrainer(nnUNetTrainer):
-    """Active split-anatomy trainer — DC+CE baseline, SGD+Cosine, ES patience 50.
+class _GroupedSplitMixin:
+    """[2026-06-05] Source-case grouped K-fold split — single source of truth.
 
-    V2 contract:
-        - Loss defaults to DC+CE. Boundary/Tversky terms are explicit,
-          environment-selected ablations so baseline runs stay comparable.
-        - CE class weights are explicit or `PENGWIN_CE_CLASS_WEIGHTS=auto`.
-        - Pelvic left/right mirroring is disabled where a plain mirror would
-          corrupt anatomy-specific labels.
+    Stock nnUNet do_split runs random KFold over per-ROI identifiers, so a source
+    CT with several anatomy ROIs (Dataset538) leaks across train/val. This mixin
+    regenerates splits_final.json grouped by source case (generate_crossval_split
+    over group IDs, seed 12345) before stock do_split reads it. Single-ROI datasets
+    (Ds539) are delegated unchanged (grouped == ungrouped). Both the anatomy trainer
+    (via PengwinTrainer) and the fracture chain (PengwinTrainerBoundaryFragmentV3)
+    inherit this so Stage A / Stage B share ONE patient-grouped split (same seed
+    12345 over the same 340 source cases → identical fold partition in both).
+    """
+
+    @staticmethod
+    def _source_case_from_identifier(identifier: str) -> str:
+        """nnU-Net 샘플 identifier에서 zero-padding된 source case ID를 반환한다."""
+        stem = str(identifier).replace("PENGWIN_", "")
+        return stem.split("_", 1)[0].zfill(3)
+
+    @staticmethod
+    def _splits_group_consistent(splits: list, source_of) -> bool:
+        """splits_final.json 의 각 fold 에서 같은 source case 가 train/val 에 동시에
+        들어가지 않는지(=leakage 없음) 검사한다."""
+        for fold in splits:
+            tr_src = {source_of(k) for k in fold.get("train", [])}
+            val_src = {source_of(k) for k in fold.get("val", [])}
+            if tr_src & val_src:
+                return False
+        return True
+
+    def _ensure_grouped_splits_file(self):
+        """[FIX:C1] source-case 단위 grouped K-fold split 강제 (위 클래스 docstring 참조).
+
+        stock 이 splits_final.json 을 읽기 전에 source case 단위로 묶은 grouped split 을
+        미리 생성한다. 한 source 당 ROI 하나뿐인 데이터셋(Ds539)은 grouped==ungrouped 이라
+        stock 에 위임한다. 기존 leaky split 은 `.leaky.bak` 로 백업 후 재생성한다.
+        """
+        if self.fold == "all":
+            return
+        from batchgenerators.utilities.file_and_folder_operations import (
+            join, isfile, load_json, save_json,
+        )
+        from nnunetv2.training.dataloading.utils import get_case_identifiers
+        from nnunetv2.utilities.crossval_split import generate_crossval_split
+
+        splits_file = join(self.preprocessed_dataset_folder_base, "splits_final.json")
+        keys = sorted(get_case_identifiers(self.preprocessed_dataset_folder))
+        groups: dict[str, list[str]] = {}
+        for k in keys:
+            groups.setdefault(self._source_case_from_identifier(k), []).append(k)
+        multi_roi = any(len(v) > 1 for v in groups.values())
+
+        if isfile(splits_file):
+            existing = load_json(splits_file)
+            if self._splits_group_consistent(existing, self._source_case_from_identifier):
+                return  # 이미 group-consistent → 그대로 사용
+            if not multi_roi:
+                return  # 단일 ROI 데이터셋은 leakage 불가 → 그대로 사용
+            backup = splits_file + ".leaky.bak"
+            if not isfile(backup):
+                os.replace(splits_file, backup)
+            self.print_to_log_file(
+                f"[FIX:C1] 기존 splits_final.json 이 source-case leakage 를 포함 → "
+                f"백업({backup}) 후 grouped split 재생성"
+            )
+        elif not multi_roi:
+            return  # 단일 ROI 데이터셋 → stock 의 ungrouped split 과 동일하므로 위임
+
+        group_ids = sorted(groups.keys())
+        group_splits = generate_crossval_split(group_ids, seed=12345, n_splits=5)
+        splits = []
+        for gs in group_splits:
+            tr = sorted(k for g in gs["train"] for k in groups[g])
+            val = sorted(k for g in gs["val"] for k in groups[g])
+            splits.append({"train": tr, "val": val})
+        save_json(splits, splits_file)
+        self.print_to_log_file(
+            f"[FIX:C1] source-case grouped {len(splits)}-fold split 생성: "
+            f"{len(group_ids)} source cases → {len(keys)} ROI samples → {splits_file}"
+        )
+
+    def do_split(self):
+        """Grouped split, then stock read. PengwinTrainer overrides to add case-lock."""
+        self._ensure_grouped_splits_file()
+        return super().do_split()
+
+
+class PengwinTrainer(_GroupedSplitMixin, nnUNetTrainer):
+    """현재 사용 중인 split-anatomy trainer — DC+CE baseline, SGD+Cosine, ES patience 50.
+
+    V2 계약 사항:
+        - Loss는 기본적으로 DC+CE. Boundary/Tversky 항은 명시적이고 환경 변수로
+          선택되는 ablation이므로, baseline 실험은 비교 가능한 상태로 유지된다.
+        - CE class weight는 명시적으로 주거나 `PENGWIN_CE_CLASS_WEIGHTS=auto`로 설정한다.
+        - 단순 mirror가 해부학적 라벨을 오염시키는 Pelvic 데이터셋에서는 좌우 mirror를 끈다.
     """
 
     NUM_EPOCHS_DEFAULT = 1500
@@ -1750,17 +1818,17 @@ class PengwinTrainer(nnUNetTrainer):
     ES_MIN_EPOCHS = 100
     WARMUP_EPOCHS = 30
 
-    # Dataset532 contains small Sacrum/LH/RH regions, so foreground patches are
-    # oversampled more aggressively. Contact-LegacyFuse has sparse core and
-    # contact-surface classes, so it gets explicit class-3/class-4 sampling.
+    # Dataset532는 작은 Sacrum/LH/RH 영역을 포함하기 때문에 foreground patch를 더 공격적으로
+    # oversample한다. Contact-LegacyFuse는 sparse한 core/contact-surface class를 가지고 있어서,
+    # class-3 / class-4를 명시적으로 추가 sampling한다.
     PELVIC_DATASETS_OVERSAMPLE_50 = {
         "Dataset532_PelvicAnatomyV2",
     }
     ABBC_OFFICIAL_DATASETS: set[str] = set()
 
-    # BoundaryDoU is off by default. PENGWIN 2024 top CT recipes used DC+CE
-    # with representation/postprocess carrying the boundary burden; treat BD as
-    # a measured ablation, not a silent default.
+    # BoundaryDoU는 기본 비활성. PENGWIN 2024 상위 CT 레시피는 DC+CE를 사용하면서
+    # boundary 부담을 representation/postprocess가 떠안는 구조였다. 그래서 BD는
+    # 조용히 켜지는 기본값이 아니라 "측정된 ablation"으로 다룬다.
     USE_BOUNDARY_LOSS = False
     BD_WEIGHT = 0.0
     USE_TVERSKY_LOSS = False
@@ -1769,7 +1837,7 @@ class PengwinTrainer(nnUNetTrainer):
     TV_BETA = 0.7
     TV_ACTIVE_CLASSES: tuple[int, ...] | None = None
     TV_CLASS_WEIGHTS: tuple[float, ...] | None = None
-    # CE class weights are disabled by default; "auto" scans labelsTr.
+    # CE class weight는 기본 비활성이다. "auto"로 두면 labelsTr를 스캔한다.
     USE_CLASS_WEIGHTS = False
     CE_CLASS_WEIGHTS: dict | str | None = None
     CLASS_WEIGHT_CLIP = (0.5, 2.0)
@@ -1777,11 +1845,15 @@ class PengwinTrainer(nnUNetTrainer):
     DEFAULT_CE_CLASS_WEIGHTS = "off"
     DEFAULT_OVERSAMPLE_PROFILE = "default"
 
-    # Datasets where left-right asymmetry matters (LH vs RH labels) — disable x-mirror.
-    # Dataset532 contains both LeftHip and RightHip, so a plain mirror would
-    # create anatomically swapped images with unswapped labels.
+    # 좌우 비대칭이 중요한 데이터셋(LH 라벨과 RH 라벨이 따로 있는 경우) — x-mirror를 비활성화한다.
+    # Dataset532는 LeftHip과 RightHip을 모두 포함하므로 단순 mirror를 하면 해부학적으로 좌우가
+    # 뒤바뀐 이미지가 만들어지는데 라벨은 바뀌지 않은 채로 남는다.
     DISABLE_X_MIRROR_DATASETS = {
         "Dataset532_PelvicAnatomyV2",
+        # [V0.x][FIX:LR][2026-06-02] Ds539 추가 — diag_hip_precision 조사 결과 hip 저조의
+        # 87.6%가 좌우 hip 스왑(laterality 혼동)이고, axis-2(L/R) mirror augmentation 이
+        # L↔R 교환을 학습시키는 직접 원인. Ds532 와 동일하게 axis-2 mirror 비활성화.
+        "Dataset539_PelvicFemurAnatomyV3",
     }
 
     def __init__(self, plans: dict, configuration: str, fold: int,
@@ -1791,20 +1863,18 @@ class PengwinTrainer(nnUNetTrainer):
                          unpack_dataset=unpack_dataset, device=device)
         self.num_epochs = int(os.environ.get("PENGWIN_NUM_EPOCHS", self.NUM_EPOCHS_DEFAULT))
         # [QA][Test:runtime_smoke]
-        # These overrides are intentionally generic so V5 can run 1-epoch and
-        # 40-epoch case-locked tests with the stock trainer. They are opt-in and
-        # never affect normal training unless the environment explicitly sets
-        # them.
+        # 이 override들은 의도적으로 일반적인 형태로 두었다. 그래야 stock trainer로도
+        # V5의 1-epoch / 40-epoch case-locked 테스트를 돌릴 수 있다. opt-in 방식이라
+        # 환경 변수가 명시되지 않으면 평소 학습에 영향을 주지 않는다.
         if os.environ.get("PENGWIN_TRAIN_ITERS"):
             self.num_iterations_per_epoch = int(os.environ["PENGWIN_TRAIN_ITERS"])
         if os.environ.get("PENGWIN_VAL_ITERS"):
             self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_VAL_ITERS"])
         # [REPRO][Risk:Major][Scope:optimizer_ablation]
-        # nnU-Net's default 1e-2 SGD LR is retained unless an experiment
-        # explicitly sets PENGWIN_INITIAL_LR. V6 case003 diagnostics showed
-        # support collapse as warmup raised LR, so this opt-in override lets us
-        # test optimizer stability without changing target, model, loss, or
-        # decoder contracts.
+        # 실험에서 PENGWIN_INITIAL_LR을 명시하지 않는 한 nnU-Net 기본값인 1e-2 SGD LR을 유지한다.
+        # V6 case003 진단에서 warmup이 LR을 올리면서 support가 붕괴하는 것을 봤기 때문에,
+        # 이 opt-in override로 target/model/loss/decoder를 건드리지 않고 optimizer 안정성만
+        # 단독으로 테스트할 수 있게 했다.
         self.initial_lr = float(os.environ.get("PENGWIN_INITIAL_LR", "1e-2"))
         self.weight_decay = 3e-5
         ds_name = self.plans_manager.dataset_name
@@ -1820,37 +1890,33 @@ class PengwinTrainer(nnUNetTrainer):
                 self.oversample_foreground_percent = 0.50
         elif ds_name == "Dataset537_PelvicBICMFragmentV5":
             # [QA][Experiment:V5_sparse_sampling]
-            # Default nnU-Net foreground sampling produced zero predicted
-            # core/contact on case003. The sparse profile is opt-in so the
-            # stock DC+CE result remains reproducible.
+            # nnU-Net 기본 foreground sampling은 case003에서 core/contact를 전혀 예측하지 못했다.
+            # sparse profile은 opt-in이라, 기본 DC+CE 결과는 재현 가능한 상태로 남는다.
             if oversample_profile == "bicm_v5_sparse":
                 self.oversample_foreground_percent = 1.00
             elif oversample_profile == "bicm_v6_support_mixed":
                 # [DATA][Risk:High][Scope:support_negative_exposure]
-                # V6.3 changes only crop distribution after V6.2 showed that
-                # support/core-only learning still over-predicts support. A
-                # non-1.0 foreground rate lets native random crops contribute
-                # true background/exterior negatives; if this fixes HD95, the
-                # root cause was sampling bias rather than representation.
+                # V6.2에서 support/core만 학습해도 여전히 support가 과대예측되는 걸 확인한 뒤,
+                # V6.3은 오로지 crop 분포만 바꾼다. foreground 비율을 1.0이 아니게 두면
+                # 기본 random crop이 진짜 background/외부 negative를 공급할 수 있다.
+                # 이걸로 HD95가 개선된다면 원인은 표현이 아니라 sampling bias였다는 뜻이다.
                 self.oversample_foreground_percent = 0.65
             elif oversample_profile == "bicm_v7_contact_mixed":
                 # [DATA][Risk:High][Scope:contact_positive_exposure]
-                # Keep the same random-background budget as support_mixed. The
-                # only changed variable is which foreground class is selected
-                # when a crop is forced.
+                # support_mixed와 동일한 random-background 비율을 유지한다.
+                # 강제 crop이 발생할 때 어떤 foreground class를 고를지만 달라진다.
                 self.oversample_foreground_percent = 0.65
             elif oversample_profile == "bicm_v7_contact15_mixed":
                 # [DATA][Risk:High][Scope:contact_positive_exposure]
-                # Same foreground-vs-random budget as support_mixed; only the
-                # forced-class distribution changes from 5% to 15% contact.
+                # foreground-vs-random 예산은 support_mixed와 동일. 차이는 forced-class
+                # 분포에서 contact 비율이 5%에서 15%로 바뀐 것 하나뿐이다.
                 self.oversample_foreground_percent = 0.65
             elif oversample_profile in {"bicm_v11_contact_roi", "bicm_v18_roi_balanced"}:
                 # [DATA][Risk:High][Scope:contact_positive_exposure]
-                # V10 showed a different failure from V9/V9.1: support/core
-                # were stable but the contact head collapsed to zero. This
-                # profile increases positive contact crop exposure while the
-                # ROI sampling probabilities below keep no-contact ROIs in the
-                # batch stream for absent-contact supervision.
+                # V10에서 V9/V9.1과는 다른 실패가 나타났다: support/core는 안정적이었지만
+                # contact head가 0으로 붕괴했다. 이 프로파일은 positive contact crop 노출을 늘리되,
+                # 아래의 ROI sampling 확률로 no-contact ROI도 배치 흐름에 남겨서
+                # absent-contact 학습이 유지되도록 한다.
                 self.oversample_foreground_percent = 0.80
             else:
                 self.oversample_foreground_percent = 0.33
@@ -1863,26 +1929,20 @@ class PengwinTrainer(nnUNetTrainer):
             self.oversample_foreground_percent = 0.33
         self._pengwin_oversample_profile = oversample_profile
         self._configure_loss_ablation_from_env()
-        # Early stop state
+        # Early stop 상태 변수
         self._es_best_dice = -1.0
         self._es_no_improve = 0
         self._es_triggered = False
 
-    @staticmethod
-    def _source_case_from_identifier(identifier: str) -> str:
-        """Return zero-padded source case ID from nnU-Net sample identifier."""
-        stem = str(identifier).replace("PENGWIN_", "")
-        return stem.split("_", 1)[0].zfill(3)
-
     def _pengwin_case_lock(self, train_keys: list[str], val_keys: list[str]) -> tuple[list[str], list[str]]:
-        """Optionally force a source-case overfit split for V5 root-cause tests.
+        """V5 root-cause 테스트를 위해 source-case 단위 overfit split을 강제하는 옵션 메서드.
 
         [DATA][Leakage:case_lock]
-        Dataset537 V5 has multiple ROI samples per source CT. A case-locked
-        overfit must include all matching ROI identifiers in both train and val
-        so patch validation cannot mix a different source case into the health
-        check. This is disabled unless `PENGWIN_OVERFIT_CASES` or
-        `PENGWIN_BICM_V5_CASES` is explicitly set.
+        Dataset537 V5에서는 source CT 하나당 여러 ROI sample이 나온다. case-locked overfit을
+        제대로 하려면 같은 source case의 ROI identifier들을 train과 val 양쪽에 모두 포함시켜야
+        한다. 그래야 patch validation이 다른 source case를 health check에 끼워넣지 못한다.
+        이 동작은 `PENGWIN_OVERFIT_CASES` 또는 `PENGWIN_BICM_V5_CASES`가 명시적으로 설정된
+        경우에만 켜진다.
         """
         raw = (
             os.environ.get("PENGWIN_OVERFIT_CASES", "").strip()
@@ -1908,32 +1968,33 @@ class PengwinTrainer(nnUNetTrainer):
         return selected, selected
 
     def do_split(self):
-        train_keys, val_keys = super().do_split()
+        # grouped split (via _GroupedSplitMixin) → stock read → optional case-lock overfit.
+        self._ensure_grouped_splits_file()
+        train_keys, val_keys = nnUNetTrainer.do_split(self)
         return self._pengwin_case_lock(list(train_keys), list(val_keys))
 
     def _build_loss(self):
-        """Build DC+CE plus explicit, auditable loss ablations.
+        """DC+CE를 기본으로 하고, 명시적이고 감사(audit) 가능한 loss ablation을 얹어서 구성한다.
 
-        Algorithm:
-            1. Build base DC_and_CE_loss exactly as parent does (preserves
-               batch_dice / smooth / DDP smoothing / ignore_label semantics).
-               If CE_CLASS_WEIGHTS is set, pass `weight` kwarg to CE part.
-            2. If boundary/Tversky profiles are explicitly selected, wrap with
-               the corresponding compound loss.
-            3. nnU-Net's torch.compile path expects loss.dc to be the Dice
-               module — our wrappers expose it via attribute pass-through.
-            4. Then DeepSupervisionWrapper as in parent (multi-resolution).
+        알고리즘:
+            1. 부모 클래스와 동일하게 base DC_and_CE_loss를 만든다
+               (batch_dice / smooth / DDP smoothing / ignore_label 의미를 그대로 보존).
+               CE_CLASS_WEIGHTS가 설정돼 있으면 CE 부분에 `weight` 인자를 넘긴다.
+            2. boundary/Tversky 프로파일이 명시적으로 선택돼 있으면 해당 compound loss로 감싼다.
+            3. nnU-Net의 torch.compile 경로는 loss.dc가 Dice 모듈일 거라고 기대하기 때문에,
+               우리 wrapper는 속성 통과(attribute pass-through)로 이를 노출한다.
+            4. 마지막으로 부모처럼 DeepSupervisionWrapper로 감싼다 (multi-resolution).
 
-        Why we don't subclass MIC-DKFZ's loss code paths:
-            DC_and_CE_loss handles ignore_label and DDP edge cases internally;
-            re-implementing risks subtle bugs. We compose, not replace.
+        MIC-DKFZ의 loss 코드 패스를 서브클래싱하지 않는 이유:
+            DC_and_CE_loss는 ignore_label과 DDP edge case들을 내부에서 다루는데,
+            이걸 다시 구현하면 미묘한 버그가 생길 위험이 있다. 그래서 대체가 아니라 구성(compose)한다.
 
         Fallback:
-            If `loss.py` import fails or USE_BOUNDARY_LOSS=False or label
-            manager has regions (multi-label, e.g. nested anatomies), fall
-            back to parent's DC+CE — never silently break training.
+            `loss.py` import가 실패하거나, USE_BOUNDARY_LOSS=False이거나, label manager가
+            region 기반(multi-label, 예: 중첩된 해부 구조)이면 부모의 DC+CE로 폴백한다.
+            절대 조용히 학습을 망가뜨리지 않는다.
         """
-        # Region-based labels (multi-label) → defer to parent (no boundary).
+        # Region 기반 라벨 (multi-label)이면 → 부모 구현으로 위임 (boundary loss 없이).
         if self.label_manager.has_regions:
             return super()._build_loss()
 
@@ -1953,10 +2014,10 @@ class PengwinTrainer(nnUNetTrainer):
 
         if getattr(self, "USE_BICM_V67_SEMANTIC_EDGE_PAIR_OBJECTIVE", False):
             # [AUDIT][Risk:High][Scope:v67_representation_diagnostic]
-            # V66 support geometry passed but LeftHip contact remained broad and
-            # seed topology failed. V67 keeps the semantic head and V62 support
-            # terms, then adds local contact-vs-support edge ranking. This is a
-            # representation/loss diagnostic, not a 159/fold0/fulltrain unlock.
+            # V66은 support geometry는 통과했지만 LeftHip contact가 여전히 넓게 퍼지고
+            # seed topology가 실패했다. V67은 semantic head와 V62 support 항을 그대로 두고,
+            # 거기에 local contact-vs-support edge ranking을 추가한다.
+            # 이건 표현/loss 진단(diagnostic)이지 159/fold0/fulltrain을 풀어주는 시도가 아니다.
             base = DC_and_CE_loss(
                 {'batch_dice': self.configuration_manager.batch_dice,
                  'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
@@ -1981,9 +2042,9 @@ class PengwinTrainer(nnUNetTrainer):
             )
         elif getattr(self, "USE_BICM_V65_BALANCED_CONTACT_CORE_OBJECTIVE", False):
             # [AUDIT][Risk:High][Scope:v65_loss_rebalance]
-            # V64 measured a contact-collapse failure from excessive precision
-            # pressure. V65 keeps the V62/V64 single-variable loss-only scope
-            # but rebalances class-4 contact toward recall first.
+            # V64는 precision 압력이 과해서 contact가 붕괴하는 실패를 측정했다.
+            # V65는 V62/V64의 "loss만 바꾸는 단일 변수" 원칙은 그대로 두면서,
+            # class-4 contact를 우선 recall 쪽으로 재균형 잡는다.
             base = DC_and_CE_loss(
                 {'batch_dice': self.configuration_manager.batch_dice,
                  'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
@@ -2008,10 +2069,10 @@ class PengwinTrainer(nnUNetTrainer):
             )
         elif getattr(self, "USE_BICM_V64_TOPOLOGY_PRECISION_OBJECTIVE", False):
             # [AUDIT][Risk:High][Scope:v64_single_variable_loss]
-            # V62 40e passed aggregate support geometry but failed contact
-            # precision, tiny-fragment core coverage, and IoU-F. V64 keeps the
-            # same V5 semantic head/target/decoder and changes only loss
-            # pressure toward the measured topology errors.
+            # V62 40-epoch 실험은 전체 support geometry는 통과했지만 contact precision,
+            # tiny-fragment core coverage, IoU-F에서 실패했다. V64는 V5 semantic
+            # head/target/decoder는 그대로 두고, 측정된 topology 오류를 잡는 쪽으로
+            # loss 압력만 변경한다.
             base = DC_and_CE_loss(
                 {'batch_dice': self.configuration_manager.batch_dice,
                  'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
@@ -2036,12 +2097,10 @@ class PengwinTrainer(nnUNetTrainer):
             )
         elif getattr(self, "USE_BICM_V62_SEMANTIC_BOUNDARY_OBJECTIVE", False):
             # [AUDIT][Risk:High][Scope:v62_methodology_pivot]
-            # V38-V61 exhausted the factorized BICM head family without
-            # passing case003. V62 deliberately returns to the simpler V5
-            # semantic head and changes only the loss toward support boundary,
-            # contact, and core terms. This avoids introducing another hidden
-            # branch while testing whether the oracle-passing target can be
-            # learned with a boundary/HD95-aware objective.
+            # V38-V61에 걸쳐 factorized BICM head 계열을 모두 시도했지만 case003을 통과시키지 못했다.
+            # V62는 의도적으로 더 단순한 V5 semantic head로 돌아가서, loss만 support boundary,
+            # contact, core 항으로 바꾼다. 또 다른 숨겨진 branch를 추가하지 않으면서,
+            # oracle을 통과하는 target이 boundary/HD95-aware 목적함수로 학습될 수 있는지 확인하려는 시도다.
             base = DC_and_CE_loss(
                 {'batch_dice': self.configuration_manager.batch_dice,
                  'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
@@ -2066,11 +2125,10 @@ class PengwinTrainer(nnUNetTrainer):
             )
         elif getattr(self, "USE_BICM_V5_SUPPORT_GEOMETRY_OBJECTIVE", False):
             # [AUDIT][Risk:Major][Scope:v5_support_geometry]
-            # V5.4 hybrid-oracle evidence showed that target contact/core
-            # information is absent from predicted support. This branch keeps
-            # target/input/decoder unchanged and changes only the support
-            # geometry objective. It is therefore a one-variable root-cause
-            # experiment, not a new architecture.
+            # V5.4 hybrid-oracle 분석에서, 예측된 support에 target의 contact/core 정보가
+            # 빠져 있음을 확인했다. 이 분기는 target/input/decoder는 그대로 두고,
+            # support geometry 목적함수만 변경한다. 따라서 새 아키텍처가 아니라
+            # 한 변수만 바꿔보는 root-cause 실험이다.
             base = DC_and_CE_loss(
                 {'batch_dice': self.configuration_manager.batch_dice,
                  'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
@@ -2095,10 +2153,9 @@ class PengwinTrainer(nnUNetTrainer):
             )
         elif getattr(self, "USE_BICM_V5_SPARSE_OBJECTIVE", False):
             # [AUDIT][Risk:Major][Scope:loss_contract]
-            # V5 maps class 3 to core and class 4 to contact. Reusing old
-            # V3 class-2 ridge losses would train the wrong semantic meaning.
-            # This branch is therefore explicit and active only for the
-            # `bicm_v5_sparse` loss profile.
+            # V5는 class 3을 core로, class 4를 contact로 매핑한다. 예전 V3의 class-2 ridge loss를
+            # 그대로 가져다 쓰면 의미가 어긋난 class를 학습하게 된다.
+            # 그래서 이 분기는 `bicm_v5_sparse` loss profile일 때만 명시적으로 활성화된다.
             base = DC_and_CE_loss(
                 {'batch_dice': self.configuration_manager.batch_dice,
                  'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
@@ -2226,17 +2283,17 @@ class PengwinTrainer(nnUNetTrainer):
         return loss
 
     def _configure_loss_ablation_from_env(self) -> None:
-        """Apply environment-selected loss ablations.
+        """환경 변수로 선택된 loss ablation을 적용한다.
 
-        Supported:
+        지원하는 값:
             PENGWIN_LOSS_PROFILE=
                 dc_ce|bd_dou_005|bd_dou_01|bd_dou_03|
                 tversky_07|tversky_08|combo_tversky_bd005|
                 abbc_contact_energy_v1|contact_fuse_v1|factorized_instance_v4
             PENGWIN_CE_CLASS_WEIGHTS=off|auto
 
-        This keeps default training comparable while allowing reproducible loss
-        experiments without code edits.
+        기본 학습은 그대로 비교 가능한 상태로 두면서, 코드 수정 없이도 재현 가능한
+        loss 실험을 돌릴 수 있게 해준다.
         """
         profile = os.environ.get("PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE).strip().lower()
         self.USE_BOUNDARY_LOSS = False
@@ -2285,10 +2342,10 @@ class PengwinTrainer(nnUNetTrainer):
             self.USE_BOUNDARY_LOSS = True
             self.BD_WEIGHT = 0.05
         elif profile == "abbc_contact_energy_v1":
-            # Contact-energy V2: class 3 is no longer a broad recall target. It
-            # is a narrow contact/fracture surface used as an energy ridge in
-            # postprocessing, so false positives are more damaging than modest
-            # false negatives. Core remains active to keep marker seeds stable.
+            # Contact-energy V2: 더 이상 class 3을 폭넓은 recall 대상으로 보지 않는다.
+            # 후처리에서 energy ridge로 쓰는 좁은 contact/fracture surface이기 때문에,
+            # 약간의 false negative보다 false positive가 훨씬 더 해롭다.
+            # marker seed의 안정성을 위해 core는 그대로 활성 상태로 둔다.
             self.USE_TVERSKY_LOSS = True
             self.TV_WEIGHT = 0.55
             self.TV_ALPHA = 0.70
@@ -2460,10 +2517,9 @@ class PengwinTrainer(nnUNetTrainer):
             "bicm_v159_core_heatmap_center_seed_affinity_sampler",
         }:
             # [QC][Invariant:custom_trainer_loss_dispatch]
-            # V6+ BICM trainers override `_build_loss` with custom sigmoid
-            # objectives. The base trainer only needs to recognize these
-            # profile names so audit logs do not report a misleading DC+CE
-            # fallback before the subclass builds its real loss.
+            # V6 이후 BICM trainer들은 `_build_loss`를 override해서 custom sigmoid 목적함수를 쓴다.
+            # base trainer는 단지 이 프로파일 이름들을 알아만 보면 된다 — 그래야 audit log에
+            # 서브클래스가 진짜 loss를 만들기 전에 "DC+CE로 fallback"이라는 잘못된 메시지가 안 찍힌다.
             pass
         elif profile in {
             "contact_instance_v1",
@@ -2501,17 +2557,17 @@ class PengwinTrainer(nnUNetTrainer):
         )
 
     def _resolve_class_weights(self, n_classes: int) -> np.ndarray | None:
-        """Resolve CE_CLASS_WEIGHTS attribute → numpy array of shape (n_classes,).
+        """CE_CLASS_WEIGHTS 속성을 (n_classes,) shape의 numpy 배열로 변환한다.
 
-        Accepts:
-            - None: returns None (caller skips weights)
-            - dict {class_idx: weight}: convert to dense array, missing keys = 1.0
-            - "auto": scan generated nnU-Net raw labels and compute clipped
-              median-frequency weights.
-            - np.ndarray / list: copy + validate length
+        받을 수 있는 형식:
+            - None: None을 반환한다 (호출자가 weight 적용을 건너뛴다)
+            - dict {class_idx: weight}: dense array로 변환하며, 누락된 키는 1.0으로 채운다
+            - "auto": 생성된 nnU-Net raw label을 스캔해서 median-frequency 기반의
+              clip된 weight를 계산한다.
+            - np.ndarray / list: 복사 후 길이를 검증한다
 
-        Returns:
-            np.ndarray of shape (n_classes,) or None.
+        반환:
+            (n_classes,) shape의 np.ndarray 또는 None.
         """
         cw = self.CE_CLASS_WEIGHTS
         if cw is None:
@@ -2526,7 +2582,7 @@ class PengwinTrainer(nnUNetTrainer):
                 if 0 <= int(k) < n_classes:
                     arr[int(k)] = float(v)
             return arr
-        # list/array — validate length and copy
+        # list/array의 경우 — 길이를 검증하고 복사한다
         arr = np.asarray(cw, dtype=np.float32)
         if arr.shape != (n_classes,):
             self.print_to_log_file(
@@ -2537,7 +2593,7 @@ class PengwinTrainer(nnUNetTrainer):
         return arr
 
     def _compute_auto_class_weights(self, n_classes: int) -> np.ndarray | None:
-        """Compute class weights from generated raw labels and write an audit JSON."""
+        """생성된 raw label로부터 class weight를 계산하고 audit JSON을 함께 기록한다."""
         try:
             import SimpleITK as sitk
         except ImportError:
@@ -2577,16 +2633,16 @@ class PengwinTrainer(nnUNetTrainer):
         return weights
 
     def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
-        """Disable axis-2 mirror (L/R) for Pelvic datasets to prevent LH↔RH label corruption.
+        """Pelvic 데이터셋에서 LH↔RH 라벨 오염을 막기 위해 axis-2 mirror(L/R)를 비활성화한다.
 
-        After transpose_forward [1,0,2], axis 2 in patch space = original x-axis = L/R.
-        Mirroring it creates LH-shaped voxels on the right side still labeled LH → noise.
+        transpose_forward [1,0,2]를 거치면 patch 공간의 axis 2는 원본의 x축, 즉 L/R 방향이다.
+        이걸 mirror하면 LH 모양 voxel이 오른쪽에 생기는데 라벨은 여전히 LH라서 노이즈가 된다.
         """
         rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes = \
             super().configure_rotation_dummyDA_mirroring_and_inital_patch_size()
         ds_name = self.plans_manager.dataset_name
         if ds_name in self.DISABLE_X_MIRROR_DATASETS:
-            # Drop axis 2 from mirror_axes
+            # mirror_axes에서 axis 2를 제거한다
             new_axes = tuple(a for a in mirror_axes if a != 2)
             self.print_to_log_file(
                 f"[PengwinTrainer] {ds_name} → disable axis-2 mirror (L/R asymmetry). "
@@ -2597,19 +2653,18 @@ class PengwinTrainer(nnUNetTrainer):
         return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes
 
     def _bicm_contact_roi_sampling_probabilities(self, dataset: nnUNetDataset) -> np.ndarray | None:
-        """Return train-case probabilities for the V11 contact-positive exposure test.
+        """V11 contact-positive exposure 실험을 위한 train-case 확률을 반환한다.
 
         [AUDIT][Risk:High][Scope:single_variable_ablation]
-        V10 failed because the contact head collapsed to zero while support and
-        core already passed full-volume gates. This method changes only sample
-        exposure: contact-positive ROI samples receive a higher probability,
-        but no-contact ROIs remain in the distribution so absent-contact
-        negatives are still trained.
+        V10에서는 support와 core가 full-volume gate를 통과했음에도 contact head가
+        0으로 붕괴(collapse)했다. 이 메서드는 오직 sample 노출 빈도만 바꿔서,
+        contact-positive ROI 샘플의 선택 확률을 높이되 no-contact ROI도 분포에 남겨두어
+        absent-contact negative까지 학습되도록 한다.
 
         [QC][Invariant:nnunet_sampling_probabilities]
-        nnU-Net expects probabilities aligned with `list(dataset.keys())`.
-        Returning `None` falls back to native uniform sampling if no ROI has
-        class-4 contact locations.
+        nnU-Net은 `list(dataset.keys())` 순서에 맞춰 정렬된 확률을 기대한다.
+        만약 class-4 contact location을 가진 ROI가 하나도 없다면 `None`을 반환해
+        기본 uniform sampling으로 폴백한다.
         """
         keys = list(dataset.keys())
         if not keys:
@@ -2619,7 +2674,7 @@ class PengwinTrainer(nnUNetTrainer):
         for key in keys:
             try:
                 _, _, props = dataset.load_case(key)
-            except Exception as exc:  # pragma: no cover - runtime guard for corrupt preprocessed data.
+            except Exception as exc:  # pragma: no cover - 전처리 데이터가 손상된 경우를 위한 runtime guard
                 raise RuntimeError(f"failed to load Dataset537 BICM properties for {key!r}") from exc
             has_contact = PengwinBICMV5DataLoader3D._class_key(
                 props.get("class_locations", {}),
@@ -2648,13 +2703,12 @@ class PengwinTrainer(nnUNetTrainer):
         return probs
 
     def get_dataloaders(self):
-        """Return native dataloaders, with opt-in V5 sparse crop steering.
+        """기본 dataloader를 반환하되, opt-in으로 V5 sparse crop steering을 적용한다.
 
         [QA][Experiment:V5_sparse_sampling]
-        This method intentionally affects only
-        `Dataset537_PelvicBICMFragmentV5` plus
-        `PENGWIN_OVERSAMPLE_PROFILE=bicm_v5_sparse`. All anatomy datasets and
-        the V5 plain-DC+CE baseline keep the parent nnU-Net dataloaders.
+        이 메서드는 의도적으로 `Dataset537_PelvicBICMFragmentV5` 데이터셋 +
+        `PENGWIN_OVERSAMPLE_PROFILE=bicm_v5_sparse` 조합에서만 동작한다.
+        그 외 해부학 데이터셋과 V5 plain-DC+CE baseline은 부모 nnU-Net의 dataloader를 그대로 쓴다.
         """
         if (
             self.plans_manager.dataset_name != "Dataset537_PelvicBICMFragmentV5"
@@ -2728,17 +2782,15 @@ class PengwinTrainer(nnUNetTrainer):
         )
         if self._pengwin_oversample_profile == "bicm_v18_roi_balanced":
             # [AUDIT][Risk:High][Scope:single_variable_ablation]
-            # V17 used the V11 sampler, where contact-positive ROIs get 6x
-            # case weight. On case003 that makes the single LeftHip contact ROI
-            # dominate Sacrum/RightHip absent-contact supervision. V18 changes
-            # only ROI case sampling back to uniform while keeping the V17
-            # branch, V16 loss, fixed target, decoder, threshold, and forced
-            # class distribution unchanged.
+            # V17은 V11 sampler를 그대로 썼는데, 그 sampler는 contact-positive ROI에
+            # 6배의 case weight를 부여한다. case003에서는 LeftHip contact ROI 하나가
+            # Sacrum/RightHip의 absent-contact 학습을 지배하게 된다.
+            # V18은 ROI case sampling만 uniform으로 되돌리고, V17 분기·V16 loss·
+            # 고정된 target/decoder/threshold/forced class distribution은 그대로 유지한다.
             #
             # [QA][Gate:003_roi_absence]
-            # Passing evidence must come from full-volume eval: absent
-            # Sacrum/RightHip ROI scores should fall below 0.5 without
-            # collapsing LeftHip contact recall.
+            # 통과 근거는 full-volume eval에서 와야 한다. 즉 부재해야 할 Sacrum/RightHip
+            # ROI 점수는 0.5 미만으로 떨어지면서 LeftHip contact recall은 무너지지 않아야 한다.
             self.print_to_log_file(
                 "[PengwinTrainer] BICM V18 ROI sampling = uniform over case/anatomy keys "
                 "(contact-positive ROI weighting disabled)"
@@ -2762,8 +2814,8 @@ class PengwinTrainer(nnUNetTrainer):
             self.configuration_manager.patch_size,
             self.label_manager,
             # [DATA][Validation]
-            # Validation remains unbiased. Patch validation is only a health
-            # check; full-volume bicm-v5-eval JSON remains the decision gate.
+            # Validation은 편향 없이 유지한다. Patch validation은 단순 health check일 뿐,
+            # 진짜 판단 기준은 full-volume bicm-v5-eval JSON이다.
             oversample_foreground_percent=0.0,
             sampling_probabilities=None,
             pad_sides=None,
@@ -2800,13 +2852,13 @@ class PengwinTrainer(nnUNetTrainer):
         """SGD + Cosine annealing + warmup (PENGWIN 2024 표준)."""
         optimizer = SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                         momentum=0.99, nesterov=True)
-        # Warmup + cosine
+        # Warmup 후 cosine 스케줄 적용
         warmup = self.WARMUP_EPOCHS
 
         def lr_lambda(epoch):
             if epoch < warmup:
                 return (epoch + 1) / warmup
-            # cosine from peak to 0 over remaining epochs
+            # 남은 epoch 동안 peak에서 0까지 cosine 감소
             import math
             progress = (epoch - warmup) / max(1, self.num_epochs - warmup)
             return 0.5 * (1 + math.cos(math.pi * progress))
@@ -2815,11 +2867,11 @@ class PengwinTrainer(nnUNetTrainer):
         return optimizer, lr_scheduler
 
     def run_training(self):
-        """Override to use while-loop so ES can shorten num_epochs mid-training.
+        """학습 중간에 ES(Early Stop)가 num_epochs를 줄일 수 있도록 while-loop로 오버라이드한다.
 
-        Parent's `for epoch in range(start, num_epochs)` evaluates num_epochs once
-        at loop creation — later changes to self.num_epochs have no effect.
-        Use a while-loop that re-evaluates self.num_epochs each iteration.
+        부모 클래스의 `for epoch in range(start, num_epochs)`는 루프 생성 시점에 num_epochs를
+        한 번만 평가하기 때문에, 이후 self.num_epochs를 바꿔도 반영되지 않는다.
+        그래서 매 반복마다 self.num_epochs를 다시 확인하는 while-loop를 사용한다.
         """
         self.on_train_start()
         while self.current_epoch < self.num_epochs:
@@ -2843,7 +2895,7 @@ class PengwinTrainer(nnUNetTrainer):
 
     def on_validation_epoch_end(self, val_outputs):
         super().on_validation_epoch_end(val_outputs)
-        # Early stop on EMA pseudo Dice
+        # EMA pseudo Dice 기준 Early stop 판단
         completed = self.current_epoch + 1
         if completed < self.ES_MIN_EPOCHS:
             return
@@ -2861,8449 +2913,319 @@ class PengwinTrainer(nnUNetTrainer):
                     f"at epoch {completed - self.ES_PATIENCE}. "
                     f"Stopping at epoch {completed}."
                 )
-                self.num_epochs = completed  # signal main loop to exit
-
-
-class PengwinTrainerBICMSemanticCandidateV66(PengwinTrainer):
-    """V66 semantic BICM candidate-checkpoint probe.
-
-    V66 deliberately keeps the V62 semantic-head learning problem unchanged:
-    same Dataset537 materialization, same 5-class output, same
-    `bicm_v62_semantic_boundary` loss, same case003 gate, and same fixed
-    `bicm_v5_core_watershed` decoder. The only changed variable is evidence
-    retention: periodic completed-epoch checkpoints are saved so full-volume
-    IoU-F/contact/core metrics can select candidates instead of nnU-Net patch
-    pseudo Dice.
-
-    Raises:
-        RuntimeError: if used on a non-V5 Dataset537 semantic contract.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v62_semantic_boundary"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v5_sparse"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self._v66_save_every = max(1, int(os.environ.get("PENGWIN_V66_SAVE_EVERY", "5")))
-
-    def initialize(self) -> None:
-        super().initialize()
-        if self.plans_manager.dataset_name != "Dataset537_PelvicBICMFragmentV5":
-            raise RuntimeError(
-                "PengwinTrainerBICMSemanticCandidateV66 is only valid for "
-                "Dataset537_PelvicBICMFragmentV5."
-            )
-        if self.label_manager.num_segmentation_heads != 5:
-            raise RuntimeError(
-                "V66 expects the V5 5-class semantic head "
-                "(background/exterior/shell/core/contact); got "
-                f"{self.label_manager.num_segmentation_heads} heads."
-            )
-        self.print_to_log_file(
-            "[BICMSemanticCandidateV66] contract "
-            "changed_variable=checkpoint_retention_only; "
-            "loss=bicm_v62_semantic_boundary; "
-            "decoder_eval=bicm_v5_core_watershed; "
-            f"candidate_save_every_completed_epochs={self._v66_save_every}; "
-            "gate=case003_before_159_20case_fold0"
-        )
-
-    def on_epoch_end(self):
-        # Keep nnU-Net's default semantic logging/checkpoint semantics, then
-        # add completed-epoch candidates before incrementing `current_epoch`.
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        self.print_to_log_file(
-            "Pseudo dice",
-            [np.round(i, decimals=4) for i in self.logger.my_fantastic_logging["dice_per_class_or_region"][-1]],
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-
-        current_epoch = int(self.current_epoch)
-        completed_epoch = current_epoch + 1
-        if completed_epoch % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_latest.pth"))
-
-        if self._best_ema is None or self.logger.my_fantastic_logging["ema_fg_dice"][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging["ema_fg_dice"][-1]
-            self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-
-        # [AUDIT][Risk:High][Scope:checkpoint_selection]
-        # V62/V65 showed patch pseudo Dice and final/best checkpoints are not
-        # reliable promotion evidence for IoU-F. V66 stores periodic
-        # completed-epoch snapshots so full-volume fixed-decoder evaluation can
-        # prove whether a useful epoch exists. This is diagnostic only; failed
-        # candidates must be deleted after JSON/log evidence is retained.
-        # [QC][Invariant:no_method_change]
-        # This save path must not alter optimizer, loss, target, decoder, or
-        # threshold behavior. It only calls nnU-Net's existing save_checkpoint.
-        if completed_epoch % self._v66_save_every == 0 or current_epoch == (self.num_epochs - 1):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            tag = self.__class__.__name__.replace("PengwinTrainer", "")
-            self.print_to_log_file(
-                f"[{tag}] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-
-        self.current_epoch += 1
-
-
-class PengwinTrainerBICMSemanticEdgePairV67(PengwinTrainerBICMSemanticCandidateV66):
-    """V67 semantic BICM with local edge-pair contact ranking.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v66]
-    V66 showed that checkpoint selection improves case003 IoU-F but leaves the
-    fractured LeftHip ROI below gate because contact is broad and tiny support
-    components lack stable seeds. V67 keeps Dataset537, the 5-class semantic
-    head, the fixed `bicm_v5_core_watershed` decoder, and periodic candidate
-    checkpoints. The changed variable is the loss profile:
-    `bicm_v67_semantic_edge_pair`.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v67_semantic_edge_pair"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self._v66_save_every = max(1, int(os.environ.get(
-            "PENGWIN_V67_SAVE_EVERY",
-            os.environ.get("PENGWIN_V66_SAVE_EVERY", "5"),
-        )))
-
-    def initialize(self) -> None:
-        PengwinTrainer.initialize(self)
-        if self.plans_manager.dataset_name != "Dataset537_PelvicBICMFragmentV5":
-            raise RuntimeError(
-                "PengwinTrainerBICMSemanticEdgePairV67 is only valid for "
-                "Dataset537_PelvicBICMFragmentV5."
-            )
-        if self.label_manager.num_segmentation_heads != 5:
-            raise RuntimeError(
-                "V67 expects the V5 5-class semantic head "
-                "(background/exterior/shell/core/contact); got "
-                f"{self.label_manager.num_segmentation_heads} heads."
-            )
-        self.print_to_log_file(
-            "[BICMSemanticEdgePairV67] contract "
-            "changed_variable=semantic_edge_pair_loss; "
-            "loss=bicm_v67_semantic_edge_pair; "
-            "decoder_eval=bicm_v5_core_watershed; "
-            f"candidate_save_every_completed_epochs={self._v66_save_every}; "
-            "gate=case003_before_159_20case_fold0"
-        )
-
-
-class PengwinTrainerBICMFactorizedV6(PengwinTrainer):
-    """Dataset537 V6 per-anatomy factorized BICM trainer.
-
-    V6 keeps the V5 data contract but changes the network head from one
-    mutually exclusive 5-class softmax to independent binary heads:
-
-    ```text
-    0 support, 1 contact energy, 2 core seed, 3 exterior context
-    ```
-
-    [AUDIT][Risk:High][Scope:representation_pivot]
-    This trainer is introduced only after V5.5/V5.6 measured full-volume
-    contact collapse under the 5-class softmax head. It does not add anatomy
-    probability input, offsets, embeddings, or threshold tuning; those would
-    confound the next root-cause question.
-    """
-
-    NUM_EPOCHS_DEFAULT = 40
-    DEFAULT_LOSS_PROFILE = "bicm_v6_factorized"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v5_sparse"
-    ES_MIN_EPOCHS = 10
-    ES_PATIENCE = 20
-    ES_MIN_DELTA = 2e-3
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.enable_deep_supervision = False
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V6_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_VAL_ITERS"])
-        self._best_v6_score: float | None = None
-        self.print_to_log_file(
-            "[BICMFactorizedV6] output_channels=4 "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch} "
-            f"oversample_profile={self._pengwin_oversample_profile}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import,
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:custom_head_channels]
-        # nnU-Net's label manager still sees labels 0..4 from V5 raw masks, but
-        # V6 emits four independent sigmoid heads. Using the label-manager class
-        # count here would silently recreate the failed V5 softmax contract.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BICM_V6_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def _build_loss(self):
-        if not _BOUNDARY_LOSS_AVAILABLE:
-            raise ImportError("BICMV6FactorizedLoss is unavailable; check code_task1/loss.py import")
-        profile = os.environ.get("PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE).strip().lower()
-        if profile == "bicm_v6_precision":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v6_precision "
-                "(factorized heads + contact-absent negatives + support-noncontact top-k)"
-            )
-            return BICMV6PrecisionLoss()
-        if profile == "bicm_v7_contact_balanced":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v7_contact_balanced "
-                "(V7 anatomy-context support/core terms + moderate contact FP pressure)"
-            )
-            return BICMV7ContactBalancedLoss()
-        if profile == "bicm_v7_contact_ranked":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v7_contact_ranked "
-                "(V7 support/core terms + contact positive-vs-shell ranking)"
-            )
-            return BICMV7ContactRankedLoss()
-        if profile == "bicm_v7_contact_presence":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v7_contact_presence "
-                "(V7 support/core terms + per-ROI contact presence calibration)"
-            )
-            return BICMV7ContactPresenceLoss()
-        if profile == "bicm_v7_contact_ratio":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v7_contact_ratio "
-                "(V7 support/core terms + soft contact mass-ratio calibration)"
-            )
-            return BICMV7ContactRatioLoss()
-        if profile == "bicm_v7_contact_dense":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v7_contact_dense "
-                "(V7 support/core terms + training-only dense contact ridge target)"
-            )
-            return BICMV7ContactDenseRidgeLoss()
-        if profile == "bicm_v8_contact_contour":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v8_contact_contour "
-                "(V8 5-channel support/contact/core/exterior + contact contour auxiliary)"
-            )
-            return BICMV8ContactContourLoss()
-        if profile == "bicm_v9_contact_energy_pair":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v9_contact_energy_pair "
-                "(V9 contact as local energy + support-near-negative pair ranking)"
-            )
-            return BICMV9ContactEnergyPairLoss()
-        if profile == "bicm_v9_contact_energy_precision":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v9_contact_energy_precision "
-                "(V9.1 precision phase: stronger absent-ROI/support-negative contact suppression)"
-            )
-            return BICMV9ContactEnergyPrecisionLoss()
-        if profile == "bicm_v10_adaptive_topology":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v10_adaptive_topology "
-                "(V10 capped contact topology: V9 recall without V9.1 support collapse)"
-            )
-            return BICMV10AdaptiveContactTopologyLoss()
-        if profile == "bicm_v12_contact_persistent":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v12_contact_persistent "
-                "(V12 V10 topology + ungated persistent positive-contact objective)"
-            )
-            return BICMV12PersistentContactLoss()
-        if profile == "bicm_v13_contact_precision":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v13_contact_precision "
-                "(V13 V12 positives + tighter no-contact/support-local precision caps)"
-            )
-            return BICMV13PersistentPrecisionLoss()
-        if profile == "bicm_v14_contact_curriculum":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v14_contact_curriculum "
-                "(V14 V12 positives + staged V13 precision caps)"
-            )
-            return BICMV14StagedContactCurriculumLoss()
-        if profile == "bicm_v15_contact_presence_gate":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v15_contact_presence_gate "
-                "(V15 ROI-level contact-presence gate + voxel ridge head)"
-            )
-            return BICMV15ContactPresenceGateLoss()
-        if profile == "bicm_v16_roi_presence_classifier":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v16_roi_presence_classifier "
-                "(V16 pooled ROI contact-presence classifier + voxel ridge head)"
-            )
-            return BICMV16ROIPresenceClassifierLoss()
-        if profile == "bicm_v19_roi_calibrated_presence":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v19_roi_calibrated_presence "
-                "(V19 V16 ROI classifier with stronger absent-ROI calibration and ROI separation)"
-            )
-            return BICMV19ROICalibratedPresenceLoss()
-        if profile == "bicm_v22_core_marker_separation":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v22_core_marker_separation "
-                "(V22 V19 ROI calibration + train-time core marker anti-bridge terms)"
-            )
-            return BICMV22CoreMarkerSeparationLoss()
-        if profile == "bicm_v23_staged_core_marker":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v23_staged_core_marker "
-                "(V23 V22 core anti-bridge terms with deterministic warmup/ramp)"
-            )
-            return BICMV23StagedCoreMarkerLoss()
-        if profile == "bicm_v24_contact_preserved_core_marker":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v24_contact_preserved_core_marker "
-                "(V24 V23 staged core terms + positive-only contact preservation floor)"
-            )
-            return BICMV24ContactPreservedCoreMarkerLoss()
-        if profile == "bicm_v25_coupled_contact_core_marker":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v25_coupled_contact_core_marker "
-                "(V25 V24 positives + recall-aware support-local contact precision)"
-            )
-            return BICMV25CoupledContactCoreMarkerLoss()
-        if profile == "bicm_v26_contact_tolerant_precision":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v26_contact_tolerant_precision "
-                "(V26 V25 coupled schedule + contact-adjacent tolerant precision mask)"
-            )
-            return BICMV26ContactTolerantPrecisionLoss()
-        if profile == "bicm_v28_isolated_contact_precision":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v28_isolated_contact_precision "
-                "(V28 V27 isolated contact branch + stricter contact precision schedule)"
-            )
-            return BICMV28IsolatedContactPrecisionLoss()
-        if profile == "bicm_v29_gentle_isolated_contact_precision":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v29_gentle_isolated_contact_precision "
-                "(V29 V27 isolated contact branch + gentle two-phase precision schedule)"
-            )
-            return BICMV29GentleIsolatedContactPrecisionLoss()
-        if profile == "bicm_v30_soft_contact_ridge":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v30_soft_contact_ridge "
-                "(V30 V27 isolated contact branch + train-only soft contact ridge calibration)"
-            )
-            return BICMV30SoftContactRidgeLoss()
-        if profile == "bicm_v31_local_contrastive_contact":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v31_local_contrastive_contact "
-                "(V31 V30 soft ridge + local positive-vs-ring contact contrast)"
-            )
-            return BICMV31LocalContrastiveContactLoss()
-        if profile == "bicm_v32_memory_efficient_local_contrast":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v32_memory_efficient_local_contrast "
-                "(V32 V31 local contrast with mask-sum memory-reduced hard mining)"
-            )
-            return BICMV32MemoryEfficientLocalContrastLoss()
-        if profile == "bicm_v34_compact_core_marker":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v34_compact_core_marker "
-                "(V34 V32 contact objective + train-time compact core marker topology loss)"
-            )
-            return BICMV34CompactCoreMarkerLoss()
-        if profile == "bicm_v35_contact_precision_compact_core":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v35_contact_precision_compact_core "
-                "(V35 V34 compact markers + contact precision/absent-ROI calibration)"
-            )
-            return BICMV35ContactPrecisionCompactCoreLoss()
-        if profile == "bicm_v36_staged_contact_precision_compact_core":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v36_staged_contact_precision_compact_core "
-                "(V36 V34 warmup + delayed V35 contact precision ramp)"
-            )
-            return BICMV36StagedContactPrecisionCompactCoreLoss()
-        if profile == "bicm_v37_asymmetric_contact_compact_core":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v37_asymmetric_contact_compact_core "
-                "(V37 compact markers + positive-ROI contact floor + absent-ROI suppression)"
-            )
-            return BICMV37AsymmetricContactCompactCoreLoss()
-        if profile == "bicm_v6_support_core":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v6_support_core "
-                "(support/core-only diagnostic; contact head ignored)"
-            )
-            return BICMV6SupportCoreLoss()
-        if profile == "bicm_v6_support_precision":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v6_support_precision "
-                "(support/core-only diagnostic with precision Tversky + stronger support FP top-k)"
-            )
-            return BICMV6SupportPrecisionLoss()
-        if profile == "bicm_v6_support_surface":
-            self.print_to_log_file(
-                "[BICMFactorizedV6] Loss = bicm_v6_support_surface "
-                "(support/core-only diagnostic with target signed-distance boundary term)"
-            )
-            return BICMV6SupportSurfaceLoss()
-        self.print_to_log_file(
-            "[BICMFactorizedV6] Loss = support BCE/Dice/top-k FP + "
-            "contact focal/Tversky + core focal/Tversky + exterior BCE"
-        )
-        return BICMV6FactorizedLoss()
-
-    @staticmethod
-    def _labels_from_target(target: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...]) -> torch.Tensor:
-        if isinstance(target, (list, tuple)):
-            target = target[0]
-        if target.ndim == 5 and target.shape[1] == 1:
-            return target[:, 0].long()
-        if target.ndim == 5 and target.shape[1] == 5:
-            return target.argmax(dim=1).long()
-        return target.long()
-
-    @staticmethod
-    def _binary_stats(pred: torch.Tensor, target: torch.Tensor) -> tuple[float, float, float]:
-        pred = pred.bool()
-        target = target.bool()
-        tp = float((pred & target).sum().item())
-        fp = float((pred & ~target).sum().item())
-        fn = float((~pred & target).sum().item())
-        precision = tp / max(tp + fp, 1.0)
-        recall = tp / max(tp + fn, 1.0)
-        f1 = 2.0 * precision * recall / max(precision + recall, 1e-8)
-        return precision, recall, f1
-
-    @staticmethod
-    def _f_beta(precision: float, recall: float, beta: float = 0.5) -> float:
-        beta2 = float(beta) ** 2
-        return (1.0 + beta2) * precision * recall / max(beta2 * precision + recall, 1e-8)
-
-    def train_step(self, batch: dict) -> dict:
-        data = batch["data"].to(self.device, non_blocking=True)
-        target = batch["target"]
-        if isinstance(target, (list, tuple)):
-            target = [t.to(self.device, non_blocking=True) for t in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-        self.optimizer.zero_grad(set_to_none=True)
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            if hasattr(self.loss, "set_current_epoch"):
-                # [REPRO][Scope:loss_curriculum]
-                # V14 uses an epoch-indexed loss schedule. The epoch is passed
-                # explicitly from the trainer so the schedule is reproducible
-                # and independent of wall-clock time or validation metrics.
-                self.loss.set_current_epoch(int(self.current_epoch))
-            loss = self.loss(output, target)
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-        return {"loss": loss.detach().cpu().numpy()}
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"].to(self.device, non_blocking=True)
-        target = batch["target"]
-        if isinstance(target, (list, tuple)):
-            target_dev = [t.to(self.device, non_blocking=True) for t in target]
-        else:
-            target_dev = target.to(self.device, non_blocking=True)
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            if hasattr(self.loss, "set_current_epoch"):
-                # [QA][Scope:metric_consistency]
-                # Validation loss should be evaluated under the same scheduled
-                # objective as the current training epoch. Promotion evidence
-                # still comes from full-volume eval, not this patch loss.
-                self.loss.set_current_epoch(int(self.current_epoch))
-            loss = self.loss(output, target_dev)
-        labels = self._labels_from_target(target_dev)
-        prob = torch.sigmoid(output.float())
-        profile = os.environ.get("PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE).strip().lower()
-        if int(prob.shape[1]) == BICM_V8_OUTPUT_CHANNELS and profile in {
-            "bicm_v16_roi_presence_classifier",
-            "bicm_v19_roi_calibrated_presence",
-            "bicm_v22_core_marker_separation",
-            "bicm_v23_staged_core_marker",
-            "bicm_v24_contact_preserved_core_marker",
-            "bicm_v25_coupled_contact_core_marker",
-            "bicm_v26_contact_tolerant_precision",
-        }:
-            # [METRIC][Risk:High][Scope:roi_presence_contract]
-            # V16 channel 4 is a pooled ROI classifier, not a dense gate. For
-            # patch validation we mirror the fixed decoder: top-k pool channel
-            # 4 inside GT support, then use a fixed 0.5 ROI decision to allow or
-            # suppress voxel contact. Full-volume JSON remains the acceptance
-            # evidence; this metric only prevents obviously wrong checkpoints.
-            support_t_for_pool = (labels == 2) | (labels == 3) | (labels == 4)
-            gates = []
-            for b in range(int(prob.shape[0])):
-                vals = prob[b, 4][support_t_for_pool[b]]
-                if vals.numel() == 0:
-                    vals = prob[b, 4].reshape(-1)
-                k = max(1, int(round(float(vals.numel()) * 0.10)))
-                gates.append(torch.topk(vals, k=min(k, vals.numel()), largest=True).values.mean())
-            roi_gate = torch.stack(gates, dim=0).view(-1, 1, 1, 1)
-            contact_prob = torch.where(roi_gate >= 0.5, prob[:, 1], torch.zeros_like(prob[:, 1]))
-        elif int(prob.shape[1]) == BICM_V8_OUTPUT_CHANNELS:
-            # [METRIC][Risk:High][Scope:five_head_contact_agreement]
-            # V8 uses channel 4 as contact-contour evidence; V15 uses it as a
-            # contact-presence gate. Both contracts keep the fixed 0.5
-            # promotion threshold and derive contact from geometric agreement
-            # with the binary contact head.
-            contact_prob = torch.sqrt((prob[:, 1] * prob[:, 4]).clamp_min(1e-6))
-        else:
-            contact_prob = prob[:, 1]
-        support_t = (labels == 2) | (labels == 3) | (labels == 4)
-        contact_t = labels == 4
-        core_t = labels == 3
-        exterior_t = labels == 1
-        support_p = prob[:, 0] > 0.5
-        contact_p = contact_prob > 0.5
-        core_p = prob[:, 2] > 0.5
-        exterior_p = prob[:, 3] > 0.5
-        support_precision, support_recall, support_f1 = self._binary_stats(support_p, support_t)
-        contact_precision, contact_recall, _contact_f1 = self._binary_stats(contact_p, contact_t)
-        core_precision, core_recall, core_f1 = self._binary_stats(core_p, core_t)
-        exterior_precision, exterior_recall, exterior_f1 = self._binary_stats(exterior_p, exterior_t)
-        contact_f05 = self._f_beta(contact_precision, contact_recall, beta=0.5)
-        # [METRIC][Risk:High][Scope:checkpoint_selection]
-        # A single false-positive contact voxel can make precision/recall
-        # numerically > 0 and previously promoted epoch0 overfit checkpoints.
-        # Full-volume V10 then evaluated a nearly untrained model. Viability
-        # must mean a minimally useful topology signal, not nonzero noise.
-        contact_viable = contact_precision >= 0.02 and contact_recall >= 0.10
-        if profile in {"bicm_v6_support_core", "bicm_v6_support_precision", "bicm_v6_support_surface"}:
-            # [METRIC][Gate:support_core_isolation]
-            # V6.2 deliberately asks whether support/core can overfit before
-            # contact is reintroduced. Do not penalize this diagnostic for
-            # contact being zero; that would select the wrong checkpoint.
-            score = 0.65 * support_f1 + 0.30 * core_f1 + 0.05 * exterior_f1
-        else:
-            score = (
-                0.35 * support_f1
-                + 0.30 * contact_f05
-                + 0.20 * core_f1
-                + 0.10 * exterior_f1
-                + 0.05 * min(1.0, contact_recall)
-            )
-            if not contact_viable:
-                # [METRIC][Gate:contact_alive]
-                # V5 softmax checkpoints looked acceptable by shell/core pseudo
-                # Dice while predicting zero contact. Penalize all-zero contact
-                # before checkpoint_best selection can promote that failure mode.
-                score *= 0.10
-        metrics = {
-            "score": float(score),
-            "support_precision": float(support_precision),
-            "support_recall": float(support_recall),
-            "support_f1": float(support_f1),
-            "contact_precision": float(contact_precision),
-            "contact_recall": float(contact_recall),
-            "contact_f0_5": float(contact_f05),
-            "core_precision": float(core_precision),
-            "core_recall": float(core_recall),
-            "core_f1": float(core_f1),
-            "exterior_precision": float(exterior_precision),
-            "exterior_recall": float(exterior_recall),
-            "exterior_f1": float(exterior_f1),
-            "contact_viable": bool(contact_viable),
-        }
-        self._last_bicm_v6_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_f1, contact_f05, core_f1, exterior_f1],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-    def on_validation_epoch_end(self, val_outputs):
-        # Metrics are logged in validation_step because the custom 4-channel
-        # output is incompatible with nnU-Net's default semantic tp/fp/fn path.
-        completed = self.current_epoch + 1
-        if completed < self.ES_MIN_EPOCHS:
-            return
-        ema = float(self.logger.my_fantastic_logging["ema_fg_dice"][-1])
-        if ema > self._es_best_dice + self.ES_MIN_DELTA:
-            self._es_best_dice = ema
-            self._es_no_improve = 0
-        else:
-            self._es_no_improve += 1
-            if self._es_no_improve >= self.ES_PATIENCE and not self._es_triggered:
-                self._es_triggered = True
-                self.print_to_log_file(
-                    f"Early stopping: no BICM V6 score improvement for {self.ES_PATIENCE} epochs. "
-                    f"Best EMA score = {self._es_best_dice:.4f}."
-                )
-                self.num_epochs = completed
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_bicm_v6_metrics", {})
-        self.print_to_log_file(
-            "BICM-V6 val",
-            {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        if (self.current_epoch + 1) % self.save_every == 0 and self.current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_latest.pth"))
-        ema_score = float(self.logger.my_fantastic_logging["ema_fg_dice"][-1])
-        if self._best_v6_score is None or ema_score > self._best_v6_score:
-            self._best_v6_score = ema_score
-            self.print_to_log_file(f"New best EMA BICM-V6 score: {np.round(self._best_v6_score, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMFactorizedV6] skipped native nnU-Net final validation; "
-            "run the V6 fixed-decoder evaluator for full-volume IoU-F."
-        )
-        return None
-
-
-class PengwinTrainerBICMOracleAlignedDirectV250(PengwinTrainerBICMFactorizedV6):
-    """Dataset537 V250: direct oracle-aligned 4-head proof trainer.
-
-    [AUDIT][Risk:High][Scope:iouf_0p90_proof]
-    V248 showed that affinity/contact variants can move recall but remain far
-    from IoU-F 0.90 because the predicted decoder inputs do not resemble the
-    oracle maps. V250 resets the question to the smallest falsifiable proof:
-    can the network learn the exact four probability maps consumed by the
-    oracle-pass `bicm_v6_factorized_watershed` decoder at threshold 0.50?
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v250_oracle_aligned_direct"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v18_roi_balanced"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V250_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BICM_V250_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BICM_V250_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BICM_V250_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BICM_V250_VAL_ITERS"])
-        if os.environ.get("PENGWIN_BICM_V250_BATCH_SIZE"):
-            # [REPRO][Risk:Major][Scope:memory_gate]
-            # Batch size override is explicit because V248 already exceeded the
-            # RTX 3090 hard memory gate with batch_size=2. Any reported metric
-            # must record this value before comparing runs.
-            self.batch_size = int(os.environ["PENGWIN_BICM_V250_BATCH_SIZE"])
-        self.print_to_log_file(
-            "[BICMOracleAlignedDirectV250] output_channels=4 "
-            "changed_variable=oracle_aligned_direct_loss "
-            "decoder_eval=bicm_v6_factorized_watershed threshold=0.50 "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch} batch_size={self.batch_size} "
-            f"oversample_profile={self._pengwin_oversample_profile}"
-        )
-
-    def _build_loss(self):
-        if not _BOUNDARY_LOSS_AVAILABLE:
-            raise ImportError("BICMV250OracleAlignedDirectLoss is unavailable; check code_task1/loss.py import")
-        # [QA][Test:003_overfit][Status:Planned]
-        # Acceptance for this trainer is not patch validation. It must export
-        # raw logits and pass full-volume `bicm-v6-eval` on case003 before any
-        # hard-case or fold0 claim is made.
-        self.print_to_log_file(
-            "[BICMOracleAlignedDirectV250] Loss = bicm_v250_oracle_aligned_direct "
-            "(balanced decoder-facing support/contact/core/exterior heads + hard-negative 0.50 margin guards)"
-        )
-        return BICMV250OracleAlignedDirectLoss()
-
-
-class _BICMROIClassifierBranch(nn.Module):
-    """Wrap a dense BICM network with an isolated ROI contact classifier.
-
-    [AUDIT][Risk:High][Scope:architecture_ablation]
-    V16 trained channel 4 as a pooled classifier, but the channel was still a
-    dense spatial map produced by the segmentation decoder. V17 makes the next
-    variable explicit: channel 4 is produced by a separate small 3D classifier
-    branch directly from the ROI input, then broadcast to the dense output
-    shape. The support/contact/core/exterior logits remain the unmodified
-    nnU-Net dense head.
-
-    [QC][Invariant:output_contract]
-    Forward output must be `[B,5,D,H,W]`: first four dense heads plus one
-    spatially constant ROI logit. Loss/eval stay on the V16 fixed 0.5 pooled
-    scalar contract, so this wrapper does not introduce threshold tuning.
-    """
-
-    def __init__(self, dense_network: nn.Module, num_input_channels: int):
-        super().__init__()
-        self.dense_network = dense_network
-        in_ch = int(num_input_channels)
-        self.roi_classifier = nn.Sequential(
-            nn.Conv3d(in_ch, 8, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.InstanceNorm3d(8, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(8, 16, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.InstanceNorm3d(16, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(16, 32, kernel_size=3, stride=2, padding=1, bias=True),
-            nn.InstanceNorm3d(32, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.AdaptiveAvgPool3d(1),
-            nn.Flatten(),
-            nn.Linear(32, 1),
-        )
-
-    @property
-    def decoder(self):
-        # [QC][Invariant:nnunet_wrapper_compat]
-        # nnU-Net toggles `network.decoder.deep_supervision` during
-        # `on_train_start`. Expose the wrapped decoder without registering a
-        # duplicate submodule so checkpoint keys remain anchored under
-        # `dense_network`.
-        return self.dense_network.decoder
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dense_logits = self.dense_network(x)
-        if isinstance(dense_logits, (list, tuple)):
-            raise RuntimeError("_BICMROIClassifierBranch requires deep supervision disabled")
-        if dense_logits.ndim != 5 or int(dense_logits.shape[1]) != BICM_V6_OUTPUT_CHANNELS:
-            raise RuntimeError(f"expected dense logits [B,4,D,H,W], got {tuple(dense_logits.shape)}")
-        roi_logit = self.roi_classifier(x).to(dtype=dense_logits.dtype)
-        roi_logit = roi_logit.view(int(dense_logits.shape[0]), 1, 1, 1, 1).expand(
-            -1,
-            1,
-            int(dense_logits.shape[2]),
-            int(dense_logits.shape[3]),
-            int(dense_logits.shape[4]),
-        )
-        return torch.cat([dense_logits, roi_logit], dim=1)
-
-
-class _BICMIsolatedDenseContactBranch(nn.Module):
-    """Replace the dense decoder contact channel with an isolated contact branch.
-
-    [AUDIT][Risk:High][Scope:architecture_ablation]
-    V25/V26 kept contact ratio controlled but showed a new conflict: checkpoints
-    with useful contact did not retain enough support geometry, while support-
-    stable checkpoints collapsed contact. This wrapper changes one mechanism
-    only: the dense contact logit is produced from a separate lightweight
-    convolutional branch fed by the ROI input, while support/core/exterior and
-    ROI-presence logits stay in the existing V17/V19 dense network.
-
-    [QC][Invariant:output_contract]
-    The public output remains `[B,5,D,H,W]` with the established layout:
-    support/contact/core/exterior/ROI-contact. Evaluation threshold, decoder,
-    target profile, and raw-logit export are unchanged. The original dense
-    contact channel is intentionally discarded so contact loss gradients no
-    longer update the shared support/core decoder through that head.
-    """
-
-    def __init__(self, base_network: nn.Module, num_input_channels: int):
-        super().__init__()
-        self.base_network = base_network
-        in_ch = int(num_input_channels)
-        self.contact_branch = nn.Sequential(
-            nn.Conv3d(in_ch, 12, kernel_size=3, padding=1, bias=True),
-            nn.InstanceNorm3d(12, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(12, 16, kernel_size=3, padding=2, dilation=2, bias=True),
-            nn.InstanceNorm3d(16, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(16, 16, kernel_size=3, padding=4, dilation=4, bias=True),
-            nn.InstanceNorm3d(16, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(16, 1, kernel_size=1, bias=True),
-        )
-
-    @property
-    def decoder(self):
-        # [QC][Invariant:nnunet_wrapper_compat]
-        # nnU-Net expects `network.decoder.deep_supervision` to exist. Delegate
-        # to the wrapped network so V27 keeps the same trainer lifecycle as V17.
-        return self.base_network.decoder
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_logits = self.base_network(x)
-        if isinstance(base_logits, (list, tuple)):
-            raise RuntimeError("_BICMIsolatedDenseContactBranch requires deep supervision disabled")
-        if base_logits.ndim != 5 or int(base_logits.shape[1]) != BICM_V8_OUTPUT_CHANNELS:
-            raise RuntimeError(f"expected base logits [B,5,D,H,W], got {tuple(base_logits.shape)}")
-        contact_logit = self.contact_branch(x).to(dtype=base_logits.dtype)
-        if contact_logit.shape[:1] + contact_logit.shape[2:] != base_logits.shape[:1] + base_logits.shape[2:]:
-            raise RuntimeError(
-                "isolated contact branch shape mismatch: "
-                f"contact={tuple(contact_logit.shape)} base={tuple(base_logits.shape)}"
-            )
-        return torch.cat(
-            [
-                base_logits[:, 0:1],
-                contact_logit,
-                base_logits[:, 2:5],
-            ],
-            dim=1,
-        )
-
-
-class PengwinTrainerBICMContactV8(PengwinTrainerBICMFactorizedV6):
-    """Dataset537 V8 contact-contour branch trainer.
-
-    [AUDIT][Risk:High][Scope:representation_change]
-    V7 proved the Dataset532 probability/SDF input can learn support geometry,
-    but every scalar contact loss/sampling variant either overpainted support or
-    collapsed contact to zero. V8 changes one variable: the model head gains a
-    fifth high-resolution contact contour auxiliary channel. Dataset537 raw
-    labels, input channels, support/core recipe, fixed threshold, and decoder
-    gate remain unchanged.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v8_contact_contour"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v6_support_mixed"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV8] output_channels=5 "
-            "layout=support/contact/core/exterior/contact_contour_aux"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import,
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:custom_head_channels]
-        # The raw label manager still reports 5 semantic labels, but V8's 5
-        # channels are not a softmax class map. They are sigmoid heads with a
-        # distinct auxiliary contact contour channel.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BICM_V8_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-
-class PengwinTrainerBICMContactV9(PengwinTrainerBICMFactorizedV6):
-    """Dataset537 V9 local contact-energy trainer.
-
-    [AUDIT][Risk:High][Scope:root_cause_response]
-    V8 showed that adding a contour auxiliary head still collapses full-volume
-    contact to zero. The separability audit then showed weak voxel-feature AUC
-    for contact against matched near-support negatives. V9 keeps the proven
-    per-anatomy ROI and four-head output, but changes the contact objective to
-    a local energy/ranking problem instead of another binary voxel loss.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v9_contact_energy_pair"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v6_support_mixed"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV9] output_channels=4 "
-            "layout=support/contact_energy/core/exterior; "
-            "contact_loss=distance_energy_plus_local_pair_ranking"
-        )
-
-
-class PengwinTrainerBICMContactV10(PengwinTrainerBICMFactorizedV6):
-    """Dataset537 V10 adaptive contact-topology trainer.
-
-    [AUDIT][Risk:High][Scope:root_cause_response]
-    V9 preserved support/core but overpainted contact; V9.1 increased
-    precision pressure and broke full-volume topology. V10 keeps the same
-    four-head output and ROI contract but changes the contact loss to capped
-    no-contact/support-local negative pressure plus a patch mass-ratio proxy.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v10_adaptive_topology"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v6_support_mixed"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV10] output_channels=4 "
-            "layout=support/contact_energy/core/exterior; "
-            "contact_loss=capped_negative_topology_plus_mass_ratio"
-        )
-
-
-class PengwinTrainerBICMContactV11(PengwinTrainerBICMContactV10):
-    """Dataset537 V11 contact-positive ROI exposure trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V10 proved the support/core heads are learnable but the contact head can
-    collapse to zero. V11 intentionally keeps the V10 loss, output layout,
-    target, decoder, and threshold contract. The only primary change is the
-    dataloader profile: contact-positive ROI samples are selected more often
-    and forced foreground crops are biased toward class-4 contact voxels.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v10_adaptive_topology"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV11] output_channels=4 "
-            "layout=support/contact_energy/core/exterior; "
-            "changed_variable=contact_positive_roi_sampling"
-        )
-
-
-class PengwinTrainerBICMContactV12(PengwinTrainerBICMContactV11):
-    """Dataset537 V12 persistent contact-positive objective trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V11 already changes contact-positive ROI exposure and still collapses to
-    zero contact. V12 keeps that dataloader and changes only the contact
-    objective: GT contact positives receive persistent, un-gated pressure even
-    after support/core losses start dominating the optimization.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v12_contact_persistent"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV12] output_channels=4 "
-            "layout=support/contact_energy/core/exterior; "
-            "changed_variable=persistent_positive_contact_objective"
-        )
-
-
-class PengwinTrainerBICMContactV13(PengwinTrainerBICMContactV12):
-    """Dataset537 V13 persistent-contact precision-phase trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V12 made contact recall viable but overpainted no-contact ROIs and exceeded
-    the contact-ratio gate. V13 keeps the V12 positive persistence and V11
-    sampling, then tightens only the existing precision caps.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v13_contact_precision"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV13] output_channels=4 "
-            "layout=support/contact_energy/core/exterior; "
-            "changed_variable=persistent_contact_precision_caps"
-        )
-
-
-class PengwinTrainerBICMContactV14(PengwinTrainerBICMContactV12):
-    """Dataset537 V14 staged contact-curriculum trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V12 and V13 bracket the remaining failure: V12 keeps recall but overpaints,
-    while V13 improves precision/ratio but loses recall. V14 keeps the same
-    data, output channels, sampler, decoder, and threshold. The only intended
-    variable is the loss schedule: V12-style positive pressure first, then a
-    ramp toward V13 precision caps.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v14_contact_curriculum"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV14] output_channels=4 "
-            "layout=support/contact_energy/core/exterior; "
-            "changed_variable=staged_contact_curriculum"
-        )
-
-
-class PengwinTrainerBICMContactV15(PengwinTrainerBICMContactV12):
-    """Dataset537 V15 ROI contact-presence gate trainer.
-
-    [AUDIT][Risk:High][Scope:representation_change]
-    V12-V14 prove scalar contact loss schedules only move the failure between
-    overpaint and under-recall. V15 adds one output channel: a per-ROI contact
-    presence gate that is combined with the voxel contact ridge by fixed
-    geometric agreement. No threshold, decoder, data, or sampling rule changes.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v15_contact_presence_gate"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV15] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/contact_presence_gate; "
-            "changed_variable=roi_contact_presence_gate"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:custom_head_channels]
-        # V15 reuses nnU-Net's ResEnc body but intentionally emits five sigmoid
-        # heads. Channel 4 is a contact-presence gate, not a semantic class.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BICM_V8_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-
-class PengwinTrainerBICMContactV16(PengwinTrainerBICMContactV15):
-    """Dataset537 V16 pooled ROI contact-presence classifier trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V15 proved a dense per-voxel gate is not enough: the auxiliary probability
-    stayed high in no-contact Sacrum/RightHip. V16 keeps the same five output
-    channels, sampler, target, decoder threshold, and support/core/contact base
-    loss. The only intended variable is channel-4 supervision and evaluation:
-    it is pooled to one ROI contact-present/absent decision.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v16_roi_presence_classifier"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV16] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/pooled_roi_contact_presence; "
-            "changed_variable=pooled_roi_contact_classifier"
-        )
-
-
-class PengwinTrainerBICMContactV17(PengwinTrainerBICMContactV16):
-    """Dataset537 V17 isolated ROI classifier-branch trainer.
-
-    [AUDIT][Risk:High][Scope:architecture_ablation]
-    V16 lowered the contact ratio but still scored every ROI above the fixed
-    0.5 presence threshold. V17 keeps the V16 loss, fixed decoder, threshold,
-    data, and sampler. The only intended variable is model architecture:
-    channel 4 is generated by a separate lightweight ROI classifier branch
-    rather than by the dense segmentation decoder.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v16_roi_presence_classifier"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV17] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=isolated_roi_classifier_branch"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:architecture_contract]
-        # Build the dense BICM head with four channels, then append an isolated
-        # ROI classifier branch. This prevents channel 4 from sharing the dense
-        # decoder's support/contact spatial bias, which V16 measured as a
-        # failure mode.
-        dense_network = nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BICM_V6_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-        return _BICMROIClassifierBranch(dense_network, num_input_channels)
-
-
-class PengwinTrainerBICMContactV18(PengwinTrainerBICMContactV17):
-    """Dataset537 V18 balanced ROI exposure trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V17 isolated the ROI classifier branch but still predicted contact-present
-    scores above 0.5 for Sacrum, LeftHip, and RightHip on case003. V18 keeps
-    the exact V17 architecture, V16 loss, target, decoder, and threshold. The
-    only intended variable is ROI sample exposure: contact-positive ROI case
-    weighting is disabled so the classifier sees absent-contact Sacrum/RightHip
-    as often as the positive LeftHip ROI during the locked 003 overfit.
-
-    [QA][Gate:003_before_159]
-    This trainer is diagnostic only until case003 full-volume eval passes the
-    same overfit gate. Do not run 159, 20-case, or fold0 from V18 unless JSON
-    evidence shows support geometry, contact precision/recall/ratio, and
-    decoder IoU-F all pass.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v16_roi_presence_classifier"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v18_roi_balanced"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV18] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=balanced_roi_presence_sampling"
-        )
-
-
-class PengwinTrainerBICMContactV19(PengwinTrainerBICMContactV17):
-    """Dataset537 V19 calibrated ROI classifier trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V18 excluded sampling-only balancing. V19 returns to the V17 architecture
-    and V11 contact-positive ROI sampler, then changes only the ROI classifier
-    loss calibration. The dense support/contact/core/exterior heads, fixed
-    0.5 ROI gate, target, decoder, and case003-first gate remain unchanged.
-
-    [QA][Gate:case003_only]
-    This trainer must not be extended to 159, 20-case, or fold0 unless
-    full-volume case003 JSON shows absent Sacrum/RightHip ROI scores below
-    the gate while LeftHip contact recall and support geometry pass.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v19_roi_calibrated_presence"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV19] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=roi_classifier_loss_calibration"
-        )
-
-
-class PengwinTrainerBICMContactV20(PengwinTrainerBICMContactV19):
-    """Dataset537 V20 full-volume candidate checkpoint trainer.
-
-    [AUDIT][Risk:High][Scope:checkpoint_selection]
-    V19 briefly made patch-level contact viable, but the saved
-    `checkpoint_best.pth` still failed full-volume case003 because patch-val
-    metrics could not see ROI-wide support/contact flooding. V20 intentionally
-    keeps the V19 architecture, loss, sampler, target, decoder, and threshold.
-    The only changed variable is evidence retention: each epoch checkpoint is
-    saved as a full-volume probe candidate so selection can be made from fixed
-    decoder IoU-F JSON rather than patch EMA.
-
-    [QA][Gate:case003_before_159]
-    Candidate checkpoints are temporary diagnostic artifacts. After fixed
-    full-volume eval, keep only JSON/log evidence unless a candidate passes
-    the case003 overfit gate. Passing case003 is still required before 159,
-    20-case, or fold0.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v19_roi_calibrated_presence"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV20] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=epoch_candidate_checkpoints_for_full_volume_probe"
-        )
-
-    def on_epoch_end(self):
-        # Keep the V6 custom checkpoint logic but retain every epoch as a
-        # candidate for external full-volume probe selection.
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_bicm_v6_metrics", {})
-        self.print_to_log_file(
-            "BICM-V6 val",
-            {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        if (self.current_epoch + 1) % self.save_every == 0 and self.current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_latest.pth"))
-        ema_score = float(self.logger.my_fantastic_logging["ema_fg_dice"][-1])
-        if self._best_v6_score is None or ema_score > self._best_v6_score:
-            self._best_v6_score = ema_score
-            self.print_to_log_file(f"New best EMA BICM-V6 score: {np.round(self._best_v6_score, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-
-        # [REPRO][Scope:checkpoint_traceability]
-        # Save the exact epoch state so a later full-volume probe can rank
-        # candidates without re-running training. The filename uses the
-        # zero-based epoch printed in logs; checkpoint metadata still stores
-        # `current_epoch + 1`, matching nnU-Net's resume semantics.
-        candidate_path = Path(self.output_folder) / f"checkpoint_epoch_{int(self.current_epoch):04d}.pth"
-        self.save_checkpoint(str(candidate_path))
-        self.print_to_log_file(
-            "[BICMContactV20] saved full-volume probe candidate",
-            str(candidate_path),
-        )
-
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-
-class PengwinTrainerBICMContactV22(PengwinTrainerBICMContactV20):
-    """Dataset537 V22 core-marker topology trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V21 proved a decoder-only core-carve can increase marker count without
-    improving IoU-F. V22 keeps the V20 candidate-checkpoint retention, V17/V19
-    five-head network, V11 ROI sampler, target profile, fixed threshold, and
-    decoder. The only intended variable is the loss profile: it adds explicit
-    anti-bridge pressure so the core head cannot become identical to support.
-
-    [QA][Gate:case003_before_159]
-    This trainer is case003-only until full-volume JSON shows separate
-    fragment-scale markers, support Dice/HD95, contact metrics, and IoU-F all
-    pass. Failed checkpoints are deleted after JSON/log evidence is saved.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v22_core_marker_separation"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV22] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=core_marker_separation_loss"
-        )
-
-
-class PengwinTrainerBICMContactV23(PengwinTrainerBICMContactV22):
-    """Dataset537 V23 staged core-marker topology trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V22 changed the failure mode but used full core anti-bridge pressure from
-    epoch 0. V23 keeps V22 architecture, sampler, checkpoint retention,
-    target, decoder, and final loss coefficients. The only changed variable is
-    a deterministic warmup/ramp for those core-marker terms.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v23_staged_core_marker"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV23] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=staged_core_marker_separation_loss"
-        )
-
-
-class PengwinTrainerBICMContactV24(PengwinTrainerBICMContactV23):
-    """Dataset537 V24 contact-preserved staged core trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V23 improved core marker discipline but reduced contact recall below the
-    fixed-decoder gate. V24 keeps the V23 model, sampler, target, epoch
-    schedule, and checkpoint retention. The only intended variable is the loss:
-    add positive-only contact preservation so true contact voxels are not
-    erased while core markers separate.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v24_contact_preserved_core_marker"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV24] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=positive_contact_floor_on_staged_core_marker_loss"
-        )
-
-
-class PengwinTrainerBICMContactV25(PengwinTrainerBICMContactV24):
-    """Dataset537 V25 coupled contact/core trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V24 proved positive-only contact preservation is insufficient: contact
-    either floods support or collapses at the support/core-stable checkpoint.
-    V25 keeps V24 and changes only the loss coupling. Support-local contact
-    precision terms activate only after GT contact probabilities are alive.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v25_coupled_contact_core_marker"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV25] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=recall_aware_support_local_contact_precision"
-        )
-
-
-class PengwinTrainerBICMContactV26(PengwinTrainerBICMContactV25):
-    """Dataset537 V26 contact-adjacent tolerant precision trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V25 improved contact ratio but reduced recall, suggesting that support-wide
-    precision negatives suppress useful contact-adjacent ridge voxels. V26
-    keeps V25 and changes only which support voxels count as precision
-    negatives: near-contact support is ignored during training loss.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v26_contact_tolerant_precision"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV26] output_channels=5 "
-            "layout=support/contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=contact_adjacent_tolerant_precision_mask"
-        )
-
-
-class PengwinTrainerBICMContactV27(PengwinTrainerBICMContactV26):
-    """Dataset537 V27 isolated dense-contact branch trainer.
-
-    [AUDIT][Risk:High][Scope:architecture_ablation]
-    V26 proved that another precision-mask tweak is not enough: contact ratio
-    can be sane while support Dice and contact recall/precision still fail
-    together. V27 keeps the V26 loss, sampler, target, threshold, raw-logit
-    evaluator, and fixed decoder. The only changed variable is architecture:
-    voxel contact logits come from an isolated local branch, so contact loss no
-    longer competes with support/core through the shared dense decoder head.
-
-    [QA][Gate:case003_before_159]
-    This remains a case003-only diagnostic. Do not run 159, 20-case, fold0, or
-    fulltrain unless full-volume JSON passes support, contact, core, and IoU-F
-    gates under the unchanged decoder.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v26_contact_tolerant_precision"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV27] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=isolated_dense_contact_branch"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:single_variable_architecture]
-        # Reuse the V17 base network so support/core/exterior and the isolated
-        # ROI classifier stay identical to V25/V26. The wrapper replaces only
-        # the dense contact channel. This keeps the experiment attributable.
-        base_network = PengwinTrainerBICMContactV17.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            num_output_channels,
-            enable_deep_supervision=False,
-        )
-        return _BICMIsolatedDenseContactBranch(base_network, num_input_channels)
-
-
-class PengwinTrainerBICMContactV28(PengwinTrainerBICMContactV27):
-    """Dataset537 V28 isolated-contact precision trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V27 isolated the dense contact branch and preserved recall, but overpainted
-    contact enough to miss the ratio/precision gates. V28 keeps that V27
-    architecture and changes only the loss coefficients for the isolated
-    contact branch's precision schedule.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v28_isolated_contact_precision"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV28] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=stricter_isolated_contact_precision_schedule"
-        )
-
-
-class PengwinTrainerBICMContactV29(PengwinTrainerBICMContactV27):
-    """Dataset537 V29 gentle isolated-contact precision trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V27 preserved contact recall but overpainted; V28 reduced overpaint only by
-    killing contact. V29 keeps the V27 architecture and changes only the loss
-    timing: precision pressure ramps in after a short recall-preserving warmup.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v29_gentle_isolated_contact_precision"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV29] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=gentle_two_phase_isolated_contact_precision_schedule"
-        )
-
-
-class PengwinTrainerBICMContactV30(PengwinTrainerBICMContactV27):
-    """Dataset537 V30 soft contact-ridge calibration trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V29 showed scalar precision timing is not enough: early checkpoints keep
-    recall by overpainting, while later checkpoints improve ratio by losing
-    recall. V30 keeps the V27 isolated dense-contact architecture and changes
-    only the train-time contact target shape in the loss. The evaluator still
-    uses the fixed 0.5 threshold and fixed BICM watershed decoder.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v30_soft_contact_ridge"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV30] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=train_only_soft_contact_ridge_calibration"
-        )
-
-
-class PengwinTrainerBICMContactV31(PengwinTrainerBICMContactV27):
-    """Dataset537 V31 local contrastive contact trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_ablation]
-    V30 fixed contact mass but not contact location. V31 keeps the V27
-    architecture and V30 soft-ridge calibration, adding only a local
-    positive-vs-ring contrastive term so true contact must outrank adjacent
-    below-threshold support.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v31_local_contrastive_contact"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV31] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=local_positive_vs_soft_ring_contact_contrast"
-        )
-
-
-class PengwinTrainerBICMContactV32(PengwinTrainerBICMContactV27):
-    """Dataset537 V32 memory-reduced local contact contrast trainer.
-
-    [AUDIT][Risk:High][Scope:runtime_feasibility]
-    V31 tested the right next question after V30, but OOMed before producing a
-    full-volume metric. V32 keeps the model, sampler, fixed decoder, and local
-    contact ranking hypothesis while swapping the loss reductions to mask-sum
-    operations. That makes the run a runtime feasibility retry, not a new
-    topology design.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v32_memory_efficient_local_contrast"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        # [QC][Risk:High][Invariant:single_gpu_memory_budget]
-        # V31/V32 OOM before producing metrics on the active ResEncL patch with
-        # batch=2. This trainer is a runtime-feasibility retry of the same
-        # contact-localization hypothesis, so the effective batch is pinned to 1
-        # instead of changing target, decoder, architecture, or thresholds.
-        self.batch_size = 1
-        self.print_to_log_file(
-            "[BICMContactV32] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=mask_sum_memory_reduced_local_contact_contrast; "
-            "effective_batch_size=1"
-        )
-
-
-class PengwinTrainerBICMContactV34(PengwinTrainerBICMContactV32):
-    """Dataset537 V34 compact core-marker trainer.
-
-    [AUDIT][Risk:High][Scope:seed_topology]
-    V32 made the local-contact experiment runnable but full-volume evaluation
-    showed decoder failure from seed-component explosion. V34 keeps V32's
-    memory-safe loss implementation and isolated contact branch, adding only
-    train-time compactness pressure to the core marker head.
-
-    [QA][Gate:case003_before_159]
-    This trainer is not promotable from patch validation. The required evidence
-    is raw-logit `bicm-v6-eval` on case003 with fixed 0.5 threshold and the
-    unchanged watershed decoder.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v34_compact_core_marker"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV34] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=train_time_compact_core_marker_loss; "
-            "effective_batch_size=1"
-        )
-
-
-class PengwinTrainerBICMContactV35(PengwinTrainerBICMContactV34):
-    """Dataset537 V35 contact precision on compact core markers.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v34]
-    V34 fixed the immediate decoder skip by making seed markers compact, but
-    contact overpaint still kept IoU-F low. V35 keeps the compact marker loss,
-    model architecture, sampler, threshold, and decoder, changing only the
-    contact precision/absent-ROI calibration terms.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v35_contact_precision_compact_core"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV35] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=contact_precision_absent_roi_on_compact_core; "
-            "effective_batch_size=1"
-        )
-
-
-class PengwinTrainerBICMContactV36(PengwinTrainerBICMContactV35):
-    """Dataset537 V36 staged contact precision on compact core markers.
-
-    [AUDIT][Risk:High][Scope:loss_schedule]
-    V35 showed that immediate contact precision/absent-ROI pressure collapses
-    contact. V36 keeps the same terms but delays/ramp-enables them after the
-    V34-style contact warmup, so the next question is timing rather than a new
-    target, decoder, or model family.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v36_staged_contact_precision_compact_core"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV36] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=delayed_contact_precision_ramp_on_compact_core; "
-            "effective_batch_size=1"
-        )
-
-
-class PengwinTrainerBICMContactV37(PengwinTrainerBICMContactV36):
-    """Dataset537 V37 asymmetric contact objective on compact core markers.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v36]
-    V36 proved that a shared precision ramp still trades contact recall against
-    support/core topology. V37 keeps the same model, sampler, Dataset537
-    materialization, fixed threshold, and fixed decoder. The changed variable is
-    only the contact loss contract: contact-positive ROIs get a recall floor and
-    contact-absent ROIs get suppression, while positive-ROI non-contact caps
-    stay disabled.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v37_asymmetric_contact_compact_core"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            "[BICMContactV37] output_channels=5 "
-            "layout=support/isolated_contact_energy/core/exterior/isolated_roi_contact_classifier; "
-            "changed_variable=positive_roi_contact_floor_plus_absent_roi_suppression; "
-            "effective_batch_size=1"
-        )
-
-
-class PengwinTrainerBICMEdgeAffinityV38(PengwinTrainer):
-    """Dataset537 V38 per-anatomy edge-affinity root-cause trainer.
-
-    [AUDIT][Risk:High][Scope:methodology_pivot]
-    V37 measured that broad contact overpaint remains when the model only sees
-    voxel-wise semantic contact supervision. V38 keeps the V5 per-anatomy ROI
-    contract but adds instance-sidecar edge supervision: neighboring voxels from
-    different GT fragments become explicit `edge_break` targets. This trainer
-    is case003-only until full-volume fixed-decoder evidence passes the gate.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v38_edge_affinity"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "bicm_v11_contact_roi"
-    NUM_EPOCHS_DEFAULT = 8
-    SMOKE_PATCH_SIZE = (224, 160, 192)
-    SMOKE_BATCH_SIZE = 1
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.enable_deep_supervision = False
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V38_EPOCHS", self.NUM_EPOCHS_DEFAULT))
-        self.configuration_manager.configuration["patch_size"] = list(self.SMOKE_PATCH_SIZE)
-        self.configuration_manager.configuration["batch_size"] = int(self.SMOKE_BATCH_SIZE)
-        self.batch_size = int(self.SMOKE_BATCH_SIZE)
-        self.num_iterations_per_epoch = int(os.environ.get("PENGWIN_TRAIN_ITERS", "20"))
-        self.num_val_iterations_per_epoch = int(os.environ.get("PENGWIN_VAL_ITERS", "5"))
-        self.oversample_foreground_percent = 1.0
-        self._best_v38_score: float | None = None
-        self.print_to_log_file(
-            "[BICMEdgeAffinityV38] output_channels=8 "
-            f"patch_size={list(self.configuration_manager.patch_size)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:output_contract]
-        # V38 uses native nnU-Net ResEnc and only changes output channel count.
-        # The channels are sigmoid heads, not a softmax semantic label map.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BICM_V38_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMEdgeAffinityV38] Loss = support/contact/core/exterior + ROI contact + explicit edge-break affinity"
-        )
-        return BICMV38EdgeAffinityLoss()
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        if not sidecar_dir.is_dir():
-            raise FileNotFoundError(
-                f"BICM V5 instance sidecar directory missing: {sidecar_dir}. "
-                "Run `python code_task1/preprocessing.py build-bicm-v5-sidecars --dataset 537`."
-            )
-        dl_tr = PengwinBICMV5EdgeAffinityDataLoader3D(
-            dataset_tr, self.batch_size, patch_size, self.configuration_manager.patch_size,
-            self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent,
-            sampling_probabilities=None, pad_sides=None, transforms=None,
-            sidecar_dir=sidecar_dir,
-            instance_center_core_radius_vox=getattr(self, "INSTANCE_CENTER_CORE_RADIUS_VOX", None),
-            edge_center_probability=0.60,
-            support_negative_center_probability=0.20,
-            tiny_center_probability=0.10,
-            hard_negative_center_probability=0.10,
-            core_center_probability=getattr(self, "CORE_CENTER_PROBABILITY", 0.0),
-        )
-        dl_val = PengwinBICMV5EdgeAffinityDataLoader3D(
-            dataset_val, self.batch_size, self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size, self.label_manager,
-            oversample_foreground_percent=0.50, sampling_probabilities=None,
-            pad_sides=None, transforms=None, sidecar_dir=sidecar_dir,
-            instance_center_core_radius_vox=getattr(self, "INSTANCE_CENTER_CORE_RADIUS_VOX", None),
-            edge_center_probability=0.35,
-            support_negative_center_probability=0.35,
-            tiny_center_probability=0.10,
-            hard_negative_center_probability=0.10,
-            core_center_probability=getattr(self, "CORE_CENTER_VAL_PROBABILITY", 0.0),
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-    def _move_v38_batch(self, batch: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        data = torch.as_tensor(batch["data"], dtype=torch.float32, device=self.device)
-        target = {key: torch.as_tensor(value, device=self.device) for key, value in batch["target"].items()}
-        for key in ("support", "core", "contact", "exterior", "edge_break", "edge_valid", "offset"):
-            if key in target:
-                target[key] = target[key].float()
-        target["instance"] = target["instance"].long()
-        if "semantic" in target:
-            # [QC][Invariant:target_dtype]
-            # CrossEntropyLoss requires integer class-index labels. Keeping this
-            # conversion centralized prevents V68 from accidentally consuming
-            # float semantic labels while older V38-V61 losses ignore the key.
-            target["semantic"] = target["semantic"].long()
-        return data, target
-
-    @staticmethod
-    def _binary_counts(pred: torch.Tensor, target: torch.Tensor) -> tuple[float, float, float, float]:
-        pred = pred.bool()
-        target = target.bool()
-        tp = float((pred & target).sum().item())
-        fp = float((pred & ~target).sum().item())
-        fn = float((~pred & target).sum().item())
-        tn = float((~pred & ~target).sum().item())
-        return tp, fp, fn, tn
-
-    @staticmethod
-    def _precision_recall_fbeta(counts: tuple[float, float, float, float], beta: float = 1.0) -> tuple[float, float, float]:
-        tp, fp, fn, _tn = counts
-        precision = tp / max(tp + fp, 1.0)
-        recall = tp / max(tp + fn, 1.0)
-        beta2 = float(beta) ** 2
-        fbeta = (1.0 + beta2) * precision * recall / max(beta2 * precision + recall, 1e-8)
-        return float(precision), float(recall), float(fbeta)
-
-    def train_step(self, batch: dict) -> dict:
-        data, target = self._move_v38_batch(batch)
-        self.optimizer.zero_grad(set_to_none=True)
-        if hasattr(self.loss, "set_current_epoch"):
-            # [REPRO][Scope:loss_schedule]
-            # Staged diagnostic losses must use the trainer epoch, not wall
-            # time or validation feedback, so the schedule is reproducible and
-            # cannot tune itself on case003 full-volume metrics.
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-        return {"loss": loss.detach().cpu().numpy()}
-
-    def validation_step(self, batch: dict) -> dict:
-        data, target = self._move_v38_batch(batch)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        prob = torch.sigmoid(output.float())
-        support_p = prob[:, 0] > 0.5
-        contact_p = prob[:, 1] > 0.5
-        core_p = prob[:, 2] > 0.5
-        exterior_p = prob[:, 3] > 0.5
-        edge_p = prob[:, 5:8] > 0.5
-        support_t = target["support"][:, 0] > 0.5
-        contact_t = target["contact"][:, 0] > 0.5
-        core_t = target["core"][:, 0] > 0.5
-        exterior_t = target["exterior"][:, 0] > 0.5
-        edge_t = target["edge_break"] > 0.5
-        edge_valid = target["edge_valid"] > 0.5
-        support_prf = self._precision_recall_fbeta(self._binary_counts(support_p, support_t), beta=1.0)
-        contact_prf = self._precision_recall_fbeta(self._binary_counts(contact_p, contact_t), beta=0.5)
-        core_prf = self._precision_recall_fbeta(self._binary_counts(core_p, core_t), beta=1.0)
-        exterior_prf = self._precision_recall_fbeta(self._binary_counts(exterior_p, exterior_t), beta=1.0)
-        edge_prf = (
-            self._precision_recall_fbeta(self._binary_counts(edge_p[edge_valid], edge_t[edge_valid]), beta=0.5)
-            if edge_valid.any() else (0.0, 0.0, 0.0)
-        )
-        roi_target = (contact_t.flatten(1).sum(dim=1) > 0.0)
-        roi_pred = prob[:, 4].flatten(1).mean(dim=1) > 0.5
-        roi_acc = float((roi_pred == roi_target).float().mean().item())
-        score = (
-            0.20 * support_prf[2]
-            + 0.20 * contact_prf[2]
-            + 0.20 * core_prf[2]
-            + 0.30 * edge_prf[2]
-            + 0.05 * exterior_prf[2]
-            + 0.05 * roi_acc
-        )
-        metrics = {
-            "score": float(score),
-            "support_precision": support_prf[0],
-            "support_recall": support_prf[1],
-            "support_f1": support_prf[2],
-            "contact_precision": contact_prf[0],
-            "contact_recall": contact_prf[1],
-            "contact_f0_5": contact_prf[2],
-            "core_precision": core_prf[0],
-            "core_recall": core_prf[1],
-            "core_f1": core_prf[2],
-            "edge_precision": edge_prf[0],
-            "edge_recall": edge_prf[1],
-            "edge_f0_5": edge_prf[2],
-            "exterior_f1": exterior_prf[2],
-            "roi_accuracy": roi_acc,
-        }
-        self._last_v38_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_prf[2], contact_prf[2], core_prf[2], edge_prf[2]],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-    def on_validation_epoch_end(self, val_outputs):
-        return None
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_v38_metrics", {})
-        self.print_to_log_file(
-            "BICM-V38 val",
-            {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        score = float(metrics.get("score", 0.0))
-        if self._best_v38_score is None or score > self._best_v38_score:
-            self._best_v38_score = score
-            self.print_to_log_file(f"New best BICM-V38 score: {np.round(self._best_v38_score, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgeAffinityV38] skipped native nnU-Net final validation; "
-            "run fixed full-volume BICM edge-affinity eval before any promotion."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgePrimaryV39(PengwinTrainerBICMEdgeAffinityV38):
-    """Dataset537 V39 edge-primary diagnostic trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v38]
-    V38's full-volume failure was not support/core geometry; it was a fixed
-    ROI scalar gate that zeroed contact everywhere. V39 keeps the same V5
-    materialization, sidecars, dataloader, 8-channel network, and fixed 0.5
-    evaluation threshold. The only methodological change is to make edge-break
-    logits the primary contact signal and demote ROI presence to diagnostic
-    logging/loss-off behavior.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v39_edge_primary"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V39_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMEdgePrimaryV39] output_channels=8 "
-            "changed_variable=edge_primary_contact_without_roi_hard_gate; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMEdgePrimaryV39] Loss = support/core/exterior + weak dense contact + primary edge-break affinity; ROI loss disabled"
-        )
-        return BICMV39EdgePrimaryLoss()
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_v38_metrics", {})
-        self.print_to_log_file(
-            "BICM-V39 val",
-            {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        score = float(metrics.get("score", 0.0))
-        if self._best_v38_score is None or score > self._best_v38_score:
-            self._best_v38_score = score
-            self.print_to_log_file(f"New best BICM-V39 score: {np.round(self._best_v38_score, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgePrimaryV39] skipped native nnU-Net final validation; "
-            "run fixed full-volume BICM edge-primary eval before any promotion."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgeCoreV40(PengwinTrainerBICMEdgePrimaryV39):
-    """Dataset537 V40 edge-primary plus staged core anti-bridge trainer."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v40_edge_core_separation"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V40_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMEdgeCoreV40] output_channels=8 "
-            "changed_variable=edge_primary_contact_plus_staged_core_anti_bridge; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMEdgeCoreV40] Loss = V39 edge-primary + staged core noncore/contact/mass/margin separation"
-        )
-        return BICMV40EdgePrimaryCoreSeparationLoss()
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_v38_metrics", {})
-        self.print_to_log_file(
-            "BICM-V40 val",
-            {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        score = float(metrics.get("score", 0.0))
-        if self._best_v38_score is None or score > self._best_v38_score:
-            self._best_v38_score = score
-            self.print_to_log_file(f"New best BICM-V40 score: {np.round(self._best_v38_score, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgeCoreV40] skipped native nnU-Net final validation; "
-            "run fixed full-volume BICM edge-primary eval before any promotion."
-        )
-        return None
-
-
-class PengwinTrainerBICMInstanceCoreV41(PengwinTrainerBICMEdgeCoreV40):
-    """Dataset537 V41 edge-primary trainer with instance-center core targets.
-
-    [AUDIT][Risk:High][Scope:target_contract]
-    V40 increased core compactness but still used semantic broad-core targets.
-    Full-volume evaluation showed the generated seed components did not map to
-    the small GT fragments. V41 changes the core target itself: the sidecar
-    instance map and stored fragment centers create one compact marker per
-    fragment in each crop.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v41_instance_core_edge"
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 2.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V41_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMInstanceCoreV41] output_channels=8 "
-            f"changed_variable=instance_center_core_target radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_v38_metrics", {})
-        self.print_to_log_file(
-            "BICM-V41 val",
-            {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        score = float(metrics.get("score", 0.0))
-        if self._best_v38_score is None or score > self._best_v38_score:
-            self._best_v38_score = score
-            self.print_to_log_file(f"New best BICM-V41 score: {np.round(self._best_v38_score, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMInstanceCoreV41] skipped native nnU-Net final validation; "
-            "run fixed full-volume BICM edge-primary eval before any promotion."
-        )
-        return None
-
-
-class PengwinTrainerBICMInstanceCoreV42(PengwinTrainerBICMEdgePrimaryV39):
-    """Dataset537 V42 instance-center core target without anti-bridge ramp.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v41]
-    V41 combined two changes: instance-center core target and staged
-    anti-bridge. The measured result was core collapse. V42 isolates the target
-    change by keeping V39's edge-primary loss and only replacing semantic core
-    supervision with fragment-center markers.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v42_instance_core_edge_primary"
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V42_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMInstanceCoreV42] output_channels=8 "
-            f"changed_variable=instance_center_core_target_without_antibridge radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_v38_metrics", {})
-        self.print_to_log_file(
-            "BICM-V42 val",
-            {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        score = float(metrics.get("score", 0.0))
-        if self._best_v38_score is None or score > self._best_v38_score:
-            self._best_v38_score = score
-            self.print_to_log_file(f"New best BICM-V42 score: {np.round(self._best_v38_score, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMInstanceCoreV42] skipped native nnU-Net final validation; "
-            "run fixed full-volume BICM edge-primary eval before any promotion."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgeContactV43(PengwinTrainerBICMEdgePrimaryV39):
-    """Dataset537 V43 contact-viability trainer on the V39 edge-primary path.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v42]
-    V42 proved core marker geometry alone is not enough: support/core pass but
-    contact is exactly zero. V43 keeps the same network, sidecars, dataloader,
-    fixed threshold, and decoder. It changes only the contact/edge viability
-    loss and the patch-level checkpoint score so a zero-contact checkpoint is
-    not preferred over a contact-positive one.
-
-    [QA][Gate:case003_before_159][Status:Required]
-    This trainer is still a locked `003` diagnostic. Full-volume JSON, not this
-    patch score, decides whether 159/20-case/fold0/fulltrain can start.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v43_edge_contact_viability"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V43_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMEdgeContactV43] output_channels=8 "
-            "changed_variable=contact_edge_viability_loss_and_score; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMEdgeContactV43] Loss = V39 edge-primary + positive contact/edge floor + no-contact edge caps"
-        )
-        return BICMV43EdgeContactViabilityLoss()
-
-    @staticmethod
-    def _recall_floor_score(value: float, floor: float = 0.60) -> float:
-        return max(0.0, min(1.0, float(value) / float(floor)))
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_v38_metrics", {})
-        self.print_to_log_file(
-            "BICM-V43 val",
-            {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in metrics.items()},
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        contact_recall = float(metrics.get("contact_recall", 0.0))
-        edge_recall = float(metrics.get("edge_recall", 0.0))
-        score = (
-            0.15 * float(metrics.get("support_f1", 0.0))
-            + 0.25 * float(metrics.get("contact_f0_5", 0.0))
-            + 0.15 * self._recall_floor_score(contact_recall)
-            + 0.25 * float(metrics.get("edge_f0_5", 0.0))
-            + 0.10 * self._recall_floor_score(edge_recall)
-            + 0.10 * float(metrics.get("core_f1", 0.0))
-        )
-        # [METRIC][Risk:High][Scope:checkpoint_selection]
-        # V40 final showed useful contact while checkpoint_best had zero
-        # contact. A zero-contact patch state is never allowed to become V43
-        # best, because full-volume promotion requires nonzero contact recall.
-        if contact_recall < 0.05 and edge_recall < 0.05:
-            score *= 0.10
-        if self._best_v38_score is None or score > self._best_v38_score:
-            self._best_v38_score = float(score)
-            self.print_to_log_file(f"New best BICM-V43 score: {np.round(self._best_v38_score, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgeContactV43] skipped native nnU-Net final validation; "
-            "run fixed full-volume BICM edge-primary eval before any promotion."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgeLocalRankV44(PengwinTrainerBICMEdgeContactV43):
-    """Dataset537 V44 local edge-rank diagnostic trainer.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v43]
-    V43 proved a positive floor can keep contact alive, but it also overpaints
-    support and no-contact ROIs. V44 keeps the V43 path and adds only local
-    edge-negative ranking so the model must place edge/contact probability on
-    true fragment breaks rather than any support-like surface.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v44_edge_local_rank"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V44_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMEdgeLocalRankV44] output_channels=8 "
-            "changed_variable=local_edge_negative_ranking; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMEdgeLocalRankV44] Loss = V43 contact viability + local edge break ranking"
-        )
-        return BICMV44EdgeLocalRankLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgeLocalRankV44] skipped native nnU-Net final validation; "
-            "run fixed full-volume BICM edge-primary eval before any promotion."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgeCandidateV45(PengwinTrainerBICMEdgeLocalRankV44):
-    """Dataset537 V45 candidate-saving diagnostic for the V44 trajectory.
-
-    [AUDIT][Risk:High][Scope:checkpoint_selection]
-    V44 measured a split trajectory: `checkpoint_best.pth` passed contact
-    recall but overpainted, while `checkpoint_final.pth` approached precision
-    but lost recall. V45 does not change the loss or architecture. It saves
-    every epoch candidate so full-volume evaluation can prove whether a
-    precision/recall crossover checkpoint exists before we add another loss
-    term.
-
-    [QA][Gate:case003_before_159][Status:Required]
-    Candidate checkpoints are diagnostic evidence only. If no candidate passes
-    the fixed full-volume 003 gate, 159/20-case/fold0/fulltrain remain
-    forbidden.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v45_edge_candidate_save"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V45_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMEdgeCandidateV45] output_channels=8 "
-            "changed_variable=save_epoch_candidates_only; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def on_epoch_end(self):
-        epoch_idx = int(self.current_epoch)
-        super().on_epoch_end()
-        if self.local_rank == 0:
-            ckpt = Path(self.output_folder) / f"checkpoint_epoch_{epoch_idx:04d}.pth"
-            self.save_checkpoint(str(ckpt))
-            self.print_to_log_file(f"[BICMEdgeCandidateV45] saved epoch candidate: {ckpt.name}")
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgeCandidateV45] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM edge-primary eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgeCurriculumV46(PengwinTrainerBICMEdgeCandidateV45):
-    """Dataset537 V46 staged edge/contact curriculum diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v45]
-    V45 proved that saving every short-run epoch candidate is not enough:
-    early checkpoints recover contact recall with poor support/precision, while
-    later support-stable checkpoints collapse contact to zero. V46 keeps the
-    same network, input, sidecars, decoder, fixed threshold, and candidate
-    checkpoint instrumentation. It changes only the timing of positive-contact
-    preservation versus local false-contact pressure.
-
-    [QA][Gate:case003_before_159][Status:Required]
-    This trainer remains locked to the case003 diagnostic gate. Full-volume
-    `bicm-v6-eval` JSON must pass before 159, 20-case, fold0, or fulltrain.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v46_staged_edge_contact"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V46_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMEdgeCurriculumV46] output_channels=8 "
-            "changed_variable=staged_edge_contact_curriculum; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMEdgeCurriculumV46] Loss = V44 local edge rank with staged positive-contact floor and false-contact pressure"
-        )
-        return BICMV46StagedEdgeContactLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgeCurriculumV46] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM edge-primary eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMSeparatedContactV47(PengwinTrainerBICMEdgeCurriculumV46):
-    """Dataset537 V47 separated contact-head diagnostic.
-
-    [AUDIT][Risk:High][Scope:optimization_decoupling]
-    V46 proved that scalar coefficient staging can independently reach
-    precision, recall, or support geometry, but not all together. V47 changes
-    one mechanism: after a support/core formation phase, it freezes the shared
-    feature extractor and non-contact output rows, then trains only the contact
-    and edge-break rows of the final segmentation layer. This tests whether
-    contact can be calibrated on top of a stable support/core representation.
-
-    [QC][Invariant:final_head_rows]
-    The trainer masks gradients and restores frozen output rows after every
-    optimizer step. This avoids SGD weight decay drifting support/core/exterior
-    rows during phase 2 while keeping the native nnU-Net optimizer contract.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v47_separated_contact_head"
-    CONTACT_PHASE_EPOCH_DEFAULT = 5
-    CONTACT_TRAIN_CHANNELS = (1, 5, 6, 7)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V47_EPOCHS", self.num_epochs))
-        self.contact_phase_epoch = int(os.environ.get(
-            "PENGWIN_BICM_V47_CONTACT_PHASE_EPOCH", self.CONTACT_PHASE_EPOCH_DEFAULT
-        ))
-        self._v47_contact_phase_configured = False
-        self._v47_restore_rows: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
-        self.print_to_log_file(
-            "[BICMSeparatedContactV47] output_channels=8 "
-            "changed_variable=freeze_support_core_then_train_contact_edge_rows; "
-            f"epochs={self.num_epochs} contact_phase_epoch={self.contact_phase_epoch}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMSeparatedContactV47] Loss = V46 phase1 + contact/edge-only phase2"
-        )
-        return BICMV47SeparatedContactHeadLoss(contact_phase_epoch=self.contact_phase_epoch)
-
-    def _v47_final_seg_layer(self) -> torch.nn.Module:
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V47 expected network.decoder.seg_layers for contact-head freezing.")
-        return seg_layers[-1]
-
-    @staticmethod
-    def _v47_masked_grad_hook(mask: torch.Tensor):
-        def _hook(grad: torch.Tensor) -> torch.Tensor:
-            return grad * mask.to(device=grad.device, dtype=grad.dtype)
-        return _hook
-
-    def _configure_v47_contact_phase(self) -> None:
-        if self._v47_contact_phase_configured or int(self.current_epoch) < int(self.contact_phase_epoch):
-            return
-        final_seg = self._v47_final_seg_layer()
-
-        for param in self.network.parameters():
-            param.requires_grad = False
-
-        train_channels = set(int(c) for c in self.CONTACT_TRAIN_CHANNELS)
-        self._v47_restore_rows = []
-        for name, param in final_seg.named_parameters(recurse=False):
-            if param.ndim < 1 or int(param.shape[0]) != BICM_V38_OUTPUT_CHANNELS:
-                raise RuntimeError(
-                    f"V47 final segmentation parameter {name!r} must have first dim "
-                    f"{BICM_V38_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                )
-            row_mask_1d = torch.tensor(
-                [idx in train_channels for idx in range(int(param.shape[0]))],
-                device=param.device,
-                dtype=torch.bool,
-            )
-            view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-            grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-            frozen_snapshot = param.detach().clone()
-            param.requires_grad = True
-            param.register_hook(self._v47_masked_grad_hook(grad_mask))
-            self._v47_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v47_contact_phase_configured = True
-        self.print_to_log_file(
-            "[BICMSeparatedContactV47] contact phase active: "
-            f"train_channels={sorted(train_channels)} trainable_params={trainable}/{total}"
-        )
-
-    def _restore_v47_frozen_rows(self) -> None:
-        if not self._v47_restore_rows:
-            return
-        with torch.no_grad():
-            for param, row_mask, snapshot in self._v47_restore_rows:
-                frozen_rows = ~row_mask.to(device=param.device)
-                param.data[frozen_rows] = snapshot.to(device=param.device, dtype=param.dtype)[frozen_rows]
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v47_contact_phase()
-        result = super().train_step(batch)
-        # [QC][Invariant:optimizer_weight_decay]
-        # SGD applies weight decay inside optimizer.step after gradient hooks.
-        # Restoring frozen rows here keeps non-contact logits exactly fixed in
-        # phase 2, so any contact change is attributable to channels 1/5/6/7.
-        self._restore_v47_frozen_rows()
-        return result
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMSeparatedContactV47] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM edge-primary eval."
-        )
-        return None
-
-
-class _BICMSupportAwareContactEdgeBranch(nn.Module):
-    """Replace contact/edge logits with a support-aware contact branch.
-
-    [AUDIT][Risk:High][Scope:architecture_ablation]
-    V47 showed that training only final output rows is not expressive enough:
-    support/core geometry stays stable, but contact precision and recall cannot
-    pass together. V48 therefore keeps the V46 loss, sidecars, decoder, fixed
-    0.5 threshold, and case003 gate, and changes one variable: contact and
-    z/y/x edge logits are produced by a separate branch that sees the original
-    ROI input plus detached support/core/exterior/ROI context from the base
-    network.
-
-    [QC][Invariant:output_contract]
-    The public output remains `[B,8,D,H,W]` in the V38+ layout. Detached base
-    probabilities give the contact branch support-local negative context while
-    preventing contact loss from backpropagating through the support/core heads
-    via this context path.
-    """
-
-    CONTEXT_CHANNELS = (0, 2, 3, 4)
-
-    def __init__(self, base_network: nn.Module, num_input_channels: int):
-        super().__init__()
-        self.base_network = base_network
-        in_ch = int(num_input_channels) + len(self.CONTEXT_CHANNELS)
-        self.contact_edge_branch = nn.Sequential(
-            nn.Conv3d(in_ch, 16, kernel_size=3, padding=1, bias=True),
-            nn.InstanceNorm3d(16, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(16, 24, kernel_size=3, padding=2, dilation=2, bias=True),
-            nn.InstanceNorm3d(24, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(24, 24, kernel_size=3, padding=4, dilation=4, bias=True),
-            nn.InstanceNorm3d(24, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(24, 4, kernel_size=1, bias=True),
-        )
-
-    @property
-    def decoder(self):
-        # [QC][Invariant:nnunet_wrapper_compat]
-        # nnU-Net toggles `network.decoder.deep_supervision` and discovers
-        # segmentation heads through the wrapped decoder. Delegating keeps the
-        # native trainer lifecycle and checkpoint format compatible.
-        return self.base_network.decoder
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_logits = self.base_network(x)
-        if isinstance(base_logits, (list, tuple)):
-            raise RuntimeError("_BICMSupportAwareContactEdgeBranch requires deep supervision disabled")
-        if base_logits.ndim != 5 or int(base_logits.shape[1]) != BICM_V38_OUTPUT_CHANNELS:
-            raise RuntimeError(f"expected base logits [B,8,D,H,W], got {tuple(base_logits.shape)}")
-
-        # [DATA][Risk:High][Scope:contact_negative_context]
-        # Context excludes the base contact/edge predictions and uses detached
-        # support/core/exterior/ROI probabilities only. This tests whether the
-        # contact branch can learn "where not to draw fracture ridges" without
-        # changing support/core via this branch.
-        context = torch.sigmoid(base_logits[:, self.CONTEXT_CHANNELS]).detach()
-        branch_in = torch.cat([x, context.to(dtype=x.dtype)], dim=1)
-        branch_logits = self.contact_edge_branch(branch_in).to(dtype=base_logits.dtype)
-        if branch_logits.shape[:1] + branch_logits.shape[2:] != base_logits.shape[:1] + base_logits.shape[2:]:
-            raise RuntimeError(
-                "support-aware contact branch shape mismatch: "
-                f"branch={tuple(branch_logits.shape)} base={tuple(base_logits.shape)}"
-            )
-
-        out = base_logits.clone()
-        out[:, 1:2] = branch_logits[:, 0:1]
-        out[:, 5:8] = branch_logits[:, 1:4]
-        return out
-
-
-class PengwinTrainerBICMSupportAwareContactV48(PengwinTrainerBICMEdgeCurriculumV46):
-    """Dataset537 V48 support-aware contact/edge branch diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v47]
-    V45 excluded checkpoint selection, V46 excluded scalar staging, and V47
-    excluded final-head-only contact separation. V48 keeps the same sidecars,
-    V46 loss, fixed decoder, threshold, sampler, and candidate saving, and
-    changes only contact/edge architecture: a small support-aware branch emits
-    channel 1 and channels 5..7.
-
-    [QA][Gate:case003_before_159][Status:Required]
-    This is a case003-only root-cause experiment. If full-volume JSON does not
-    pass the 003 gate, checkpoints remain diagnostic and 159/20-case/fold0/
-    fulltrain stay forbidden.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v48_support_aware_contact_branch"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V48_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMSupportAwareContactV48] output_channels=8 "
-            "changed_variable=support_aware_contact_edge_branch; "
-            f"epochs={self.num_epochs}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        base_network = PengwinTrainerBICMEdgeCurriculumV46.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            num_output_channels,
-            enable_deep_supervision=False,
-        )
-        return _BICMSupportAwareContactEdgeBranch(base_network, num_input_channels)
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMSupportAwareContactV48] Loss = V46 staged edge/contact; architecture supplies support-aware branch"
-        )
-        return BICMV46StagedEdgeContactLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMSupportAwareContactV48] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM edge-primary eval."
-        )
-        return None
-
-
-class _BICMDecoderFeatureContactEdgeBranch(nn.Module):
-    """Emit contact/edge logits from the final decoder feature map.
-
-    [AUDIT][Risk:High][Scope:architecture_ablation]
-    The V48 branch used raw ROI input plus detached support/core probabilities.
-    The six-case audit showed raw input-local edge-pair features are useful on
-    average but weak on the hardest ROIs. V49 changes one variable: the
-    contact/edge branch sees the learned high-resolution decoder feature map
-    immediately before the final segmentation layer. Loss, target sidecars,
-    threshold, decoder, and candidate saving remain unchanged.
-
-    [QC][Invariant:decoder_contract]
-    This wrapper mirrors `UNetDecoder.forward` to capture the final feature
-    `x`. The base segmentation logits are still produced by `seg_layers[-1]`;
-    only channels 1 and 5..7 are replaced by the contact branch. If
-    `deep_supervision` is enabled, the wrapper fails early because V49 is a
-    full-resolution diagnostic and the custom evaluator expects one tensor.
-    """
-
-    def __init__(self, base_network: nn.Module):
-        super().__init__()
-        self.base_network = base_network
-        decoder = getattr(base_network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V49 expected a nnU-Net style decoder with seg_layers")
-        final_seg = seg_layers[-1]
-        if not hasattr(final_seg, "in_channels"):
-            raise RuntimeError("V49 expected final segmentation layer to expose in_channels")
-        in_ch = int(final_seg.in_channels)
-        # [QC][Invariant:branch_capacity]
-        # Keep this branch modest: the experiment tests learned feature depth,
-        # not a wholesale architecture replacement. The public output contract
-        # and all non-contact logits remain anchored to the base decoder.
-        hidden = max(16, min(64, in_ch // 2))
-        self.contact_edge_branch = nn.Sequential(
-            nn.Conv3d(in_ch, hidden, kernel_size=3, padding=1, bias=True),
-            nn.InstanceNorm3d(hidden, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(hidden, hidden, kernel_size=3, padding=2, dilation=2, bias=True),
-            nn.InstanceNorm3d(hidden, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(hidden, 4, kernel_size=1, bias=True),
-        )
-
-    @property
-    def decoder(self):
-        # [QC][Invariant:nnunet_wrapper_compat]
-        # nnU-Net trainer lifecycle code accesses `network.decoder`. Delegate
-        # to the wrapped decoder so deep-supervision toggles and checkpoint
-        # state stay compatible with native nnU-Net expectations.
-        return self.base_network.decoder
-
-    def _decode_with_final_feature(self, skips: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        decoder = self.base_network.decoder
-        if bool(getattr(decoder, "deep_supervision", False)):
-            raise RuntimeError("_BICMDecoderFeatureContactEdgeBranch requires deep supervision disabled")
-        lres_input = skips[-1]
-        final_feature = None
-        seg_output = None
-        for s in range(len(decoder.stages)):
-            x = decoder.transpconvs[s](lres_input)
-            x = torch.cat((x, skips[-(s + 2)]), 1)
-            x = decoder.stages[s](x)
-            if s == (len(decoder.stages) - 1):
-                final_feature = x
-                seg_output = decoder.seg_layers[-1](x)
-            lres_input = x
-        if final_feature is None or seg_output is None:
-            raise RuntimeError("V49 decoder produced no final feature/logit tensor")
-        return seg_output, final_feature
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        skips = self.base_network.encoder(x)
-        base_logits, final_feature = self._decode_with_final_feature(skips)
-        if base_logits.ndim != 5 or int(base_logits.shape[1]) != BICM_V38_OUTPUT_CHANNELS:
-            raise RuntimeError(f"expected base logits [B,8,D,H,W], got {tuple(base_logits.shape)}")
-        branch_logits = self.contact_edge_branch(final_feature).to(dtype=base_logits.dtype)
-        if branch_logits.shape[:1] + branch_logits.shape[2:] != base_logits.shape[:1] + base_logits.shape[2:]:
-            raise RuntimeError(
-                "decoder-feature contact branch shape mismatch: "
-                f"branch={tuple(branch_logits.shape)} base={tuple(base_logits.shape)}"
-            )
-        out = base_logits.clone()
-        out[:, 1:2] = branch_logits[:, 0:1]
-        out[:, 5:8] = branch_logits[:, 1:4]
-        return out
-
-
-class PengwinTrainerBICMDecoderFeatureContactV49(PengwinTrainerBICMEdgeCurriculumV46):
-    """Dataset537 V49 decoder-feature contact/edge branch diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v48]
-    V48 showed a shallow branch fed by raw input plus detached support context
-    is not enough. The V48 follow-up audit showed edge-pair topology is the
-    better signal, but input-local edge features fail on the hardest ROIs.
-    V49 therefore changes only feature depth: contact and edge logits are
-    emitted from the learned final decoder feature map.
-
-    [QA][Gate:case003_before_159][Status:Required]
-    This remains case003-only. A full-volume JSON gate failure blocks 159,
-    20-case, fold0, and fulltrain.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v49_decoder_feature_contact_branch"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V49_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMDecoderFeatureContactV49] output_channels=8 "
-            "changed_variable=decoder_feature_contact_edge_branch; "
-            f"epochs={self.num_epochs}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        base_network = PengwinTrainerBICMEdgeCurriculumV46.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            num_output_channels,
-            enable_deep_supervision=False,
-        )
-        return _BICMDecoderFeatureContactEdgeBranch(base_network)
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMDecoderFeatureContactV49] Loss = V46 staged edge/contact; architecture supplies decoder-feature branch"
-        )
-        return BICMV46StagedEdgeContactLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMDecoderFeatureContactV49] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM edge-primary eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMDecoderFeaturePhaseV50(PengwinTrainerBICMDecoderFeatureContactV49):
-    """Dataset537 V50 decoder-feature branch with separated contact phase.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v49]
-    V49 proved that moving contact/edge logits to final decoder features is
-    not enough by itself: support can pass while contact precision and recall
-    still trade off. V50 keeps the V49 architecture, sidecars, sampler,
-    threshold, decoder, and case003 gate, then changes one optimization
-    variable: after a support/core formation phase, the wrapped base network is
-    frozen and only the decoder-feature contact/edge branch is trainable.
-
-    [QA][Gate:case003_before_159][Status:Required]
-    A V50 checkpoint is promotion evidence only if full-volume case003 JSON
-    passes the fixed gate. Patch validation and `checkpoint_best.pth` alone
-    must not trigger 159, 20-case, fold0, or fulltrain.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v50_decoder_feature_contact_phase"
-    CONTACT_PHASE_EPOCH_DEFAULT = 5
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V50_EPOCHS", self.num_epochs))
-        self.contact_phase_epoch = int(os.environ.get(
-            "PENGWIN_BICM_V50_CONTACT_PHASE_EPOCH", self.CONTACT_PHASE_EPOCH_DEFAULT
-        ))
-        self._v50_contact_phase_configured = False
-        self.print_to_log_file(
-            "[BICMDecoderFeaturePhaseV50] output_channels=8 "
-            "changed_variable=freeze_base_then_train_decoder_feature_contact_branch; "
-            f"epochs={self.num_epochs} contact_phase_epoch={self.contact_phase_epoch}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMDecoderFeaturePhaseV50] Loss = V46 phase1 + V47 contact/edge-only phase2"
-        )
-        return BICMV47SeparatedContactHeadLoss(contact_phase_epoch=self.contact_phase_epoch)
-
-    def _configure_v50_contact_phase(self) -> None:
-        if self._v50_contact_phase_configured or int(self.current_epoch) < int(self.contact_phase_epoch):
-            return
-        if not isinstance(self.network, _BICMDecoderFeatureContactEdgeBranch):
-            raise RuntimeError("V50 expected _BICMDecoderFeatureContactEdgeBranch network wrapper.")
-
-        # [QC][Invariant:phase2_trainable_scope]
-        # Freeze the base encoder/decoder so support/core/exterior/ROI logits
-        # cannot drift while the contact branch is calibrated. The optimizer
-        # still owns all parameters, but frozen parameters receive no gradient.
-        for param in self.network.base_network.parameters():
-            param.requires_grad = False
-        for param in self.network.contact_edge_branch.parameters():
-            param.requires_grad = True
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v50_contact_phase_configured = True
-        self.print_to_log_file(
-            "[BICMDecoderFeaturePhaseV50] contact phase active: "
-            f"trainable_params={trainable}/{total}"
-        )
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v50_contact_phase()
-        return super().train_step(batch)
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMDecoderFeaturePhaseV50] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM edge-primary eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMDenseEdgeCostV51(PengwinTrainerBICMDecoderFeatureContactV49):
-    """Dataset537 V51 dense edge-distance crossing-cost diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v50]
-    V49/V50 excluded branch depth and branch-only phase separation. V51 keeps
-    the V49 decoder-feature contact/edge branch, raw-logit evaluator, fixed
-    threshold, fixed decoder, sampler, and case003 gate. It changes only the
-    loss target representation by using `BICMV51DenseEdgeCostLoss`, which
-    expands sparse edge-break targets into a soft crossing-cost ridge.
-
-    [QA][Gate:case003_before_159][Status:Required]
-    This is still not a fold0/fulltrain trainer. It must pass the full-volume
-    case003 JSON gate before any broader run.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v51_dense_edge_cost"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V51_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMDenseEdgeCostV51] output_channels=8 "
-            "changed_variable=dense_edge_distance_crossing_cost_loss; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMDenseEdgeCostV51] Loss = V46 base + dense edge-distance crossing-cost supervision"
-        )
-        return BICMV51DenseEdgeCostLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMDenseEdgeCostV51] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM edge-primary eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMDenseEdgeCoreV52(PengwinTrainerBICMDecoderFeatureContactV49):
-    """Dataset537 V52 dense edge-cost with explicit core-marker topology.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v51]
-    V51 showed support/core coverage can pass while LeftHip still has one core
-    seed component for eight GT fragments. V52 keeps V51's decoder-feature
-    contact/edge branch, dense edge target, sampler, raw-logit evaluator, fixed
-    threshold, and fixed decoder. It changes only the loss by adding train-time
-    core marker topology pressure.
-
-    [QA][Gate:case003_before_159][Status:Required]
-    The new evaluator seed-topology metric must pass on full-volume case003
-    together with support/contact/IoU-F before any 159, 20-case, fold0, or
-    fulltrain expansion.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v52_dense_edge_core_topology"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V52_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMDenseEdgeCoreV52] output_channels=8 "
-            "changed_variable=dense_edge_cost_plus_core_marker_topology_loss; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMDenseEdgeCoreV52] Loss = V51 dense edge-cost + staged core marker topology pressure"
-        )
-        return BICMV52DenseEdgeCoreTopologyLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMDenseEdgeCoreV52] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM edge-primary eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMFragmentMarkerCoreV53(PengwinTrainerBICMDenseEdgeCoreV52):
-    """Dataset537 V53 dense edge/contact trainer with fragment-center core markers.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v52]
-    V52 proved that broad semantic core supervision can cover every fragment
-    while still producing invalid seed topology: either dozens of over-split
-    seed components or one merged component spanning multiple GT fragments. V53
-    keeps V52's network, dense edge/contact loss, sampler, raw-logit evaluator,
-    fixed threshold, and fixed decoder. The only intended change is the core
-    target geometry delivered by the existing V5 instance sidecar loader.
-
-    [DATA][Invariant:fragment_marker_target]
-    ``INSTANCE_CENTER_CORE_RADIUS_VOX`` activates
-    ``PengwinBICMV5EdgeAffinityDataLoader3D._fragment_center_core``. That path
-    uses GT instance IDs from sidecars as training supervision only; instance IDs
-    are never model inputs. This prevents anatomy-level core blobs from being
-    accepted as fragment-scale markers during 003 overfit.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    V53 must pass full-volume case003 support/contact/core-topology/IoU-F gates
-    before 159, 20-case, fold0, or fulltrain is allowed.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v53_fragment_marker_core"
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V53_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMFragmentMarkerCoreV53] output_channels=8 "
-            "changed_variable=fragment_center_core_target_geometry; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMFragmentMarkerCoreV53] Loss = V52 dense edge/contact/core topology; "
-            "core target = fragment-center markers from V5 instance sidecars"
-        )
-        return BICMV52DenseEdgeCoreTopologyLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMFragmentMarkerCoreV53] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM seed-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMSparseHeadBalancedV54(PengwinTrainerBICMFragmentMarkerCoreV53):
-    """Dataset537 V54 sparse-head gradient normalization diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v53]
-    V53 proved fragment-center marker targets alone are not enough: support
-    nearly reaches the surface gate while contact/core logits stay below the
-    fixed decoder threshold. The saved gradient audit shows sparse positives are
-    overwhelmed by support-noncore negatives. V54 keeps V53 target geometry,
-    network, sampler, threshold, and decoder, and changes only sparse positive
-    loss normalization for core/contact/edge heads.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    A V54 checkpoint must pass the same full-volume case003 gate before any
-    159, 20-case, fold0, or fulltrain expansion.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v54_sparse_head_balanced"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V54_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMSparseHeadBalancedV54] output_channels=8 "
-            "changed_variable=sparse_positive_loss_normalization; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMSparseHeadBalancedV54] Loss = V53 fragment-center core target + "
-            "V54 sparse positive normalization for core/contact/edge"
-        )
-        return BICMV54SparseHeadBalancedLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMSparseHeadBalancedV54] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM seed-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMCalibratedSparseHeadV55(PengwinTrainerBICMSparseHeadBalancedV54):
-    """Dataset537 V55 calibrated sparse-head balance diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v54]
-    V54 proved sparse-positive normalization is useful but uncalibrated: one
-    checkpoint keeps support geometry and zeroes contact, while another makes
-    contact nonzero by overgrowing core/contact and breaking marker topology.
-    V55 changes only the sparse-positive/noncore balance in the loss. Target
-    geometry, network, sampler, raw-logit evaluator, fixed threshold, and
-    decoder stay fixed.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This trainer is not a fold0/fulltrain path. It must pass the full-volume
-    case003 support/contact/core-topology/IoU-F gate before any broader run.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v55_calibrated_sparse_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V55_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMCalibratedSparseHeadV55] output_channels=8 "
-            "changed_variable=calibrated_sparse_positive_vs_noncore_balance; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMCalibratedSparseHeadV55] Loss = V54 sparse-head objective with "
-            "calibrated positive pressure and restored noncore/contact suppression"
-        )
-        return BICMV55CalibratedSparseHeadLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMCalibratedSparseHeadV55] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM seed-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMPhasedMarkerContactV56(PengwinTrainerBICMSparseHeadBalancedV54):
-    """Dataset537 V56 support-prefit then marker/contact phase diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v55]
-    V55 excludes another coefficient-only sparse-head balance. V56 changes the
-    optimization contract: phase 1 uses the V54 objective to form support and
-    context; phase 2 freezes the shared network and all non-marker output rows,
-    then trains only contact/core/edge rows. Target geometry, sampler, fixed
-    threshold, raw-logit evaluator, and decoder stay unchanged.
-
-    [QC][Invariant:phase2_trainable_rows]
-    The final segmentation layer rows for support/exterior/auxiliary channels
-    are restored after every optimizer step. This prevents SGD weight decay from
-    drifting frozen support logits while marker/contact rows are calibrated.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This remains a case003-only diagnostic. No 159, 20-case, fold0, or fulltrain
-    is allowed unless fixed full-volume case003 gates pass.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v56_phased_marker_contact"
-    MARKER_PHASE_EPOCH_DEFAULT = 5
-    MARKER_TRAIN_CHANNELS = (1, 2, 5, 6, 7)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V56_EPOCHS", self.num_epochs))
-        self.marker_phase_epoch = int(os.environ.get(
-            "PENGWIN_BICM_V56_MARKER_PHASE_EPOCH", self.MARKER_PHASE_EPOCH_DEFAULT
-        ))
-        self._v56_marker_phase_configured = False
-        self._v56_restore_rows: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
-        self.print_to_log_file(
-            "[BICMPhasedMarkerContactV56] output_channels=8 "
-            "changed_variable=freeze_support_then_train_marker_contact_edge_rows; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} marker_phase_epoch={self.marker_phase_epoch}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMPhasedMarkerContactV56] Loss = V54 phase1 + marker/contact/edge-only phase2"
-        )
-        return BICMV56PhasedMarkerContactLoss(marker_phase_epoch=self.marker_phase_epoch)
-
-    def _v56_final_seg_layer(self) -> torch.nn.Module:
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V56 expected network.decoder.seg_layers for marker/contact phase freezing.")
-        return seg_layers[-1]
-
-    @staticmethod
-    def _v56_masked_grad_hook(mask: torch.Tensor):
-        def _hook(grad: torch.Tensor) -> torch.Tensor:
-            return grad * mask.to(device=grad.device, dtype=grad.dtype)
-        return _hook
-
-    def _configure_v56_marker_phase(self) -> None:
-        if self._v56_marker_phase_configured or int(self.current_epoch) < int(self.marker_phase_epoch):
-            return
-        final_seg = self._v56_final_seg_layer()
-
-        for param in self.network.parameters():
-            param.requires_grad = False
-
-        train_channels = set(int(c) for c in self.MARKER_TRAIN_CHANNELS)
-        self._v56_restore_rows = []
-        for name, param in final_seg.named_parameters(recurse=False):
-            if param.ndim < 1 or int(param.shape[0]) != BICM_V38_OUTPUT_CHANNELS:
-                raise RuntimeError(
-                    f"V56 final segmentation parameter {name!r} must have first dim "
-                    f"{BICM_V38_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                )
-            row_mask_1d = torch.tensor(
-                [idx in train_channels for idx in range(int(param.shape[0]))],
-                device=param.device,
-                dtype=torch.bool,
-            )
-            view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-            grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-            frozen_snapshot = param.detach().clone()
-            param.requires_grad = True
-            param.register_hook(self._v56_masked_grad_hook(grad_mask))
-            self._v56_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v56_marker_phase_configured = True
-        self.print_to_log_file(
-            "[BICMPhasedMarkerContactV56] marker/contact phase active: "
-            f"train_channels={sorted(train_channels)} trainable_params={trainable}/{total}"
-        )
-
-    def _restore_v56_frozen_rows(self) -> None:
-        if not self._v56_restore_rows:
-            return
-        with torch.no_grad():
-            for param, row_mask, snapshot in self._v56_restore_rows:
-                frozen_rows = ~row_mask.to(device=param.device)
-                param.data[frozen_rows] = snapshot.to(device=param.device, dtype=param.dtype)[frozen_rows]
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v56_marker_phase()
-        result = super().train_step(batch)
-        self._restore_v56_frozen_rows()
-        return result
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMPhasedMarkerContactV56] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM seed-topology eval."
-        )
-        return None
-
-
-class _BICMDecoderFeatureMarkerContactEdgeBranch(nn.Module):
-    """Replace marker/contact/edge logits from the final decoder feature map.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v56]
-    V56 proved that phase separation alone is not enough when only final
-    segmentation rows are trainable: support stayed stable, but core markers
-    disappeared and contact stayed zero. This wrapper changes only the
-    trainable marker/contact capacity by adding a small decoder-feature branch
-    for channels 1, 2, and 5..7. Support, exterior, ROI-presence, target
-    sidecars, fixed threshold, and fixed decoder contracts stay unchanged.
-
-    [QC][Invariant:output_contract]
-    Dataset537 V38+ evaluation expects exactly eight sigmoid logits:
-    support, contact, core, exterior, ROI, edge_z, edge_y, edge_x. The branch
-    may replace only contact/core/edge logits. Any shape/channel drift is a
-    hard failure because it would invalidate raw-logit `bicm-v6-eval`.
-    """
-
-    def __init__(self, base_network: nn.Module):
-        super().__init__()
-        self.base_network = base_network
-        decoder = getattr(base_network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V57 expected a nnU-Net style decoder with seg_layers")
-        final_seg = seg_layers[-1]
-        if not hasattr(final_seg, "in_channels"):
-            raise RuntimeError("V57 expected final segmentation layer to expose in_channels")
-        in_ch = int(final_seg.in_channels)
-        # [QC][Invariant:capacity_control]
-        # The branch is deliberately smaller than the base decoder. V57 tests
-        # whether marker/contact need more than output-row capacity, not whether
-        # a new architecture can overpower the fixed support contract.
-        hidden = max(32, min(96, in_ch // 2))
-        self.marker_contact_edge_branch = nn.Sequential(
-            nn.Conv3d(in_ch, hidden, kernel_size=3, padding=1, bias=True),
-            nn.InstanceNorm3d(hidden, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(hidden, hidden, kernel_size=3, padding=2, dilation=2, bias=True),
-            nn.InstanceNorm3d(hidden, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(hidden, 5, kernel_size=1, bias=True),
-        )
-
-    @property
-    def decoder(self):
-        # [QC][Invariant:nnunet_lifecycle]
-        # Native nnU-Net trainer code accesses `network.decoder` for lifecycle,
-        # checkpoint, and mirroring/deep-supervision handling. Delegate to the
-        # wrapped network so this remains a native trainer, not an external loop.
-        return self.base_network.decoder
-
-    def _decode_with_final_feature(self, skips: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        decoder = self.base_network.decoder
-        if bool(getattr(decoder, "deep_supervision", False)):
-            raise RuntimeError("_BICMDecoderFeatureMarkerContactEdgeBranch requires deep supervision disabled")
-        lres_input = skips[-1]
-        final_feature = None
-        seg_output = None
-        for s in range(len(decoder.stages)):
-            x = decoder.transpconvs[s](lres_input)
-            x = torch.cat((x, skips[-(s + 2)]), 1)
-            x = decoder.stages[s](x)
-            if s == (len(decoder.stages) - 1):
-                final_feature = x
-                seg_output = decoder.seg_layers[-1](x)
-            lres_input = x
-        if final_feature is None or seg_output is None:
-            raise RuntimeError("V57 decoder produced no final feature/logit tensor")
-        return seg_output, final_feature
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        skips = self.base_network.encoder(x)
-        base_logits, final_feature = self._decode_with_final_feature(skips)
-        if base_logits.ndim != 5 or int(base_logits.shape[1]) != BICM_V38_OUTPUT_CHANNELS:
-            raise RuntimeError(f"expected base logits [B,8,D,H,W], got {tuple(base_logits.shape)}")
-        branch_logits = self.marker_contact_edge_branch(final_feature).to(dtype=base_logits.dtype)
-        if branch_logits.shape[:1] + branch_logits.shape[2:] != base_logits.shape[:1] + base_logits.shape[2:]:
-            raise RuntimeError(
-                "decoder-feature marker/contact branch shape mismatch: "
-                f"branch={tuple(branch_logits.shape)} base={tuple(base_logits.shape)}"
-            )
-        out = base_logits.clone()
-        out[:, 1:2] = branch_logits[:, 0:1]
-        out[:, 2:3] = branch_logits[:, 1:2]
-        out[:, 5:8] = branch_logits[:, 2:5]
-        return out
-
-
-class _BICMDecoderFeatureCoreBranch(nn.Module):
-    """Replace only the core marker logit from final decoder features.
-
-    [AUDIT][Risk:High][Scope:v60_core_topology_isolation]
-    V59 showed that preserving a shared branch core row is not enough because
-    the prefit marker topology is already invalid. V60 isolates the core marker
-    pathway from contact/edge heads. Support/contact/edge logits remain the
-    base network outputs; only channel 2 is replaced by this core branch.
-    """
-
-    def __init__(self, base_network: nn.Module):
-        super().__init__()
-        self.base_network = base_network
-        decoder = getattr(base_network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V60 expected a nnU-Net style decoder with seg_layers")
-        final_seg = seg_layers[-1]
-        if not hasattr(final_seg, "in_channels"):
-            raise RuntimeError("V60 expected final segmentation layer to expose in_channels")
-        in_ch = int(final_seg.in_channels)
-        hidden = max(32, min(96, in_ch // 2))
-        self.core_marker_branch = nn.Sequential(
-            nn.Conv3d(in_ch, hidden, kernel_size=3, padding=1, bias=True),
-            nn.InstanceNorm3d(hidden, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(hidden, hidden, kernel_size=3, padding=2, dilation=2, bias=True),
-            nn.InstanceNorm3d(hidden, affine=True),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv3d(hidden, 1, kernel_size=1, bias=True),
-        )
-
-    @property
-    def decoder(self):
-        return self.base_network.decoder
-
-    def _decode_with_final_feature(self, skips: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        decoder = self.base_network.decoder
-        if bool(getattr(decoder, "deep_supervision", False)):
-            raise RuntimeError("_BICMDecoderFeatureCoreBranch requires deep supervision disabled")
-        lres_input = skips[-1]
-        final_feature = None
-        seg_output = None
-        for s in range(len(decoder.stages)):
-            x = decoder.transpconvs[s](lres_input)
-            x = torch.cat((x, skips[-(s + 2)]), 1)
-            x = decoder.stages[s](x)
-            if s == (len(decoder.stages) - 1):
-                final_feature = x
-                seg_output = decoder.seg_layers[-1](x)
-            lres_input = x
-        if final_feature is None or seg_output is None:
-            raise RuntimeError("V60 decoder produced no final feature/logit tensor")
-        return seg_output, final_feature
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        skips = self.base_network.encoder(x)
-        base_logits, final_feature = self._decode_with_final_feature(skips)
-        if base_logits.ndim != 5 or int(base_logits.shape[1]) != BICM_V38_OUTPUT_CHANNELS:
-            raise RuntimeError(f"expected base logits [B,8,D,H,W], got {tuple(base_logits.shape)}")
-        core_logit = self.core_marker_branch(final_feature).to(dtype=base_logits.dtype)
-        if core_logit.shape[:1] + core_logit.shape[2:] != base_logits.shape[:1] + base_logits.shape[2:]:
-            raise RuntimeError(
-                "decoder-feature core branch shape mismatch: "
-                f"core={tuple(core_logit.shape)} base={tuple(base_logits.shape)}"
-            )
-        out = base_logits.clone()
-        out[:, 2:3] = core_logit
-        return out
-
-
-class PengwinTrainerBICMDecoderFeatureMarkerPhaseV57(PengwinTrainerBICMSparseHeadBalancedV54):
-    """Dataset537 V57 decoder-feature marker/contact phase diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v56]
-    V56 froze support/shared rows and trained only final contact/core/edge
-    output rows. That preserved support but eliminated core/contact. V57 keeps
-    the same V56 two-phase loss, sidecars, sampler, fixed threshold, raw-logit
-    evaluator, and case003 gate, but changes trainable phase2 capacity: a small
-    final-decoder-feature branch emits contact, core-marker, and z/y/x edge
-    logits.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This is still root-cause overfit, not fold0. Passing native patch
-    validation, or only improving support, cannot unlock 159/20-case/fold0/
-    fulltrain. Only fixed full-volume case003 JSON can.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v57_decoder_feature_marker_phase"
-    MARKER_PHASE_EPOCH_DEFAULT = 5
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V57_EPOCHS", self.num_epochs))
-        self.marker_phase_epoch = int(os.environ.get(
-            "PENGWIN_BICM_V57_MARKER_PHASE_EPOCH", self.MARKER_PHASE_EPOCH_DEFAULT
-        ))
-        self._v57_marker_phase_configured = False
-        self.print_to_log_file(
-            "[BICMDecoderFeatureMarkerPhaseV57] output_channels=8 "
-            "changed_variable=decoder_feature_marker_contact_edge_branch_phase; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} marker_phase_epoch={self.marker_phase_epoch}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        base_network = PengwinTrainerBICMEdgeCurriculumV46.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            num_output_channels,
-            enable_deep_supervision=False,
-        )
-        return _BICMDecoderFeatureMarkerContactEdgeBranch(base_network)
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMDecoderFeatureMarkerPhaseV57] Loss = V54 phase1 + "
-            "marker/contact/edge-only phase2; architecture supplies decoder-feature branch"
-        )
-        return BICMV56PhasedMarkerContactLoss(marker_phase_epoch=self.marker_phase_epoch)
-
-    def _configure_v57_marker_phase(self) -> None:
-        if self._v57_marker_phase_configured or int(self.current_epoch) < int(self.marker_phase_epoch):
-            return
-        if not isinstance(self.network, _BICMDecoderFeatureMarkerContactEdgeBranch):
-            raise RuntimeError("V57 expected _BICMDecoderFeatureMarkerContactEdgeBranch network wrapper.")
-
-        # [QC][Invariant:phase2_trainable_scope]
-        # Freeze the base encoder/decoder so support/exterior/ROI logits cannot
-        # drift in phase2. Unlike V56, the trainable branch sees decoder
-        # features and emits marker/contact/edge logits, giving the sparse heads
-        # more capacity than final-row affine weights alone.
-        for param in self.network.base_network.parameters():
-            param.requires_grad = False
-        for param in self.network.marker_contact_edge_branch.parameters():
-            param.requires_grad = True
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v57_marker_phase_configured = True
-        self.print_to_log_file(
-            "[BICMDecoderFeatureMarkerPhaseV57] marker/contact branch phase active: "
-            f"trainable_params={trainable}/{total}"
-        )
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v57_marker_phase()
-        return super().train_step(batch)
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMDecoderFeatureMarkerPhaseV57] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM seed-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMHeatmapMarkerContactV58(PengwinTrainerBICMDecoderFeatureMarkerPhaseV57):
-    """Dataset537 V58 heatmap marker/contact target-loss diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v57]
-    V57 changed phase-2 capacity and still failed with zero contact and invalid
-    marker topology. V58 deliberately keeps the V57 decoder-feature branch,
-    sampler, sidecars, raw-logit export, fixed threshold, and fixed decoder.
-    The only changed variable is the marker/contact loss contract: sparse hard
-    positives are interpreted as calibrated heatmaps/energy ridges with
-    fixed-threshold floors and support-local false-positive caps.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This trainer is a case003 root-cause diagnostic. It must not unlock 159,
-    20-case, fold0, or fulltrain unless fixed full-volume case003 JSON passes
-    the support, contact, core-topology, and IoU-F gate.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v58_heatmap_marker_contact"
-    MARKER_PHASE_EPOCH_DEFAULT = 5
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V58_EPOCHS", self.num_epochs))
-        self.marker_phase_epoch = int(os.environ.get(
-            "PENGWIN_BICM_V58_MARKER_PHASE_EPOCH", self.MARKER_PHASE_EPOCH_DEFAULT
-        ))
-        self._v58_marker_phase_configured = False
-        # Disable the inherited V57 phase hook so V58 can log its own audit
-        # scope while keeping the exact same trainable parameter set.
-        self._v57_marker_phase_configured = True
-        self.print_to_log_file(
-            "[BICMHeatmapMarkerContactV58] output_channels=8 "
-            "changed_variable=heatmap_energy_marker_contact_loss_contract; "
-            f"epochs={self.num_epochs} marker_phase_epoch={self.marker_phase_epoch}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMHeatmapMarkerContactV58] Loss = V54 phase1 + "
-            "phase2 calibrated heatmap/energy marker-contact-edge contract"
-        )
-        return BICMV58HeatmapMarkerContactLoss(marker_phase_epoch=self.marker_phase_epoch)
-
-    def _configure_v58_marker_phase(self) -> None:
-        if self._v58_marker_phase_configured or int(self.current_epoch) < int(self.marker_phase_epoch):
-            return
-        if not isinstance(self.network, _BICMDecoderFeatureMarkerContactEdgeBranch):
-            raise RuntimeError("V58 expected _BICMDecoderFeatureMarkerContactEdgeBranch network wrapper.")
-
-        # [QC][Invariant:phase2_trainable_scope]
-        # V58 must isolate the target/loss contract. The trainable scope is
-        # therefore identical to V57: frozen base network plus the small
-        # decoder-feature marker/contact/edge branch only.
-        for param in self.network.base_network.parameters():
-            param.requires_grad = False
-        for param in self.network.marker_contact_edge_branch.parameters():
-            param.requires_grad = True
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v58_marker_phase_configured = True
-        self.print_to_log_file(
-            "[BICMHeatmapMarkerContactV58] marker/contact heatmap phase active: "
-            f"trainable_params={trainable}/{total}"
-        )
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v58_marker_phase()
-        return PengwinTrainerBICMSparseHeadBalancedV54.train_step(self, batch)
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMHeatmapMarkerContactV58] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM seed-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMCorePreservingContactV59(PengwinTrainerBICMHeatmapMarkerContactV58):
-    """Dataset537 V59 contact/edge heatmap diagnostic with frozen core marker.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v58]
-    V58 recovered contact recall only by overpainting contact and deleting
-    core markers after the phase switch. V59 keeps the V58 branch, target
-    heatmap, sampler, raw-logit export, fixed threshold, and decoder. The
-    changed variable is phase-2 trainability: base network, branch hidden
-    layers, and the branch core row stay frozen; only contact and z/y/x edge
-    final branch rows are updated.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This is still a case003 root-cause run. It must not progress to 159,
-    20-case, fold0, or fulltrain unless fixed full-volume case003 JSON passes
-    support/contact/core-topology/IoU-F gates.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v59_core_preserving_contact"
-    MARKER_PHASE_EPOCH_DEFAULT = 5
-    CONTACT_EDGE_BRANCH_ROWS = (0, 2, 3, 4)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V59_EPOCHS", self.num_epochs))
-        self.marker_phase_epoch = int(os.environ.get(
-            "PENGWIN_BICM_V59_MARKER_PHASE_EPOCH", self.MARKER_PHASE_EPOCH_DEFAULT
-        ))
-        self._v59_contact_phase_configured = False
-        self._v59_restore_rows: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
-        # Disable inherited phase hooks. V59 owns the phase-2 trainable scope
-        # so the audit log and gradient mask match the tested hypothesis.
-        self._v57_marker_phase_configured = True
-        self._v58_marker_phase_configured = True
-        self.print_to_log_file(
-            "[BICMCorePreservingContactV59] output_channels=8 "
-            "changed_variable=phase2_freeze_core_marker_and_train_contact_edge_rows; "
-            f"epochs={self.num_epochs} marker_phase_epoch={self.marker_phase_epoch}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMCorePreservingContactV59] Loss = V54 phase1 + "
-            "phase2 contact/edge heatmap only; core-marker loss intentionally disabled"
-        )
-        return BICMV59CorePreservingContactLoss(marker_phase_epoch=self.marker_phase_epoch)
-
-    @staticmethod
-    def _v59_masked_grad_hook(mask: torch.Tensor):
-        def _hook(grad: torch.Tensor) -> torch.Tensor:
-            return grad * mask.to(device=grad.device, dtype=grad.dtype)
-        return _hook
-
-    def _v59_final_branch_conv(self) -> torch.nn.Conv3d:
-        if not isinstance(self.network, _BICMDecoderFeatureMarkerContactEdgeBranch):
-            raise RuntimeError("V59 expected _BICMDecoderFeatureMarkerContactEdgeBranch network wrapper.")
-        branch = self.network.marker_contact_edge_branch
-        final_conv = branch[-1]
-        if not isinstance(final_conv, torch.nn.Conv3d) or int(final_conv.out_channels) != 5:
-            raise RuntimeError(
-                "V59 expected marker_contact_edge_branch final Conv3d with 5 output rows, "
-                f"got {type(final_conv).__name__}"
-            )
-        return final_conv
-
-    def _configure_v59_contact_phase(self) -> None:
-        if self._v59_contact_phase_configured or int(self.current_epoch) < int(self.marker_phase_epoch):
-            return
-        final_conv = self._v59_final_branch_conv()
-
-        # [QC][Invariant:phase2_core_preservation]
-        # Freeze all shared/base features and the branch hidden layers. Only
-        # branch output rows 0(contact) and 2..4(edge z/y/x) receive gradients.
-        # Row 1(core) is restored after every optimizer step to prevent AdamW or
-        # weight decay from drifting preserved marker logits.
-        for param in self.network.base_network.parameters():
-            param.requires_grad = False
-        for param in self.network.marker_contact_edge_branch.parameters():
-            param.requires_grad = False
-
-        train_rows = set(int(v) for v in self.CONTACT_EDGE_BRANCH_ROWS)
-        self._v59_restore_rows = []
-        for name, param in final_conv.named_parameters(recurse=False):
-            if param.ndim < 1 or int(param.shape[0]) != 5:
-                raise RuntimeError(
-                    f"V59 final branch parameter {name!r} must have first dim 5, got {tuple(param.shape)}"
-                )
-            row_mask_1d = torch.tensor(
-                [idx in train_rows for idx in range(int(param.shape[0]))],
-                device=param.device,
-                dtype=torch.bool,
-            )
-            view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-            grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-            frozen_snapshot = param.detach().clone()
-            param.requires_grad = True
-            param.register_hook(self._v59_masked_grad_hook(grad_mask))
-            self._v59_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v59_contact_phase_configured = True
-        self.print_to_log_file(
-            "[BICMCorePreservingContactV59] contact/edge phase active: "
-            f"train_rows={sorted(train_rows)} preserved_row=1 trainable_params={trainable}/{total}"
-        )
-
-    def _restore_v59_frozen_rows(self) -> None:
-        if not self._v59_restore_rows:
-            return
-        with torch.no_grad():
-            for param, row_mask, snapshot in self._v59_restore_rows:
-                frozen_rows = ~row_mask.to(device=param.device)
-                param.data[frozen_rows] = snapshot.to(device=param.device, dtype=param.dtype)[frozen_rows]
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v59_contact_phase()
-        result = PengwinTrainerBICMSparseHeadBalancedV54.train_step(self, batch)
-        self._restore_v59_frozen_rows()
-        return result
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMCorePreservingContactV59] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM seed-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMStrictCoreTopologyV60(PengwinTrainerBICMSparseHeadBalancedV54):
-    """Dataset537 V60 strict core-topology diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v59]
-    V59 proved that preserving a core row while training contact/edge rows is
-    too weak and that the preserved prefit marker topology is already invalid.
-    V60 changes one variable: it gives core markers an independent final
-    decoder-feature branch and a phase-2 strict fragment-scale topology loss.
-    Contact/edge heads are not optimized in phase 2.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This is not a promotion path by itself. It must first improve case003
-    core-topology evidence; 159, 20-case, fold0, and fulltrain remain forbidden
-    unless the original full-volume gate passes.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v60_strict_core_topology"
-    MARKER_PHASE_EPOCH_DEFAULT = 5
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V60_EPOCHS", self.num_epochs))
-        self.marker_phase_epoch = int(os.environ.get(
-            "PENGWIN_BICM_V60_MARKER_PHASE_EPOCH", self.MARKER_PHASE_EPOCH_DEFAULT
-        ))
-        self._v60_core_phase_configured = False
-        self.print_to_log_file(
-            "[BICMStrictCoreTopologyV60] output_channels=8 "
-            "changed_variable=independent_core_branch_plus_strict_core_topology_phase; "
-            f"epochs={self.num_epochs} marker_phase_epoch={self.marker_phase_epoch}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        base_network = PengwinTrainerBICMEdgeCurriculumV46.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            num_output_channels,
-            enable_deep_supervision=False,
-        )
-        return _BICMDecoderFeatureCoreBranch(base_network)
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMStrictCoreTopologyV60] Loss = V54 phase1 + "
-            "phase2 strict core topology only; contact/edge phase2 loss disabled"
-        )
-        return BICMV60StrictCoreTopologyLoss(marker_phase_epoch=self.marker_phase_epoch)
-
-    def _configure_v60_core_phase(self) -> None:
-        if self._v60_core_phase_configured or int(self.current_epoch) < int(self.marker_phase_epoch):
-            return
-        if not isinstance(self.network, _BICMDecoderFeatureCoreBranch):
-            raise RuntimeError("V60 expected _BICMDecoderFeatureCoreBranch network wrapper.")
-
-        # [QC][Invariant:phase2_trainable_scope]
-        # Freeze support/contact/edge base logits and train only the independent
-        # core branch. This directly tests marker topology without contact loss
-        # or support drift becoming the hidden changed variable.
-        for param in self.network.base_network.parameters():
-            param.requires_grad = False
-        for param in self.network.core_marker_branch.parameters():
-            param.requires_grad = True
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v60_core_phase_configured = True
-        self.print_to_log_file(
-            "[BICMStrictCoreTopologyV60] strict core phase active: "
-            f"trainable_params={trainable}/{total}"
-        )
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v60_core_phase()
-        return PengwinTrainerBICMSparseHeadBalancedV54.train_step(self, batch)
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMStrictCoreTopologyV60] skipped native nnU-Net final validation; "
-            "evaluate epoch candidates with fixed full-volume BICM seed-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMPeakSeedV61(PengwinTrainerBICMSparseHeadBalancedV54):
-    """Dataset537 V61 peak-seed marker representation diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v60]
-    V60 proved an independent final core branch plus scalar topology loss is
-    insufficient. V61 changes the marker contract instead: the core channel is
-    trained as a compact peak heatmap and must be evaluated with the fixed
-    peak-seed decoder. Network width, sidecars, sampler, support/contact/edge
-    heads, threshold 0.5, and case003-only gate stay unchanged.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This run is allowed to produce zero contact while testing marker topology,
-    but it is not allowed to progress to 159/20-case/fold0/fulltrain unless
-    the original combined full-volume gate passes.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v61_peak_seed"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V61_EPOCHS", self.num_epochs))
-        self.print_to_log_file(
-            "[BICMPeakSeedV61] output_channels=8 "
-            "changed_variable=core_marker_peak_heatmap_plus_fixed_peak_seed_decoder; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMPeakSeedV61] Loss = V54 support/contact/edge objective + "
-            "peak-heatmap core seed representation"
-        )
-        return BICMV61PeakSeedLoss()
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMPeakSeedV61] skipped native nnU-Net final validation; "
-            "evaluate with bicm_v61_peakseed_watershed full-volume decoder."
-        )
-        return None
-
-
-class PengwinTrainerBICMSemanticTopologyV68(PengwinTrainerBICMEdgeAffinityV38):
-    """Dataset537 V68 hybrid semantic-support plus topology-head diagnostic.
-
-    [AUDIT][Risk:High][Scope:method_pivot_after_v67]
-    V67 failed with good support geometry but poor LeftHip contact/core
-    topology. Earlier V6/V38 factorized variants failed when support itself was
-    learned as an independent sigmoid map. V68 keeps the V5 semantic softmax
-    branch for support/exterior labels and adds independent contact/core/edge
-    heads trained from instance sidecars. This is the smallest representation
-    change that removes semantic contact/core competition without reintroducing
-    the known factorized-support failure mode.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This trainer is locked to case003 diagnostics until fixed full-volume
-    `bicm-v6-eval --contact-contract semantic_topology_v68` passes the full
-    case003 gate. 159/20-case/fold0/fulltrain remain forbidden before that.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v68_semantic_topology"
-    NUM_EPOCHS_DEFAULT = 80
-    # [QC][Invariant:fragment_scale_marker]
-    # `PengwinBICMV5EdgeAffinityDataLoader3D` falls back to broad semantic
-    # core-body targets when this attribute is None. That exact fallback made
-    # the first V68 diagnostic produce one LeftHip-wide seed component. V68
-    # must use sidecar fragment-center markers so watershed seeds are trained
-    # at fragment scale rather than anatomy-support scale.
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V68_EPOCHS", self.num_epochs))
-        self._v68_save_every = int(os.environ.get("PENGWIN_BICM_V68_SAVE_EVERY", "10"))
-        self.print_to_log_file(
-            "[BICMSemanticTopologyV68] output_channels=10 "
-            "changed_variable=semantic_support_plus_independent_contact_core_edge_heads; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v68_save_every}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:output_contract]
-        # Channels 0..4 are a softmax semantic branch; channels 5..9 are
-        # independent topology logits. The nnU-Net label manager still reports
-        # five raw labels, so the requested `num_output_channels` must not be
-        # forwarded here.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BICM_V68_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMSemanticTopologyV68] Loss = semantic CE/support Dice + "
-            "independent contact/core/edge topology sidecar losses"
-        )
-        return BICMV68SemanticTopologyLoss()
-
-    def validation_step(self, batch: dict) -> dict:
-        data, target = self._move_v38_batch(batch)
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        logits = output.float()
-        sem_prob = torch.softmax(logits[:, 0:5], dim=1)
-        sem_pred = sem_prob.argmax(dim=1)
-        contact_p = torch.sigmoid(logits[:, 5]) > 0.5
-        core_p = torch.sigmoid(logits[:, 6]) > 0.5
-        edge_p = torch.sigmoid(logits[:, 7:10]) > 0.5
-        support_p = (sem_pred == 2) | (sem_pred == 3) | (sem_pred == 4)
-        exterior_p = sem_pred == 1
-        support_t = target["support"][:, 0] > 0.5
-        contact_t = target["contact"][:, 0] > 0.5
-        core_t = target["core"][:, 0] > 0.5
-        exterior_t = target["exterior"][:, 0] > 0.5
-        edge_t = target["edge_break"] > 0.5
-        edge_valid = target["edge_valid"] > 0.5
-        support_prf = self._precision_recall_fbeta(self._binary_counts(support_p, support_t), beta=1.0)
-        contact_prf = self._precision_recall_fbeta(self._binary_counts(contact_p, contact_t), beta=0.5)
-        core_prf = self._precision_recall_fbeta(self._binary_counts(core_p, core_t), beta=1.0)
-        exterior_prf = self._precision_recall_fbeta(self._binary_counts(exterior_p, exterior_t), beta=1.0)
-        edge_prf = (
-            self._precision_recall_fbeta(self._binary_counts(edge_p[edge_valid], edge_t[edge_valid]), beta=0.5)
-            if edge_valid.any() else (0.0, 0.0, 0.0)
-        )
-        # [METRIC][Risk:High][Scope:patch_validation]
-        # This patch score intentionally rewards topology heads, but it is not
-        # the promotion metric. V67 proved full-volume IoU-F can diverge from
-        # patch pseudo Dice, so completed checkpoints are saved for external
-        # fixed-decoder evaluation.
-        score = (
-            0.30 * support_prf[2]
-            + 0.25 * contact_prf[2]
-            + 0.20 * core_prf[2]
-            + 0.20 * edge_prf[2]
-            + 0.05 * exterior_prf[2]
-        )
-        metrics = {
-            "score": float(score),
-            "support_precision": support_prf[0],
-            "support_recall": support_prf[1],
-            "support_f1": support_prf[2],
-            "contact_precision": contact_prf[0],
-            "contact_recall": contact_prf[1],
-            "contact_f0_5": contact_prf[2],
-            "core_precision": core_prf[0],
-            "core_recall": core_prf[1],
-            "core_f1": core_prf[2],
-            "edge_precision": edge_prf[0],
-            "edge_recall": edge_prf[1],
-            "edge_f0_5": edge_prf[2],
-            "exterior_f1": exterior_prf[2],
-        }
-        self._last_v38_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log("dice_per_class_or_region", [support_prf[2], contact_prf[2], core_prf[2], edge_prf[2]], self.current_epoch)
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-    def on_epoch_end(self):
-        super().on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v68_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMSemanticTopologyV68] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMSemanticTopologyV68] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume BICM V68 eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMTopologyCalibratedV69(PengwinTrainerBICMSemanticTopologyV68):
-    """Dataset537 V69 topology-head calibration diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v68]
-    V68 fixed the representation plumbing but measured two remaining failures:
-    dense contact stayed all-zero and the core marker head predicted almost the
-    whole LeftHip support as one seed component. V69 intentionally keeps the
-    Dataset537 materialization, 10-channel network, ROI sampler, compact marker
-    target, fixed threshold, and full-volume evaluator unchanged. The only
-    changed variable is loss calibration for sparse contact/core/edge heads.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This trainer must pass the same case003 full-volume gate before any 159,
-    20-case, fold0, or fulltrain run is allowed.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v69_topology_calibrated"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V69_EPOCHS", self.num_epochs))
-        self._v69_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V69_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V68_SAVE_EVERY", "10"),
-        ))
-        self._v68_save_every = self._v69_save_every
-        self.print_to_log_file(
-            "[BICMTopologyCalibratedV69] output_channels=10 "
-            "changed_variable=topology_head_mass_ratio_and_false_positive_calibration; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v69_save_every}"
-        )
-
-    def _build_loss(self):
-        # [QC][Invariant:loss_profile]
-        # Keep V68's channel layout and evaluator contract. Returning the V69
-        # loss here is the only intended behavioral delta for this diagnostic.
-        self.print_to_log_file(
-            "[BICMTopologyCalibratedV69] Loss = V68 semantic-topology loss + "
-            "core/contact mass-ratio calibration + sparse positive floors"
-        )
-        return BICMV69TopologyCalibratedLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v69_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMTopologyCalibratedV69] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMTopologyCalibratedV69] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume BICM V68/V69 eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMTopologyConsistencyV70(PengwinTrainerBICMTopologyCalibratedV69):
-    """Dataset537 V70 core/support/contact consistency diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v69]
-    V69 recovered fixed-threshold core markers only when the decoder admitted
-    core voxels into support, but the markers were still learned as semantic
-    background/contact-ridge voxels. V70 keeps V69's 10-channel architecture,
-    sampler, sidecars, and decoder ablation fixed; it changes only loss terms at
-    GT core-marker voxels so markers become semantic support and non-contact.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v70_topology_consistency"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V70_EPOCHS", self.num_epochs))
-        self._v70_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V70_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V69_SAVE_EVERY", "10"),
-        ))
-        self._v69_save_every = self._v70_save_every
-        self._v68_save_every = self._v70_save_every
-        self.print_to_log_file(
-            "[BICMTopologyConsistencyV70] output_channels=10 "
-            "changed_variable=core_marker_semantic_support_contact_exclusion; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v70_save_every}"
-        )
-
-    def _build_loss(self):
-        # [QC][Invariant:loss_profile]
-        # V70 is a loss-only diagnostic over V69. If this returns any other loss,
-        # the experiment no longer isolates the measured marker/support conflict.
-        self.print_to_log_file(
-            "[BICMTopologyConsistencyV70] Loss = V69 + core semantic-support "
-            "floor + core/contact-edge exclusion"
-        )
-        return BICMV70TopologyConsistencyLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v70_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMTopologyConsistencyV70] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMTopologyConsistencyV70] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume BICM V70 eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgeCutPrimaryV71(PengwinTrainerBICMTopologyConsistencyV70):
-    """Dataset537 V71 edge-cut affinity primary diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v70]
-    V70 improved support and contact recall but still failed because voxel
-    contact did not form a precise continuous split barrier. V71 keeps V70's
-    10-channel architecture, case-lock sampler, compact core markers, and
-    fixed core-union decoder. The only training change is that z/y/x edge-break
-    affinity becomes the primary cut signal while dense contact is auxiliary.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This trainer may only be used for locked case003 diagnostics until the
-    fixed full-volume gate passes. It must not trigger 159, 20-case, fold0, or
-    fulltrain by itself.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v71_edge_cut_primary"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V71_EPOCHS", self.num_epochs))
-        self._v71_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V71_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V70_SAVE_EVERY", "10"),
-        ))
-        self._v70_save_every = self._v71_save_every
-        self._v69_save_every = self._v71_save_every
-        self._v68_save_every = self._v71_save_every
-        self.print_to_log_file(
-            "[BICMEdgeCutPrimaryV71] output_channels=10 "
-            "changed_variable=edge_break_affinity_primary_contact_auxiliary; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v71_save_every}"
-        )
-
-    def _build_loss(self):
-        # [QC][Invariant:loss_profile]
-        # V71 must not change Dataset537 materialization, output channels, or
-        # decoder thresholds. A different loss here would invalidate the
-        # contact-vs-edge primary comparison against V70.
-        self.print_to_log_file(
-            "[BICMEdgeCutPrimaryV71] Loss = V70 + edge-cut affinity ranking; "
-            "dense contact is auxiliary"
-        )
-        return BICMV71EdgeCutPrimaryLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v71_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMEdgeCutPrimaryV71] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgeCutPrimaryV71] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMLogitCalibratedV72(PengwinTrainerBICMTopologyConsistencyV70):
-    """Dataset537 V72 fixed edge-logit calibration diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v71]
-    V71 made edge-break affinity the primary objective but measured a fixed
-    threshold collapse: edge/contact probabilities stayed below 0.5 and IoU-F
-    regressed versus V70. V72 deliberately returns to the V70 loss/decoder and
-    changes only the final segmentation-layer bias for topology heads at
-    initialization. This tests whether the edge-cut signal is being killed
-    before the loss can shape it, without adding another loss coefficient.
-
-    [QA][Gate:case003_before_expansion][Status:Required]
-    This is still a locked case003 diagnostic. Passing patch validation is not
-    enough; only full-volume `v68_edge_primary + bicm_v69_core_union_watershed`
-    evidence can unlock 159/20-case/fold0/fulltrain.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v72_logit_calibrated"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V72_EPOCHS", self.num_epochs))
-        self._v72_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V72_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V70_SAVE_EVERY", "10"),
-        ))
-        self._v70_save_every = self._v72_save_every
-        self._v69_save_every = self._v72_save_every
-        self._v68_save_every = self._v72_save_every
-        self._v72_edge_bias = float(os.environ.get("PENGWIN_BICM_V72_EDGE_BIAS", "1.5"))
-        self._v72_contact_bias = float(os.environ.get("PENGWIN_BICM_V72_CONTACT_BIAS", "0.0"))
-        self.print_to_log_file(
-            "[BICMLogitCalibratedV72] output_channels=10 "
-            "changed_variable=fixed_initial_edge_contact_logit_bias; "
-            f"edge_bias={self._v72_edge_bias}; contact_bias={self._v72_contact_bias}; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v72_save_every}"
-        )
-
-    def initialize(self) -> None:
-        super().initialize()
-        self._apply_v72_topology_bias()
-
-    def _apply_v72_topology_bias(self) -> None:
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V72 expected network.decoder.seg_layers for fixed topology bias calibration.")
-        final_seg = seg_layers[-1]
-        bias = getattr(final_seg, "bias", None)
-        if bias is None or int(bias.numel()) < int(BICM_V68_OUTPUT_CHANNELS):
-            raise RuntimeError(
-                "V72 expected final segmentation bias with 10 channels; "
-                f"got {None if bias is None else int(bias.numel())}"
-            )
-        with torch.no_grad():
-            # [QC][Invariant:fixed_calibration_not_threshold_tuning]
-            # The fixed 0.5 promotion threshold remains unchanged. This bias
-            # only changes the starting logit prior for topology heads so that
-            # edge positives are not immediately below-threshold before any
-            # full-volume feedback exists. It is global and case-independent.
-            bias[5].fill_(self._v72_contact_bias)
-            bias[7:10].fill_(self._v72_edge_bias)
-        self.print_to_log_file(
-            "[BICMLogitCalibratedV72] applied final-head bias calibration: "
-            f"contact_ch5={self._v72_contact_bias}; edge_ch7_9={self._v72_edge_bias}"
-        )
-
-    def _build_loss(self):
-        # [AUDIT][Risk:Medium][Scope:single_variable_control]
-        # V72 intentionally reuses V70 loss. If this returns V71 or another
-        # loss, the experiment no longer isolates fixed logit calibration.
-        self.print_to_log_file(
-            "[BICMLogitCalibratedV72] Loss = V70 topology consistency; "
-            "only initial topology-head bias differs"
-        )
-        return BICMV70TopologyConsistencyLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v72_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMLogitCalibratedV72] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMLogitCalibratedV72] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMInstanceTopologyV73(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V73 instance-aware topology diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v72]
-    V72 restored nonzero contact but still failed because LeftHip fragment-scale
-    core seed topology remained invalid and contact precision stayed far below
-    gate. V73 keeps the V72 initialization, Dataset537 materialization,
-    10-channel output, sampler, fixed thresholds, and core-union decoder. The
-    only learning change is the instance-aware topology loss that uses existing
-    V5 sidecars to require one seed peak per GT fragment and suppress hardest
-    false contact inside fragment support.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v73_instance_topology"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V73_EPOCHS", self.num_epochs))
-        self._v73_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V73_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V72_SAVE_EVERY", "10"),
-        ))
-        self._v72_save_every = self._v73_save_every
-        self._v70_save_every = self._v73_save_every
-        self._v69_save_every = self._v73_save_every
-        self._v68_save_every = self._v73_save_every
-        self.print_to_log_file(
-            "[BICMInstanceTopologyV73] output_channels=10 "
-            "changed_variable=instance_fragment_seed_presence_and_false_contact_precision; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v73_save_every}"
-        )
-
-    def _build_loss(self):
-        # [QC][Invariant:loss_profile]
-        # V73 must keep V72's output contract and bias calibration. Returning
-        # this loss is the only intended behavioral delta for the locked
-        # case003 diagnostic.
-        self.print_to_log_file(
-            "[BICMInstanceTopologyV73] Loss = V70/V72 + fragment-wise seed "
-            "presence + support-internal false-contact precision"
-        )
-        return BICMV73InstanceTopologyLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v73_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMInstanceTopologyV73] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMInstanceTopologyV73] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMAdaptiveInstanceTopologyV74(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V74 adaptive instance-topology diagnostic.
-
-    [AUDIT][Risk:High][Scope:single_variable_after_v73]
-    V73 introduced instance-aware seed/contact supervision, but its seed term
-    can pressure visible partial fragments whose GT core center is outside the
-    crop. V74 keeps Dataset537, V72 initialization, 10-channel output, sampler,
-    fixed thresholds, and core-union decoder. The only learning change is a
-    target-core-aware instance topology loss with detached adaptive balancing
-    between contact recall and support-internal false-contact precision.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v74_adaptive_instance_topology"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V74_EPOCHS", self.num_epochs))
-        self._v74_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V74_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V72_SAVE_EVERY", "10"),
-        ))
-        self._v72_save_every = self._v74_save_every
-        self._v70_save_every = self._v74_save_every
-        self._v69_save_every = self._v74_save_every
-        self._v68_save_every = self._v74_save_every
-        self.print_to_log_file(
-            "[BICMAdaptiveInstanceTopologyV74] output_channels=10 "
-            "changed_variable=target_core_aware_seed_mass_and_adaptive_contact_precision; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v74_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMAdaptiveInstanceTopologyV74] Loss = V70/V72 + target-core-aware "
-            "fragment seed/mass + adaptive contact precision-recall balancing"
-        )
-        return BICMV74AdaptiveInstanceTopologyLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v74_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMAdaptiveInstanceTopologyV74] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMAdaptiveInstanceTopologyV74] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgePrecisionSeedTopologyV75(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V75 edge-primary precision and seed-topology diagnostic.
-
-    [AUDIT][Risk:High][Scope:response_after_v73_v74]
-    V73 had the best case003 full-volume IoU-F and core coverage but failed
-    contact precision/recall and seed topology. V74 improved contact activation
-    but core coverage/topology regressed. V75 keeps V72 representation/bias,
-    Dataset537 sidecars, fixed thresholds, and the core-union decoder while
-    combining V73 visible-fragment seed pressure with direct edge-head
-    precision/recall ranking, because the promotion decoder uses edge-primary
-    contact.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v75_edge_precision_seed_topology"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V75_EPOCHS", self.num_epochs))
-        self._v75_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V75_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V73_SAVE_EVERY", "10"),
-        ))
-        self._v72_save_every = self._v75_save_every
-        self._v70_save_every = self._v75_save_every
-        self._v69_save_every = self._v75_save_every
-        self._v68_save_every = self._v75_save_every
-        self.print_to_log_file(
-            "[BICMEdgePrecisionSeedTopologyV75] output_channels=10 "
-            "changed_variable=edge_primary_precision_rank_plus_v73_seed_topology; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v75_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMEdgePrecisionSeedTopologyV75] Loss = V73 seed coverage + "
-            "edge-primary contact precision/recall rank + fragment core mass guard"
-        )
-        return BICMV75EdgePrecisionSeedTopologyLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v75_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMEdgePrecisionSeedTopologyV75] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgePrecisionSeedTopologyV75] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMGentleEdgePrecisionV76(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V76 gentle edge-primary precision diagnostic.
-
-    [AUDIT][Risk:High][Scope:response_after_v75]
-    V75 added strong direct edge precision pressure and suppressed core/contact
-    activation by epoch 10. V76 keeps V73's seed behavior and applies only
-    low-amplitude edge-primary ranking/false-positive terms so the model can
-    preserve the V73/V74 recall signal while reducing broad false edge costs.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v76_gentle_edge_precision"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V76_EPOCHS", self.num_epochs))
-        self._v76_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V76_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V73_SAVE_EVERY", "10"),
-        ))
-        self._v72_save_every = self._v76_save_every
-        self._v70_save_every = self._v76_save_every
-        self._v69_save_every = self._v76_save_every
-        self._v68_save_every = self._v76_save_every
-        self.print_to_log_file(
-            "[BICMGentleEdgePrecisionV76] output_channels=10 "
-            "changed_variable=v73_seed_plus_gentle_edge_primary_precision; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v76_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMGentleEdgePrecisionV76] Loss = V73 seed/contact objective + "
-            "gentle edge-primary rank/false-positive pressure"
-        )
-        return BICMV76GentleEdgePrecisionLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v76_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMGentleEdgePrecisionV76] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMGentleEdgePrecisionV76] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMEdgeCurriculumV77(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V77 edge recall-to-precision curriculum diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v77_edge_recall_precision_curriculum"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V77_EPOCHS", self.num_epochs))
-        self._v77_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V77_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V73_SAVE_EVERY", "10"),
-        ))
-        self._v72_save_every = self._v77_save_every
-        self._v70_save_every = self._v77_save_every
-        self._v69_save_every = self._v77_save_every
-        self._v68_save_every = self._v77_save_every
-        self.print_to_log_file(
-            "[BICMEdgeCurriculumV77] output_channels=10 "
-            "changed_variable=edge_recall_first_precision_late_curriculum; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v77_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMEdgeCurriculumV77] Loss = V73 seed/contact objective + "
-            "scheduled edge recall-first precision-late curriculum"
-        )
-        return BICMV77EdgeRecallPrecisionCurriculumLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v77_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file("[BICMEdgeCurriculumV77] saved full-volume probe candidate", str(candidate_path))
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMEdgeCurriculumV77] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMCoreAnchoredEdgeCurriculumV78(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V78 core-anchored adaptive edge curriculum diagnostic.
-
-    V77's best full-volume checkpoint improved edge/contact balance but failed
-    because core coverage/topology were not viable at the same time. V78 keeps
-    V72 initialization, the 10-channel output, Dataset537 materialization,
-    sampler, thresholds, and core-union decoder fixed. The only learning change
-    is the V78 loss: edge precision pressure is adaptive to fragment core
-    viability and late precision phases reinforce seed preservation.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v78_core_anchored_edge_curriculum"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V78_EPOCHS", self.num_epochs))
-        self._v78_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V78_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V77_SAVE_EVERY", "10"),
-        ))
-        self._v77_save_every = self._v78_save_every
-        self._v72_save_every = self._v78_save_every
-        self._v70_save_every = self._v78_save_every
-        self._v69_save_every = self._v78_save_every
-        self._v68_save_every = self._v78_save_every
-        self.print_to_log_file(
-            "[BICMCoreAnchoredEdgeCurriculumV78] output_channels=10 "
-            "changed_variable=adaptive_edge_precision_gated_by_core_seed_viability; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v78_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMCoreAnchoredEdgeCurriculumV78] Loss = V73 seed/contact base + "
-            "adaptive edge precision + late core/support preservation"
-        )
-        return BICMV78CoreAnchoredEdgeCurriculumLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v78_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                "[BICMCoreAnchoredEdgeCurriculumV78] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMCoreAnchoredEdgeCurriculumV78] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMDuplicateSeedEdgeV79(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V79 duplicate-seed suppression diagnostic.
-
-    Contact-contract audit did not justify changing the V68/V72 output
-    structure. V73 full-volume topology analysis instead localized the closest
-    failure to one LeftHip fragment with duplicate core seeds. V79 keeps the
-    same channels, sampler, thresholds, and core-union decoder while replacing
-    V78's broad core anchor with local secondary-peak suppression.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v79_duplicate_seed_edge"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V79_EPOCHS", self.num_epochs))
-        self._v79_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V79_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V77_SAVE_EVERY", "10"),
-        ))
-        self._v77_save_every = self._v79_save_every
-        self._v72_save_every = self._v79_save_every
-        self._v70_save_every = self._v79_save_every
-        self._v69_save_every = self._v79_save_every
-        self._v68_save_every = self._v79_save_every
-        self.print_to_log_file(
-            "[BICMDuplicateSeedEdgeV79] output_channels=10 "
-            "changed_variable=duplicate_core_seed_suppression_with_core_gated_edge_precision; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v79_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMDuplicateSeedEdgeV79] Loss = V73 seed/contact base + "
-            "local duplicate core seed suppression + core-gated edge-primary curriculum"
-        )
-        return BICMV79DuplicateSeedSuppressedEdgeLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v79_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                "[BICMDuplicateSeedEdgeV79] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMDuplicateSeedEdgeV79] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMTopologyStateAdaptiveV80(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V80 topology-state adaptive loss diagnostic.
-
-    V79 reduced the original V73 duplicate seed but introduced background
-    seed-component noise and missing LeftHip seeds. V80 keeps the same model
-    outputs and fixed edge-primary decoder while making loss pressure depend on
-    detached topology state: preserve seed coverage first, suppress background
-    core noise always, and activate duplicate/edge precision only when fragment
-    seed peaks are viable.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v80_topology_state_adaptive"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V80_EPOCHS", self.num_epochs))
-        self._v80_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V80_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V77_SAVE_EVERY", "10"),
-        ))
-        self._v77_save_every = self._v80_save_every
-        self._v72_save_every = self._v80_save_every
-        self._v70_save_every = self._v80_save_every
-        self._v69_save_every = self._v80_save_every
-        self._v68_save_every = self._v80_save_every
-        self.print_to_log_file(
-            "[BICMTopologyStateAdaptiveV80] output_channels=10 "
-            "changed_variable=topology_state_gated_seed_noise_and_edge_precision; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v80_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMTopologyStateAdaptiveV80] Loss = V73 seed/contact base + "
-            "coverage-gated duplicate suppression + background core-noise guard + "
-            "state-gated edge-primary curriculum"
-        )
-        return BICMV80TopologyStateAdaptiveLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v80_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                "[BICMTopologyStateAdaptiveV80] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMTopologyStateAdaptiveV80] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMCoreStableEdgePrecisionV81(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V81 core-stable edge precision diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v81_core_stable_edge_precision"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V81_EPOCHS", self.num_epochs))
-        self._v81_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V81_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V80_SAVE_EVERY", "10"),
-        ))
-        self._v80_save_every = self._v81_save_every
-        self._v77_save_every = self._v81_save_every
-        self._v72_save_every = self._v81_save_every
-        self._v70_save_every = self._v81_save_every
-        self._v69_save_every = self._v81_save_every
-        self._v68_save_every = self._v81_save_every
-        self.print_to_log_file(
-            "[BICMCoreStableEdgePrecisionV81] output_channels=10 "
-            "changed_variable=v80_core_guard_plus_stronger_gated_edge_precision; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v81_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMCoreStableEdgePrecisionV81] Loss = V80 topology-state core guard + "
-            "stronger late edge false/rank/mass precision"
-        )
-        return BICMV81CoreStableEdgePrecisionLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v81_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                "[BICMCoreStableEdgePrecisionV81] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMCoreStableEdgePrecisionV81] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMSeedRecallEdgeSeparationV82(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V82 seed-recall and edge-separation diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v82_seed_recall_edge_separation"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V82_EPOCHS", self.num_epochs))
-        self._v82_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V82_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V81_SAVE_EVERY", "10"),
-        ))
-        self._v81_save_every = self._v82_save_every
-        self._v80_save_every = self._v82_save_every
-        self._v77_save_every = self._v82_save_every
-        self._v72_save_every = self._v82_save_every
-        self._v70_save_every = self._v82_save_every
-        self._v69_save_every = self._v82_save_every
-        self._v68_save_every = self._v82_save_every
-        self.print_to_log_file(
-            "[BICMSeedRecallEdgeSeparationV82] output_channels=10 "
-            "changed_variable=v81_seed_recall_plus_edge_logit_separation; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v82_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMSeedRecallEdgeSeparationV82] Loss = V81 structure + "
-            "stronger targeted seed recall and fixed-threshold edge separation"
-        )
-        return BICMV82SeedRecallEdgeSeparationLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v82_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                "[BICMSeedRecallEdgeSeparationV82] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMSeedRecallEdgeSeparationV82] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMSeedSafeEdgeCalibrationV83(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V83 moderated seed-safe edge calibration diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v83_seed_safe_edge_calibration"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V83_EPOCHS", self.num_epochs))
-        self._v83_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V83_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V82_SAVE_EVERY", "10"),
-        ))
-        self._v82_save_every = self._v83_save_every
-        self._v81_save_every = self._v83_save_every
-        self._v80_save_every = self._v83_save_every
-        self._v77_save_every = self._v83_save_every
-        self._v72_save_every = self._v83_save_every
-        self._v70_save_every = self._v83_save_every
-        self._v69_save_every = self._v83_save_every
-        self._v68_save_every = self._v83_save_every
-        self.print_to_log_file(
-            "[BICMSeedSafeEdgeCalibrationV83] output_channels=10 "
-            "changed_variable=v81_moderated_seed_floor_plus_edge_calibration; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v83_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMSeedSafeEdgeCalibrationV83] Loss = V81 structure + "
-            "mild seed-floor recovery and slower edge hard-false calibration"
-        )
-        return BICMV83SeedSafeEdgeCalibrationLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v83_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                "[BICMSeedSafeEdgeCalibrationV83] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMSeedSafeEdgeCalibrationV83] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary core-union eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMDualHeadContactCalibrationV84(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V84 dual-head contact calibration diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v84_dual_head_contact_calibration"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V84_EPOCHS", self.num_epochs))
-        self._v84_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V84_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V83_SAVE_EVERY", "10"),
-        ))
-        self._v83_save_every = self._v84_save_every
-        self._v82_save_every = self._v84_save_every
-        self._v81_save_every = self._v84_save_every
-        self._v80_save_every = self._v84_save_every
-        self._v77_save_every = self._v84_save_every
-        self._v72_save_every = self._v84_save_every
-        self._v70_save_every = self._v84_save_every
-        self._v69_save_every = self._v84_save_every
-        self._v68_save_every = self._v84_save_every
-        self.print_to_log_file(
-            "[BICMDualHeadContactCalibrationV84] output_channels=10 "
-            "changed_variable=v81_edge_recall_plus_dense_contact_gate_and_hard_seed_floor; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v84_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMDualHeadContactCalibrationV84] Loss = V81 core/edge base + "
-            "dense-contact gate calibration for semantic_topology_v68 contract"
-        )
-        return BICMV84DualHeadContactCalibrationLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v84_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                "[BICMDualHeadContactCalibrationV84] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMDualHeadContactCalibrationV84] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed full-volume edge-primary and semantic-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMSemanticGateContactV85(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V85 semantic-topology contact-gate diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v85_semantic_gate_contact"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V85_EPOCHS", self.num_epochs))
-        self._v85_save_every = int(os.environ.get(
-            "PENGWIN_BICM_V85_SAVE_EVERY",
-            os.environ.get("PENGWIN_BICM_V84_SAVE_EVERY", "10"),
-        ))
-        self._v84_save_every = self._v85_save_every
-        self._v83_save_every = self._v85_save_every
-        self._v82_save_every = self._v85_save_every
-        self._v81_save_every = self._v85_save_every
-        self._v80_save_every = self._v85_save_every
-        self._v77_save_every = self._v85_save_every
-        self._v72_save_every = self._v85_save_every
-        self._v70_save_every = self._v85_save_every
-        self._v69_save_every = self._v85_save_every
-        self._v68_save_every = self._v85_save_every
-        self.print_to_log_file(
-            "[BICMSemanticGateContactV85] output_channels=10 "
-            "changed_variable=v81_core_plus_semantic_topology_contact_product_gate; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v85_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            "[BICMSemanticGateContactV85] Loss = V81 core/edge base + "
-            "fixed semantic_topology_v68 product-gate contact separation"
-        )
-        return BICMV85SemanticGateContactLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v85_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                "[BICMSemanticGateContactV85] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[BICMSemanticGateContactV85] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed semantic-topology and edge-primary eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMEvalBandEdgePrimaryV86(PengwinTrainerBICMLogitCalibratedV72):
-    """Dataset537 V86 eval-band-aligned edge-primary diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v86_eval_band_edge_primary"
-    NUM_EPOCHS_DEFAULT = 40
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-    VERSION_TAG = "BICMEvalBandEdgePrimaryV86"
-    EPOCH_ENV = "PENGWIN_BICM_V86_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V86_SAVE_EVERY"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get(self.EPOCH_ENV, self.num_epochs))
-        self._v86_save_every = int(os.environ.get(
-            self.SAVE_EVERY_ENV,
-            os.environ.get("PENGWIN_BICM_V85_SAVE_EVERY", "10"),
-        ))
-        self._v85_save_every = self._v86_save_every
-        self._v84_save_every = self._v86_save_every
-        self._v83_save_every = self._v86_save_every
-        self._v82_save_every = self._v86_save_every
-        self._v81_save_every = self._v86_save_every
-        self._v80_save_every = self._v86_save_every
-        self._v77_save_every = self._v86_save_every
-        self._v72_save_every = self._v86_save_every
-        self._v70_save_every = self._v86_save_every
-        self._v69_save_every = self._v86_save_every
-        self._v68_save_every = self._v86_save_every
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] output_channels=10 "
-            "changed_variable=v81_core_plus_eval_band_edge_primary_alignment; "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX}; "
-            f"epochs={self.num_epochs} save_every={self._v86_save_every}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V81 core/support base + "
-            "semantic contact-band aligned edge-primary contact objective"
-        )
-        return BICMV86EvalBandEdgePrimaryLoss()
-
-    def on_epoch_end(self):
-        super(PengwinTrainerBICMSemanticTopologyV68, self).on_epoch_end()
-        completed_epoch = int(self.current_epoch)
-        if completed_epoch > 0 and (
-            completed_epoch % max(1, int(self._v86_save_every)) == 0
-            or completed_epoch == int(self.num_epochs)
-        ):
-            candidate_path = Path(self.output_folder) / f"checkpoint_completed_{completed_epoch:04d}.pth"
-            self.save_checkpoint(str(candidate_path))
-            self.print_to_log_file(
-                f"[{self.VERSION_TAG}] saved full-volume probe candidate",
-                str(candidate_path),
-            )
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] skipped native nnU-Net final validation; "
-            "evaluate completed checkpoints with fixed edge-primary and semantic-topology eval."
-        )
-        return None
-
-
-class PengwinTrainerBICMEvalBandSemanticGateV87(PengwinTrainerBICMEvalBandEdgePrimaryV86):
-    """Dataset537 V87 eval-band-aligned semantic-gate diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v87_eval_band_semantic_gate"
-    VERSION_TAG = "BICMEvalBandSemanticGateV87"
-    EPOCH_ENV = "PENGWIN_BICM_V87_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V87_SAVE_EVERY"
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V86 eval-band edge alignment + "
-            "semantic_topology_v68 dense-contact gate against semantic contact band"
-        )
-        return BICMV87EvalBandSemanticGateLoss()
-
-
-class PengwinTrainerBICMCorePreservingBandPrecisionV88(PengwinTrainerBICMEvalBandEdgePrimaryV86):
-    """Dataset537 V88 core-preserving eval-band edge precision diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v88_core_preserving_band_precision"
-    VERSION_TAG = "BICMCorePreservingBandPrecisionV88"
-    EPOCH_ENV = "PENGWIN_BICM_V88_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V88_SAVE_EVERY"
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V81 core/support base + "
-            "late low-weight semantic contact-band hard-false calibration for v68_edge_primary"
-        )
-        return BICMV88CorePreservingBandPrecisionLoss()
-
-
-class PengwinTrainerBICMBandFalseOnlyPrecisionV89(PengwinTrainerBICMCorePreservingBandPrecisionV88):
-    """Dataset537 V89 semantic-band negative-only edge precision diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v89_band_false_only_precision"
-    VERSION_TAG = "BICMBandFalseOnlyPrecisionV89"
-    EPOCH_ENV = "PENGWIN_BICM_V89_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V89_SAVE_EVERY"
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V81 core/support base + "
-            "semantic contact-band negative-only hard-false edge suppression"
-        )
-        return BICMV89BandFalseOnlyEdgePrecisionLoss()
-
-
-class PengwinTrainerBICMSemanticBandProductV90(PengwinTrainerBICMBandFalseOnlyPrecisionV89):
-    """Dataset537 V90 semantic class-4 contact-band product diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v90_semantic_band_product"
-    VERSION_TAG = "BICMSemanticBandProductV90"
-    EPOCH_ENV = "PENGWIN_BICM_V90_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V90_SAVE_EVERY"
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V89 edge false suppression + "
-            "semantic class-4 contact-band product gate training"
-        )
-        return BICMV90SemanticBandProductLoss()
-
-
-class PengwinTrainerBICMTopologyAwareEdgeBalanceV91(PengwinTrainerBICMBandFalseOnlyPrecisionV89):
-    """Dataset537 V91 V89-base topology-aware edge-balance diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v91_topology_aware_edge_balance"
-    VERSION_TAG = "BICMTopologyAwareEdgeBalanceV91"
-    EPOCH_ENV = "PENGWIN_BICM_V91_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V91_SAVE_EVERY"
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V89 support/core base + "
-            "tight duplicate-seed suppression and eval-band low-positive edge balance"
-        )
-        return BICMV91TopologyAwareEdgeBalanceLoss()
-
-
-class PengwinTrainerBICMEvalAlignedSupportContactV93(PengwinTrainerBICMBandFalseOnlyPrecisionV89):
-    """Dataset537 V93 eval-aligned support/contact hard-mining diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v93_eval_aligned_support_contact"
-    VERSION_TAG = "BICMEvalAlignedSupportContactV93"
-    EPOCH_ENV = "PENGWIN_BICM_V93_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V93_SAVE_EVERY"
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V89 core base + "
-            "late semantic support hard mining and eval-band edge barrier"
-        )
-        return BICMV93EvalAlignedSupportContactLoss()
-
-
-class PengwinTrainerBICMFinalRowCalibratedV94(PengwinTrainerBICMBandFalseOnlyPrecisionV89):
-    """Dataset537 V94 V89-initialized final-row support/contact calibration."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v94_final_row_support_contact"
-    VERSION_TAG = "BICMFinalRowCalibratedV94"
-    EPOCH_ENV = "PENGWIN_BICM_V94_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V94_SAVE_EVERY"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get("PENGWIN_BICM_V94_LR", "3e-4"))
-        self._v94_configured = False
-        self._v94_restore_rows: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] final-row calibration lr={self.initial_lr}; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_core_row=6"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = low-gain V93 support/contact terms "
-            "for V89-initialized frozen-core final-row calibration"
-        )
-        return BICMV94FinalRowSupportContactLoss()
-
-    @staticmethod
-    def _v94_masked_grad_hook(mask: torch.Tensor):
-        def _hook(grad: torch.Tensor) -> torch.Tensor:
-            return grad * mask.to(device=grad.device, dtype=grad.dtype)
-        return _hook
-
-    def _configure_v94_final_row_calibration(self) -> None:
-        if self._v94_configured:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V94 expected network.decoder.seg_layers for final-row calibration.")
-
-        # [AUDIT][Risk:High][Scope:v94_core_preservation]
-        # V89+peak17 proved core topology can pass. V93 failed by moving the
-        # whole network and deleting all full-volume core seeds. Freeze shared
-        # features and restore row 6 after every optimizer step so any V94
-        # change is attributable only to semantic/contact/edge output rows.
-        for param in self.network.parameters():
-            param.requires_grad = False
-
-        train_rows = set(int(v) for v in self.CALIBRATION_ROWS)
-        self._v94_restore_rows = []
-        for layer_idx, seg_layer in enumerate(seg_layers):
-            for name, param in seg_layer.named_parameters(recurse=False):
-                if param.ndim < 1 or int(param.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V94 seg_layers[{layer_idx}] parameter {name!r} must have first dim "
-                        f"{BICM_V68_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                    )
-                row_mask_1d = torch.tensor(
-                    [idx in train_rows for idx in range(int(param.shape[0]))],
-                    device=param.device,
-                    dtype=torch.bool,
-                )
-                view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-                grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-                frozen_snapshot = param.detach().clone()
-                param.requires_grad = True
-                param.register_hook(self._v94_masked_grad_hook(grad_mask))
-                self._v94_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v94_configured = True
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] final-row calibration active: "
-            f"train_rows={sorted(train_rows)} restored_rows={[6]} trainable_params={trainable}/{total}"
-        )
-
-    def _restore_v94_frozen_rows(self) -> None:
-        if not self._v94_restore_rows:
-            return
-        with torch.no_grad():
-            for param, row_mask, snapshot in self._v94_restore_rows:
-                frozen_rows = ~row_mask.to(device=param.device)
-                param.data[frozen_rows] = snapshot.to(device=param.device, dtype=param.dtype)[frozen_rows]
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v94_final_row_calibration()
-        result = super().train_step(batch)
-        self._restore_v94_frozen_rows()
-        return result
-
-
-class PengwinTrainerBICMDecoderFeatureContactV95(PengwinTrainerBICMBandFalseOnlyPrecisionV89):
-    """Dataset537 V95 decoder-feature contact separation diagnostic."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v95_decoder_feature_contact"
-    VERSION_TAG = "BICMDecoderFeatureContactV95"
-    EPOCH_ENV = "PENGWIN_BICM_V95_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V95_SAVE_EVERY"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get("PENGWIN_BICM_V95_LR", "1e-4"))
-        self._v95_configured = False
-        self._v95_restore_rows: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] decoder-feature contact lr={self.initial_lr}; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_core_row=6"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V89 core base + hard semantic-band "
-            "edge false separation for decoder-feature fine-tuning"
-        )
-        return BICMV95DecoderFeatureContactSeparationLoss()
-
-    @staticmethod
-    def _v95_masked_grad_hook(mask: torch.Tensor):
-        def _hook(grad: torch.Tensor) -> torch.Tensor:
-            return grad * mask.to(device=grad.device, dtype=grad.dtype)
-        return _hook
-
-    def _configure_v95_decoder_feature_contact(self) -> None:
-        if self._v95_configured:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V95 expected network.decoder.seg_layers for decoder-feature calibration.")
-
-        # [AUDIT][Risk:High][Scope:v95_feature_scope]
-        # V94 showed final-row calibration is not expressive enough for contact
-        # precision. V95 opens decoder features but keeps the encoder frozen and
-        # restores core row 6 after every optimizer step. Core loss gradients can
-        # still flow through the frozen core row into decoder features, preserving
-        # topology while allowing contact-edge features to separate.
-        for param in self.network.parameters():
-            param.requires_grad = False
-
-        for module_name in ("stages", "transpconvs"):
-            module = getattr(decoder, module_name, None)
-            if module is not None:
-                for param in module.parameters():
-                    param.requires_grad = True
-
-        train_rows = set(int(v) for v in self.CALIBRATION_ROWS)
-        self._v95_restore_rows = []
-        for layer_idx, seg_layer in enumerate(seg_layers):
-            for name, param in seg_layer.named_parameters(recurse=False):
-                if param.ndim < 1 or int(param.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V95 seg_layers[{layer_idx}] parameter {name!r} must have first dim "
-                        f"{BICM_V68_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                    )
-                row_mask_1d = torch.tensor(
-                    [idx in train_rows for idx in range(int(param.shape[0]))],
-                    device=param.device,
-                    dtype=torch.bool,
-                )
-                view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-                grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-                frozen_snapshot = param.detach().clone()
-                param.requires_grad = True
-                param.register_hook(self._v95_masked_grad_hook(grad_mask))
-                self._v95_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v95_configured = True
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] decoder-feature contact active: "
-            f"train_rows={sorted(train_rows)} restored_rows={[6]} trainable_params={trainable}/{total}"
-        )
-
-    def _restore_v95_frozen_rows(self) -> None:
-        if not self._v95_restore_rows:
-            return
-        with torch.no_grad():
-            for param, row_mask, snapshot in self._v95_restore_rows:
-                frozen_rows = ~row_mask.to(device=param.device)
-                param.data[frozen_rows] = snapshot.to(device=param.device, dtype=param.dtype)[frozen_rows]
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v95_decoder_feature_contact()
-        result = super().train_step(batch)
-        self._restore_v95_frozen_rows()
-        return result
-
-
-class PengwinTrainerBICMDenseBandGateV96(PengwinTrainerBICMBandFalseOnlyPrecisionV89):
-    """Dataset537 V96 dense-contact band gate calibration."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v96_dense_band_gate"
-    VERSION_TAG = "BICMDenseBandGateV96"
-    EPOCH_ENV = "PENGWIN_BICM_V96_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V96_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V96_LR"
-    CALIBRATION_ROWS = (5,)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "5e-4"))
-        self._v96_configured = False
-        self._v96_restore_rows: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] dense-band gate lr={self.initial_lr}; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} contact_contract=semantic_topology_v68"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = dense row-5 semantic-band gate "
-            "over frozen V89 edge/core/semantic rows"
-        )
-        return BICMV96DenseBandGateLoss()
-
-    @staticmethod
-    def _v96_masked_grad_hook(mask: torch.Tensor):
-        def _hook(grad: torch.Tensor) -> torch.Tensor:
-            return grad * mask.to(device=grad.device, dtype=grad.dtype)
-        return _hook
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        if self._v96_configured:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V96 expected network.decoder.seg_layers for dense-band gate calibration.")
-
-        # [AUDIT][Risk:High][Scope:v96_contact_structure]
-        # V95 failed because edge-primary contact is not separable enough at the
-        # fixed threshold. Freeze every shared feature and output row except
-        # dense contact row 5, then evaluate with semantic_topology_v68
-        # sqrt(dense_contact * edge). This isolates the structural question:
-        # whether a learned band gate can suppress edge false positives without
-        # touching the measured V89 support/core topology.
-        for param in self.network.parameters():
-            param.requires_grad = False
-
-        train_rows = set(int(v) for v in self.CALIBRATION_ROWS)
-        self._v96_restore_rows = []
-        for layer_idx, seg_layer in enumerate(seg_layers):
-            for name, param in seg_layer.named_parameters(recurse=False):
-                if param.ndim < 1 or int(param.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V96 seg_layers[{layer_idx}] parameter {name!r} must have first dim "
-                        f"{BICM_V68_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                    )
-                row_mask_1d = torch.tensor(
-                    [idx in train_rows for idx in range(int(param.shape[0]))],
-                    device=param.device,
-                    dtype=torch.bool,
-                )
-                view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-                grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-                frozen_snapshot = param.detach().clone()
-                param.requires_grad = True
-                param.register_hook(self._v96_masked_grad_hook(grad_mask))
-                self._v96_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v96_configured = True
-        restored_rows = [idx for idx in range(BICM_V68_OUTPUT_CHANNELS) if idx not in train_rows]
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] dense-band gate active: "
-            f"train_rows={sorted(train_rows)} restored_rows={restored_rows} "
-            f"trainable_params={trainable}/{total}"
-        )
-
-    def _restore_v96_frozen_rows(self) -> None:
-        if not self._v96_restore_rows:
-            return
-        with torch.no_grad():
-            for param, row_mask, snapshot in self._v96_restore_rows:
-                frozen_rows = ~row_mask.to(device=param.device)
-                param.data[frozen_rows] = snapshot.to(device=param.device, dtype=param.dtype)[frozen_rows]
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        result = super().train_step(batch)
-        self._restore_v96_frozen_rows()
-        return result
-
-
-class PengwinTrainerBICMPositiveDenseBandGateV97(PengwinTrainerBICMDenseBandGateV96):
-    """Dataset537 V97 higher-recall dense-band gate calibration."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v97_positive_dense_band_gate"
-    VERSION_TAG = "BICMPositiveDenseBandGateV97"
-    EPOCH_ENV = "PENGWIN_BICM_V97_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V97_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V97_LR"
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = higher-recall dense row-5 gate "
-            "with hard non-band suppression over frozen V89 rows"
-        )
-        return BICMV97PositiveDenseBandGateLoss()
-
-
-class PengwinTrainerBICMTeacherDistilledDenseGateV98(PengwinTrainerBICMDenseBandGateV96):
-    """Dataset537 V98 decoder-feature dense gate with frozen V89 teacher."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v98_teacher_distilled_dense_gate"
-    VERSION_TAG = "BICMTeacherDistilledDenseGateV98"
-    EPOCH_ENV = "PENGWIN_BICM_V98_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V98_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V98_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self._v98_teacher: torch.nn.Module | None = None
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V97 dense gate + V89 teacher "
-            "distillation for semantic/core/edge preservation"
-        )
-        return BICMV98TeacherDistilledDenseGateLoss()
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        if self._v96_configured:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V98 expected network.decoder.seg_layers for teacher-distilled gate calibration.")
-
-        # [AUDIT][Risk:High][Scope:v98_teacher_snapshot]
-        # Snapshot the fully initialized V89 network before opening decoder
-        # features. This teacher is the measured-safe support/core/edge state;
-        # it is not updated, and no full-volume metric feeds back into it.
-        self._v98_teacher = copy.deepcopy(self.network).to(self.device)
-        self._v98_teacher.eval()
-        for param in self._v98_teacher.parameters():
-            param.requires_grad = False
-
-        for param in self.network.parameters():
-            param.requires_grad = False
-
-        decoder = getattr(self.network, "decoder", None)
-        assert decoder is not None
-        for module_name in ("stages", "transpconvs"):
-            module = getattr(decoder, module_name, None)
-            if module is not None:
-                for param in module.parameters():
-                    param.requires_grad = True
-
-        train_rows = set(int(v) for v in self.CALIBRATION_ROWS)
-        self._v96_restore_rows = []
-        for layer_idx, seg_layer in enumerate(seg_layers):
-            for name, param in seg_layer.named_parameters(recurse=False):
-                if param.ndim < 1 or int(param.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V98 seg_layers[{layer_idx}] parameter {name!r} must have first dim "
-                        f"{BICM_V68_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                    )
-                row_mask_1d = torch.tensor(
-                    [idx in train_rows for idx in range(int(param.shape[0]))],
-                    device=param.device,
-                    dtype=torch.bool,
-                )
-                view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-                grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-                frozen_snapshot = param.detach().clone()
-                param.requires_grad = True
-                param.register_hook(self._v96_masked_grad_hook(grad_mask))
-                self._v96_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v96_configured = True
-        restored_rows = [idx for idx in range(BICM_V68_OUTPUT_CHANNELS) if idx not in train_rows]
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] teacher-distilled dense gate active: "
-            f"decoder_features=on train_rows={sorted(train_rows)} "
-            f"restored_rows={restored_rows} trainable_params={trainable}/{total}"
-        )
-
-    def _teacher_logits(self, data: torch.Tensor) -> torch.Tensor:
-        if self._v98_teacher is None:
-            raise RuntimeError("V98 teacher network is not configured.")
-        with torch.no_grad():
-            with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-                return self._v98_teacher(data).detach()
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        data, target = self._move_v38_batch(batch)
-        target["teacher_logits"] = self._teacher_logits(data)
-        self.optimizer.zero_grad(set_to_none=True)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-        self._restore_v96_frozen_rows()
-        return {"loss": loss.detach().cpu().numpy()}
-
-    def validation_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        data, target = self._move_v38_batch(batch)
-        target["teacher_logits"] = self._teacher_logits(data)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        logits = output.float()
-        sem_prob = torch.softmax(logits[:, 0:5], dim=1)
-        sem_pred = sem_prob.argmax(dim=1)
-        dense_contact = torch.sigmoid(logits[:, 5])
-        edge_prob = torch.sigmoid(logits[:, 7:10]).amax(dim=1)
-        contact_p = torch.sqrt((dense_contact * edge_prob).clamp(1e-6, 1.0)) > 0.5
-        core_p = torch.sigmoid(logits[:, 6]) > 0.5
-        edge_p = torch.sigmoid(logits[:, 7:10]) > 0.5
-        support_p = (sem_pred == 2) | (sem_pred == 3) | (sem_pred == 4)
-        exterior_p = sem_pred == 1
-        support_t = target["support"][:, 0] > 0.5
-        contact_t = self.loss._semantic_contact_band(target["semantic"]).to(logits.device)
-        core_t = target["core"][:, 0] > 0.5
-        exterior_t = target["exterior"][:, 0] > 0.5
-        edge_t = target["edge_break"] > 0.5
-        edge_valid = target["edge_valid"] > 0.5
-        support_prf = self._precision_recall_fbeta(self._binary_counts(support_p, support_t), beta=1.0)
-        contact_prf = self._precision_recall_fbeta(self._binary_counts(contact_p, contact_t), beta=0.5)
-        core_prf = self._precision_recall_fbeta(self._binary_counts(core_p, core_t), beta=1.0)
-        exterior_prf = self._precision_recall_fbeta(self._binary_counts(exterior_p, exterior_t), beta=1.0)
-        edge_prf = (
-            self._precision_recall_fbeta(self._binary_counts(edge_p[edge_valid], edge_t[edge_valid]), beta=0.5)
-            if edge_valid.any() else (0.0, 0.0, 0.0)
-        )
-        score = (
-            0.25 * support_prf[2]
-            + 0.30 * contact_prf[2]
-            + 0.20 * core_prf[2]
-            + 0.20 * edge_prf[2]
-            + 0.05 * exterior_prf[2]
-        )
-        metrics = {
-            "score": float(score),
-            "support_precision": support_prf[0],
-            "support_recall": support_prf[1],
-            "support_f1": support_prf[2],
-            "contact_precision": contact_prf[0],
-            "contact_recall": contact_prf[1],
-            "contact_f0_5": contact_prf[2],
-            "core_precision": core_prf[0],
-            "core_recall": core_prf[1],
-            "core_f1": core_prf[2],
-            "edge_precision": edge_prf[0],
-            "edge_recall": edge_prf[1],
-            "edge_f0_5": edge_prf[2],
-            "exterior_f1": exterior_prf[2],
-        }
-        # [QA][Status:Required][Scope:v98_validation_logging]
-        # V38-family epoch_end reads metrics directly from the logger instead
-        # of aggregating returned val_outputs. Log here so teacher-distilled
-        # validation remains compatible with the existing checkpoint gate.
-        self._last_v38_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_prf[2], contact_prf[2], core_prf[2], edge_prf[2]],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-
-class PengwinTrainerBICMAdaptiveDualMarginDenseGateV99(PengwinTrainerBICMDenseBandGateV96):
-    """Dataset537 V99 adaptive dense-gate precision/recall calibration."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v99_adaptive_dual_margin_dense_gate"
-    VERSION_TAG = "BICMAdaptiveDualMarginDenseGateV99"
-    EPOCH_ENV = "PENGWIN_BICM_V99_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V99_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V99_LR"
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = adaptive dense row-5 gate "
-            "with positive-unlocked hard non-band precision"
-        )
-        return BICMV99AdaptiveDualMarginDenseGateLoss()
-
-
-class PengwinTrainerBICMNegativeBalancedDenseGateV100(PengwinTrainerBICMAdaptiveDualMarginDenseGateV99):
-    """Dataset537 V100 V99 loss with support/hard-negative crop balance."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v100_negative_balanced_dense_gate"
-    VERSION_TAG = "BICMNegativeBalancedDenseGateV100"
-    EPOCH_ENV = "PENGWIN_BICM_V100_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V100_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V100_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.oversample_foreground_percent = float(os.environ.get("PENGWIN_BICM_V100_OVERSAMPLE_FG", "0.80"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] negative-balanced sampler active: "
-            f"oversample_fg={self.oversample_foreground_percent:.2f} "
-            "train_center_probs=edge0.35/support_neg0.40/tiny0.05/hard0.15"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V99 adaptive dense gate; changed variable = crop negative exposure"
-        )
-        return BICMV99AdaptiveDualMarginDenseGateLoss()
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        if not sidecar_dir.is_dir():
-            raise FileNotFoundError(
-                f"BICM V5 instance sidecar directory missing: {sidecar_dir}. "
-                "Run `python code_task1/preprocessing.py build-bicm-v5-sidecars --dataset 537`."
-            )
-        # [DATA][Risk:High][Scope:full_volume_false_contact]
-        # V96-V99 changed row-5 losses but the V38-family loader still forced
-        # every train crop to a foreground center with only 20% support-negative
-        # priority. Full-volume probes then showed the same tradeoff: recall opens
-        # only by painting large support interiors as contact. V100 changes only
-        # crop exposure: more support/hard negatives and a small random-crop budget
-        # while keeping V99 loss, V89 warm-start, output contract, and decoder.
-        dl_tr = PengwinBICMV5EdgeAffinityDataLoader3D(
-            dataset_tr, self.batch_size, patch_size, self.configuration_manager.patch_size,
-            self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent,
-            sampling_probabilities=None, pad_sides=None, transforms=None,
-            sidecar_dir=sidecar_dir,
-            instance_center_core_radius_vox=getattr(self, "INSTANCE_CENTER_CORE_RADIUS_VOX", None),
-            edge_center_probability=0.35,
-            support_negative_center_probability=0.40,
-            tiny_center_probability=0.05,
-            hard_negative_center_probability=0.15,
-        )
-        dl_val = PengwinBICMV5EdgeAffinityDataLoader3D(
-            dataset_val, self.batch_size, self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size, self.label_manager,
-            oversample_foreground_percent=0.50, sampling_probabilities=None,
-            pad_sides=None, transforms=None, sidecar_dir=sidecar_dir,
-            instance_center_core_radius_vox=getattr(self, "INSTANCE_CENTER_CORE_RADIUS_VOX", None),
-            edge_center_probability=0.35,
-            support_negative_center_probability=0.35,
-            tiny_center_probability=0.10,
-            hard_negative_center_probability=0.10,
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-
-class PengwinTrainerBICMDualFieldProductGateV101(PengwinTrainerBICMNegativeBalancedDenseGateV100):
-    """Dataset537 V101 train dense precision and edge recall rows jointly."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v101_dual_field_product_gate"
-    VERSION_TAG = "BICMDualFieldProductGateV101"
-    EPOCH_ENV = "PENGWIN_BICM_V101_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V101_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V101_LR"
-    CALIBRATION_ROWS = (5, 7, 8, 9)
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = dual-field semantic-band product gate "
-            "with train_rows=[5,7,8,9] and preserved semantic/core rows"
-        )
-        return BICMV101DualFieldProductGateLoss()
-
-
-class PengwinTrainerBICMDistanceRankDenseGateV102(PengwinTrainerBICMNegativeBalancedDenseGateV100):
-    """Dataset537 V102 train row 5 with distance-ranked contact shoulders."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v102_distance_rank_dense_gate"
-    VERSION_TAG = "BICMDistanceRankDenseGateV102"
-    EPOCH_ENV = "PENGWIN_BICM_V102_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V102_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V102_LR"
-    CALIBRATION_ROWS = (5,)
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = distance-ranked dense row-5 gate "
-            "with below-threshold contact shoulders and preserved V89 rows"
-        )
-        return BICMV102DistanceRankDenseGateLoss()
-
-
-class PengwinTrainerBICMSemanticDistanceContactV103(PengwinTrainerBICMNegativeBalancedDenseGateV100):
-    """Dataset537 V103 train semantic row 4 as the direct contact field."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v103_semantic_distance_contact"
-    VERSION_TAG = "BICMSemanticDistanceContactV103"
-    EPOCH_ENV = "PENGWIN_BICM_V103_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V103_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V103_LR"
-    CALIBRATION_ROWS = (4,)
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic row-4 distance-ranked contact "
-            "with preserved support/core/edge rows"
-        )
-        return BICMV103SemanticDistanceContactLoss()
-
-
-class PengwinTrainerBICMTeacherSemanticContactV104(PengwinTrainerBICMTeacherDistilledDenseGateV98):
-    """Dataset537 V104 train semantic contact with decoder-feature capacity."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v104_teacher_semantic_contact"
-    VERSION_TAG = "BICMTeacherSemanticContactV104"
-    EPOCH_ENV = "PENGWIN_BICM_V104_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V104_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V104_LR"
-    CALIBRATION_ROWS = (4,)
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = decoder-feature semantic row-4 contact "
-            "with V89 teacher preservation for support/core/edge rows"
-        )
-        return BICMV104TeacherDistilledSemanticContactLoss()
-
-    def validation_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        data, target = self._move_v38_batch(batch)
-        target["teacher_logits"] = self._teacher_logits(data)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        logits = output.float()
-        sem_prob = torch.softmax(logits[:, 0:5], dim=1)
-        sem_pred = sem_prob.argmax(dim=1)
-        contact_p = sem_prob[:, 4] > 0.5
-        core_p = torch.sigmoid(logits[:, 6]) > 0.5
-        edge_p = torch.sigmoid(logits[:, 7:10]) > 0.5
-        support_p = (sem_pred == 2) | (sem_pred == 3) | (sem_pred == 4)
-        exterior_p = sem_pred == 1
-        support_t = target["support"][:, 0] > 0.5
-        contact_t = self.loss._semantic_contact_band(target["semantic"]).to(logits.device)
-        core_t = target["core"][:, 0] > 0.5
-        exterior_t = target["exterior"][:, 0] > 0.5
-        edge_t = target["edge_break"] > 0.5
-        edge_valid = target["edge_valid"] > 0.5
-        support_prf = self._precision_recall_fbeta(self._binary_counts(support_p, support_t), beta=1.0)
-        contact_prf = self._precision_recall_fbeta(self._binary_counts(contact_p, contact_t), beta=0.5)
-        core_prf = self._precision_recall_fbeta(self._binary_counts(core_p, core_t), beta=1.0)
-        exterior_prf = self._precision_recall_fbeta(self._binary_counts(exterior_p, exterior_t), beta=1.0)
-        edge_prf = (
-            self._precision_recall_fbeta(self._binary_counts(edge_p[edge_valid], edge_t[edge_valid]), beta=0.5)
-            if edge_valid.any() else (0.0, 0.0, 0.0)
-        )
-        score = (
-            0.25 * support_prf[2]
-            + 0.30 * contact_prf[2]
-            + 0.20 * core_prf[2]
-            + 0.20 * edge_prf[2]
-            + 0.05 * exterior_prf[2]
-        )
-        metrics = {
-            "score": float(score),
-            "support_precision": support_prf[0],
-            "support_recall": support_prf[1],
-            "support_f1": support_prf[2],
-            "contact_precision": contact_prf[0],
-            "contact_recall": contact_prf[1],
-            "contact_f0_5": contact_prf[2],
-            "core_precision": core_prf[0],
-            "core_recall": core_prf[1],
-            "core_f1": core_prf[2],
-            "edge_precision": edge_prf[0],
-            "edge_recall": edge_prf[1],
-            "edge_f0_5": edge_prf[2],
-            "exterior_f1": exterior_prf[2],
-        }
-        self._last_v38_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_prf[2], contact_prf[2], core_prf[2], edge_prf[2]],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-
-class PengwinTrainerBICMOffsetAssignmentV105(PengwinTrainerBICMTeacherDistilledDenseGateV98):
-    """Dataset537 V105 direct fragment assignment via center-offset rows."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v105_offset_assignment"
-    VERSION_TAG = "BICMOffsetAssignmentV105"
-    EPOCH_ENV = "PENGWIN_BICM_V105_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V105_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V105_LR"
-    CALIBRATION_ROWS = (5, 7, 8, 9)
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BICM_V105_OVERSAMPLE_FG",
-            os.environ.get("PENGWIN_BICM_V100_OVERSAMPLE_FG", str(self.oversample_foreground_percent)),
-        ))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] offset-assignment active: "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,6] "
-            f"lr={self.initial_lr} oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = direct row-5 contact metric + rows 7..9 center-offset regression "
-            "with V89 teacher preservation for semantic/core rows"
-        )
-        return BICMV105OffsetAssignmentLoss()
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        if not sidecar_dir.is_dir():
-            raise FileNotFoundError(
-                f"BICM V5 instance sidecar directory missing: {sidecar_dir}. "
-                "Run `python code_task1/preprocessing.py build-bicm-v5-sidecars --dataset 537`."
-            )
-        # [DATA][Risk:High][Scope:v105_offset_assignment]
-        # Keep V100's negative-balanced crop exposure so V105 changes the split
-        # representation instead of returning to contact-positive-only crops.
-        # The new offset target is generated by the shared V38-family loader.
-        dl_tr = PengwinBICMV5EdgeAffinityDataLoader3D(
-            dataset_tr, self.batch_size, patch_size, self.configuration_manager.patch_size,
-            self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent,
-            sampling_probabilities=None, pad_sides=None, transforms=None,
-            sidecar_dir=sidecar_dir,
-            instance_center_core_radius_vox=getattr(self, "INSTANCE_CENTER_CORE_RADIUS_VOX", None),
-            edge_center_probability=0.35,
-            support_negative_center_probability=0.40,
-            tiny_center_probability=0.05,
-            hard_negative_center_probability=0.15,
-        )
-        dl_val = PengwinBICMV5EdgeAffinityDataLoader3D(
-            dataset_val, self.batch_size, self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size, self.label_manager,
-            oversample_foreground_percent=0.50, sampling_probabilities=None,
-            pad_sides=None, transforms=None, sidecar_dir=sidecar_dir,
-            instance_center_core_radius_vox=getattr(self, "INSTANCE_CENTER_CORE_RADIUS_VOX", None),
-            edge_center_probability=0.35,
-            support_negative_center_probability=0.35,
-            tiny_center_probability=0.10,
-            hard_negative_center_probability=0.10,
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-    def validation_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        data, target = self._move_v38_batch(batch)
-        target["teacher_logits"] = self._teacher_logits(data)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        logits = output.float()
-        sem_prob = torch.softmax(logits[:, 0:5], dim=1)
-        sem_pred = sem_prob.argmax(dim=1)
-        contact_p = torch.sigmoid(logits[:, 5]) > 0.5
-        core_p = torch.sigmoid(logits[:, 6]) > 0.5
-        support_p = (sem_pred == 2) | (sem_pred == 3) | (sem_pred == 4)
-        exterior_p = sem_pred == 1
-        support_t = target["support"][:, 0] > 0.5
-        contact_t = self.loss._semantic_contact_band(target["semantic"]).to(logits.device)
-        core_t = target["core"][:, 0] > 0.5
-        exterior_t = target["exterior"][:, 0] > 0.5
-        offset_t = target["offset"].to(device=logits.device, dtype=logits.dtype)
-        offset_mask = support_t.unsqueeze(1).expand_as(offset_t)
-        if offset_mask.any():
-            offset_mae_vox = float((logits[:, 7:10][offset_mask] - offset_t[offset_mask]).abs().mean().detach().cpu()) * 64.0
-        else:
-            offset_mae_vox = 0.0
-        offset_score = 1.0 / (1.0 + float(offset_mae_vox))
-        support_prf = self._precision_recall_fbeta(self._binary_counts(support_p, support_t), beta=1.0)
-        contact_prf = self._precision_recall_fbeta(self._binary_counts(contact_p, contact_t), beta=0.5)
-        core_prf = self._precision_recall_fbeta(self._binary_counts(core_p, core_t), beta=1.0)
-        exterior_prf = self._precision_recall_fbeta(self._binary_counts(exterior_p, exterior_t), beta=1.0)
-        score = (
-            0.25 * support_prf[2]
-            + 0.25 * contact_prf[2]
-            + 0.20 * core_prf[2]
-            + 0.20 * offset_score
-            + 0.10 * exterior_prf[2]
-        )
-        metrics = {
-            "score": float(score),
-            "support_precision": support_prf[0],
-            "support_recall": support_prf[1],
-            "support_f1": support_prf[2],
-            "contact_precision": contact_prf[0],
-            "contact_recall": contact_prf[1],
-            "contact_f0_5": contact_prf[2],
-            "core_precision": core_prf[0],
-            "core_recall": core_prf[1],
-            "core_f1": core_prf[2],
-            "offset_mae_vox": offset_mae_vox,
-            "offset_score": float(offset_score),
-            "exterior_f1": exterior_prf[2],
-        }
-        self._last_v38_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_prf[2], contact_prf[2], core_prf[2], float(offset_score)],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-
-class PengwinTrainerBICMOffsetAttractorV106(PengwinTrainerBICMOffsetAssignmentV105):
-    """Dataset537 V106 reset offset rows and train endpoint-attractor offsets."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v106_offset_attractor"
-    VERSION_TAG = "BICMOffsetAttractorV106"
-    EPOCH_ENV = "PENGWIN_BICM_V106_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V106_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V106_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self._v106_offset_rows_reset = False
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=zero_init_offset_rows_plus_endpoint_attractor_loss"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V105 contact metric + endpoint/direction/norm/hard-tail offset attractor"
-        )
-        return BICMV106OffsetAttractorLoss()
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        super()._configure_v96_dense_band_gate()
-        if self._v106_offset_rows_reset:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V106 expected network.decoder.seg_layers for offset row reset.")
-        with torch.no_grad():
-            for layer_idx, seg_layer in enumerate(seg_layers):
-                weight = getattr(seg_layer, "weight", None)
-                bias = getattr(seg_layer, "bias", None)
-                if weight is None or int(weight.shape[0]) != int(BICM_V68_OUTPUT_CHANNELS):
-                    raise RuntimeError(
-                        f"V106 seg_layers[{layer_idx}] weight must have 10 output rows, "
-                        f"got {None if weight is None else tuple(weight.shape)}"
-                    )
-                # [AUDIT][Risk:High][Scope:v106_offset_initialization]
-                # V105 initialized raw offset rows from V89 edge-break logits.
-                # Oracle diagnostics showed those predicted offsets are the main
-                # assignment failure. Reset only trainable rows 7..9 after the V89
-                # teacher snapshot and pretrained load; preserved rows remain V89.
-                weight[7:10].zero_()
-                if bias is not None:
-                    bias[7:10].zero_()
-        self._v106_offset_rows_reset = True
-        self.print_to_log_file(f"[{self.VERSION_TAG}] reset offset rows 7..9 to zero after V89 teacher snapshot")
-
-
-class PengwinTrainerBICMRadialSupportOffsetV107(PengwinTrainerBICMOffsetAttractorV106):
-    """Dataset537 V107 radial offset recovery with support/core calibration."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v107_radial_support_offset"
-    VERSION_TAG = "BICMRadialSupportOffsetV107"
-    EPOCH_ENV = "PENGWIN_BICM_V107_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V107_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V107_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=radial_offset_projection_plus_support_false_positive_calibration; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[6]"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V106 offset reset + radial projection, "
-            "support hard false suppression, contact mass floor, and core precision guard"
-        )
-        return BICMV107RadialSupportOffsetLoss()
-
-
-class PengwinTrainerBICMWatershedBarrierV108(PengwinTrainerBICMTeacherDistilledDenseGateV98):
-    """Dataset537 V108 edge-primary watershed barrier refinement."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v108_watershed_barrier"
-    VERSION_TAG = "BICMWatershedBarrierV108"
-    EPOCH_ENV = "PENGWIN_BICM_V108_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V108_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V108_LR"
-    CALIBRATION_ROWS = (7, 8, 9)
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BICM_V108_OVERSAMPLE_FG",
-            os.environ.get("PENGWIN_BICM_V100_OVERSAMPLE_FG", str(self.oversample_foreground_percent)),
-        ))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=edge_primary_watershed_barrier_after_offset_rejection; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,5,6] "
-            f"lr={self.initial_lr} oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V89/V91 topology base + teacher-preserved "
-            "edge-primary contact barrier for V92 peak17 watershed"
-        )
-        return BICMV108WatershedBarrierLoss()
-
-    def validation_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        data, target = self._move_v38_batch(batch)
-        target["teacher_logits"] = self._teacher_logits(data)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        logits = output.float()
-        sem_prob = torch.softmax(logits[:, 0:5], dim=1)
-        sem_pred = sem_prob.argmax(dim=1)
-        edge_prob = torch.sigmoid(logits[:, 7:10]).amax(dim=1)
-        contact_p = edge_prob > 0.5
-        core_p = torch.sigmoid(logits[:, 6]) > 0.5
-        edge_p = torch.sigmoid(logits[:, 7:10]) > 0.5
-        support_p = (sem_pred == 2) | (sem_pred == 3) | (sem_pred == 4)
-        exterior_p = sem_pred == 1
-        support_t = target["support"][:, 0] > 0.5
-        contact_t = self.loss._semantic_contact_band(target["semantic"]).to(logits.device)
-        core_t = target["core"][:, 0] > 0.5
-        exterior_t = target["exterior"][:, 0] > 0.5
-        edge_t = target["edge_break"] > 0.5
-        edge_valid = target["edge_valid"] > 0.5
-        support_prf = self._precision_recall_fbeta(self._binary_counts(support_p, support_t), beta=1.0)
-        contact_prf = self._precision_recall_fbeta(self._binary_counts(contact_p, contact_t), beta=0.5)
-        core_prf = self._precision_recall_fbeta(self._binary_counts(core_p, core_t), beta=1.0)
-        exterior_prf = self._precision_recall_fbeta(self._binary_counts(exterior_p, exterior_t), beta=1.0)
-        edge_prf = (
-            self._precision_recall_fbeta(self._binary_counts(edge_p[edge_valid], edge_t[edge_valid]), beta=0.5)
-            if edge_valid.any() else (0.0, 0.0, 0.0)
-        )
-        score = (
-            0.20 * support_prf[2]
-            + 0.40 * contact_prf[2]
-            + 0.20 * core_prf[2]
-            + 0.15 * edge_prf[2]
-            + 0.05 * exterior_prf[2]
-        )
-        metrics = {
-            "score": float(score),
-            "support_precision": support_prf[0],
-            "support_recall": support_prf[1],
-            "support_f1": support_prf[2],
-            "contact_precision": contact_prf[0],
-            "contact_recall": contact_prf[1],
-            "contact_f0_5": contact_prf[2],
-            "core_precision": core_prf[0],
-            "core_recall": core_prf[1],
-            "core_f1": core_prf[2],
-            "edge_precision": edge_prf[0],
-            "edge_recall": edge_prf[1],
-            "edge_f0_5": edge_prf[2],
-            "exterior_f1": exterior_prf[2],
-        }
-        self._last_v38_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_prf[2], contact_prf[2], core_prf[2], edge_prf[2]],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-
-class PengwinTrainerBICMPrecisionLockedRecallV109(PengwinTrainerBICMDenseBandGateV96):
-    """Dataset537 V109 row-5 staged recall expansion from V96 precision state."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v109_precision_locked_recall"
-    VERSION_TAG = "BICMPrecisionLockedRecallV109"
-    EPOCH_ENV = "PENGWIN_BICM_V109_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V109_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V109_LR"
-    CALIBRATION_ROWS = (5,)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "8e-5"))
-        self.oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BICM_V109_OVERSAMPLE_FG",
-            os.environ.get("PENGWIN_BICM_V100_OVERSAMPLE_FG", str(self.oversample_foreground_percent)),
-        ))
-        self._v109_teacher: torch.nn.Module | None = None
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=precision_locked_row5_recall_from_v96; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,6,7,8,9] "
-            f"lr={self.initial_lr} oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V96 row-5 continuation with teacher negative-expansion lock "
-            "and positive soft-threshold recall floor"
-        )
-        return BICMV109PrecisionLockedRecallLoss()
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        if self._v96_configured:
-            return
-        # [AUDIT][Risk:High][Scope:v109_teacher_snapshot]
-        # V109 is only meaningful when initialized from the measured V96 e10
-        # precision-safe checkpoint. Snapshot the fully loaded network before
-        # any row-5 update so the loss can penalize negative expansion relative
-        # to that exact state, not relative to V89 or a moving student.
-        self._v109_teacher = copy.deepcopy(self.network).to(self.device)
-        self._v109_teacher.eval()
-        for param in self._v109_teacher.parameters():
-            param.requires_grad = False
-        super()._configure_v96_dense_band_gate()
-
-    def _teacher_logits(self, data: torch.Tensor) -> torch.Tensor:
-        if self._v109_teacher is None:
-            raise RuntimeError("V109 teacher network is not configured.")
-        with torch.no_grad():
-            with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-                return self._v109_teacher(data).detach()
-
-    def train_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        data, target = self._move_v38_batch(batch)
-        target["teacher_logits"] = self._teacher_logits(data)
-        self.optimizer.zero_grad(set_to_none=True)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-        self._restore_v96_frozen_rows()
-        return {"loss": loss.detach().cpu().numpy()}
-
-    def validation_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        data, target = self._move_v38_batch(batch)
-        target["teacher_logits"] = self._teacher_logits(data)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        logits = output.float()
-        sem_prob = torch.softmax(logits[:, 0:5], dim=1)
-        sem_pred = sem_prob.argmax(dim=1)
-        dense_contact = torch.sigmoid(logits[:, 5])
-        edge_prob = torch.sigmoid(logits[:, 7:10]).amax(dim=1)
-        contact_p = torch.sqrt((dense_contact * edge_prob).clamp(1e-6, 1.0)) > 0.5
-        core_p = torch.sigmoid(logits[:, 6]) > 0.5
-        edge_p = torch.sigmoid(logits[:, 7:10]) > 0.5
-        support_p = (sem_pred == 2) | (sem_pred == 3) | (sem_pred == 4)
-        exterior_p = sem_pred == 1
-        support_t = target["support"][:, 0] > 0.5
-        contact_t = self.loss._semantic_contact_band(target["semantic"]).to(logits.device)
-        core_t = target["core"][:, 0] > 0.5
-        exterior_t = target["exterior"][:, 0] > 0.5
-        edge_t = target["edge_break"] > 0.5
-        edge_valid = target["edge_valid"] > 0.5
-        support_prf = self._precision_recall_fbeta(self._binary_counts(support_p, support_t), beta=1.0)
-        contact_prf = self._precision_recall_fbeta(self._binary_counts(contact_p, contact_t), beta=0.5)
-        core_prf = self._precision_recall_fbeta(self._binary_counts(core_p, core_t), beta=1.0)
-        exterior_prf = self._precision_recall_fbeta(self._binary_counts(exterior_p, exterior_t), beta=1.0)
-        edge_prf = (
-            self._precision_recall_fbeta(self._binary_counts(edge_p[edge_valid], edge_t[edge_valid]), beta=0.5)
-            if edge_valid.any() else (0.0, 0.0, 0.0)
-        )
-        score = (
-            0.25 * support_prf[2]
-            + 0.35 * contact_prf[2]
-            + 0.20 * core_prf[2]
-            + 0.15 * edge_prf[2]
-            + 0.05 * exterior_prf[2]
-        )
-        metrics = {
-            "score": float(score),
-            "support_precision": support_prf[0],
-            "support_recall": support_prf[1],
-            "support_f1": support_prf[2],
-            "contact_precision": contact_prf[0],
-            "contact_recall": contact_prf[1],
-            "contact_f0_5": contact_prf[2],
-            "core_precision": core_prf[0],
-            "core_recall": core_prf[1],
-            "core_f1": core_prf[2],
-            "edge_precision": edge_prf[0],
-            "edge_recall": edge_prf[1],
-            "edge_f0_5": edge_prf[2],
-            "exterior_f1": exterior_prf[2],
-        }
-        self._last_v38_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_prf[2], contact_prf[2], core_prf[2], edge_prf[2]],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-
-class PengwinTrainerBICMSemanticGeometryBridgeV110(PengwinTrainerBICMDenseBandGateV96):
-    """Dataset537 V110 semantic support/contact geometry bridge."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v110_semantic_geometry_bridge"
-    VERSION_TAG = "BICMSemanticGeometryBridgeV110"
-    EPOCH_ENV = "PENGWIN_BICM_V110_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V110_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V110_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "1.2e-4"))
-        self.oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BICM_V110_OVERSAMPLE_FG",
-            os.environ.get("PENGWIN_BICM_V100_OVERSAMPLE_FG", str(self.oversample_foreground_percent)),
-        ))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=semantic_support_contact_geometry_after_oracle_bridge; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"contact_contract=v68_semantic_contact lr={self.initial_lr} "
-            f"oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic CE/support geometry + direct semantic contact "
-            "after GT semantic/contact mixed oracle passed with predicted core"
-        )
-        return BICMV110SemanticGeometryBridgeLoss()
-
-    def validation_step(self, batch: dict) -> dict:
-        self._configure_v96_dense_band_gate()
-        data, target = self._move_v38_batch(batch)
-        if hasattr(self.loss, "set_current_epoch"):
-            self.loss.set_current_epoch(int(self.current_epoch))
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        logits = output.float()
-        sem_prob = torch.softmax(logits[:, 0:5], dim=1)
-        sem_pred = sem_prob.argmax(dim=1)
-        contact_p = sem_prob[:, 4] > 0.5
-        core_p = torch.sigmoid(logits[:, 6]) > 0.5
-        edge_p = torch.sigmoid(logits[:, 7:10]) > 0.5
-        support_p = (sem_pred == 2) | (sem_pred == 3) | (sem_pred == 4)
-        exterior_p = sem_pred == 1
-        support_t = target["support"][:, 0] > 0.5
-        contact_t = self.loss._semantic_contact_band(target["semantic"]).to(logits.device)
-        core_t = target["core"][:, 0] > 0.5
-        exterior_t = target["exterior"][:, 0] > 0.5
-        edge_t = target["edge_break"] > 0.5
-        edge_valid = target["edge_valid"] > 0.5
-        support_prf = self._precision_recall_fbeta(self._binary_counts(support_p, support_t), beta=1.0)
-        contact_prf = self._precision_recall_fbeta(self._binary_counts(contact_p, contact_t), beta=0.5)
-        core_prf = self._precision_recall_fbeta(self._binary_counts(core_p, core_t), beta=1.0)
-        exterior_prf = self._precision_recall_fbeta(self._binary_counts(exterior_p, exterior_t), beta=1.0)
-        edge_prf = (
-            self._precision_recall_fbeta(self._binary_counts(edge_p[edge_valid], edge_t[edge_valid]), beta=0.5)
-            if edge_valid.any() else (0.0, 0.0, 0.0)
-        )
-        score = (
-            0.30 * support_prf[2]
-            + 0.38 * contact_prf[2]
-            + 0.17 * core_prf[2]
-            + 0.10 * edge_prf[2]
-            + 0.05 * exterior_prf[2]
-        )
-        metrics = {
-            "score": float(score),
-            "support_precision": support_prf[0],
-            "support_recall": support_prf[1],
-            "support_f1": support_prf[2],
-            "contact_precision": contact_prf[0],
-            "contact_recall": contact_prf[1],
-            "contact_f0_5": contact_prf[2],
-            "core_precision": core_prf[0],
-            "core_recall": core_prf[1],
-            "core_f1": core_prf[2],
-            "edge_precision": edge_prf[0],
-            "edge_recall": edge_prf[1],
-            "edge_f0_5": edge_prf[2],
-            "exterior_f1": exterior_prf[2],
-        }
-        self._last_v38_metrics = metrics
-        self.logger.log("mean_fg_dice", float(score), self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_prf[2], contact_prf[2], core_prf[2], edge_prf[2]],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss.detach().cpu().numpy(), self.current_epoch)
-        return {"loss": loss.detach().cpu().numpy()}
-
-
-class PengwinTrainerBICMJointSupportProductV111(PengwinTrainerBICMTeacherDistilledDenseGateV98):
-    """Dataset537 V111 joint support and dense/edge product repair."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v111_joint_support_product"
-    VERSION_TAG = "BICMJointSupportProductV111"
-    EPOCH_ENV = "PENGWIN_BICM_V111_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V111_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V111_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "4e-5"))
-        self.oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BICM_V111_OVERSAMPLE_FG",
-            os.environ.get("PENGWIN_BICM_V100_OVERSAMPLE_FG", str(self.oversample_foreground_percent)),
-        ))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=decoder_feature_joint_support_product_contact; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[6] "
-            f"contact_contract=semantic_topology_v68 lr={self.initial_lr} "
-            f"oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic support geometry + dense/edge product contact "
-            "with teacher-preserved row6 core after V110 semantic-contact failure"
-        )
-        return BICMV111JointSupportProductLoss()
-
-
-class PengwinTrainerBICMEdgeGraphAssignmentV112(PengwinTrainerBICMJointSupportProductV111):
-    """Dataset537 V112 edge-break graph assignment trainer."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v112_edge_graph_assignment"
-    VERSION_TAG = "BICMEdgeGraphAssignmentV112"
-    EPOCH_ENV = "PENGWIN_BICM_V112_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V112_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V112_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "6e-5"))
-        self.oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BICM_V112_OVERSAMPLE_FG",
-            os.environ.get("PENGWIN_BICM_V111_OVERSAMPLE_FG", str(self.oversample_foreground_percent)),
-        ))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=edge_break_graph_assignment_contract; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[6] "
-            f"decoder_profile=bicm_v112_edge_graph_assignment "
-            f"contact_contract=v68_edge_primary lr={self.initial_lr} "
-            f"oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = local edge-break graph cuts + edge-primary contact band "
-            "with teacher-preserved row6 core"
-        )
-        return BICMV112EdgeGraphAssignmentLoss()
-
-
-class PengwinTrainerBICMAdaptiveBoundaryProductV113(PengwinTrainerBICMJointSupportProductV111):
-    """Dataset537 V113 adaptive boundary/product trainer."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v113_adaptive_boundary_product"
-    VERSION_TAG = "BICMAdaptiveBoundaryProductV113"
-    EPOCH_ENV = "PENGWIN_BICM_V113_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V113_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V113_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "5e-5"))
-        self.oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BICM_V113_OVERSAMPLE_FG",
-            os.environ.get("PENGWIN_BICM_V111_OVERSAMPLE_FG", str(self.oversample_foreground_percent)),
-        ))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=boundary_weighted_support_adaptive_product_contact; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[6] "
-            f"decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=semantic_topology_v68 lr={self.initial_lr} "
-            f"oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = support-boundary semantic repair + adaptive dense/edge product "
-            "with teacher-preserved row6 core"
-        )
-        return BICMV113AdaptiveBoundaryProductLoss()
-
-
-class PengwinTrainerBICMAdaptiveBoundaryProductV113HighLR(PengwinTrainerBICMAdaptiveBoundaryProductV113):
-    """Dataset537 V113 high-LR sensitivity probe with the same loss contract."""
-
-    VERSION_TAG = "BICMAdaptiveBoundaryProductV113HighLR"
-    EPOCH_ENV = "PENGWIN_BICM_V113H_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V113H_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V113H_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "8e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=lr_sensitivity_only; "
-            f"loss_profile={self.DEFAULT_LOSS_PROFILE} lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMEncoderAdapterV114(PengwinTrainerBICMAdaptiveBoundaryProductV113):
-    """Dataset537 V114 opens late encoder capacity under the V113 loss."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v114_encoder_adapter_boundary_product"
-    VERSION_TAG = "BICMEncoderAdapterV114"
-    EPOCH_ENV = "PENGWIN_BICM_V114_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V114_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V114_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=late_encoder_adapter_capacity; "
-            f"loss_profile={self.DEFAULT_LOSS_PROFILE} lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V113 adaptive boundary/product objective; "
-            "changed variable is trainable late encoder capacity"
-        )
-        return BICMV113AdaptiveBoundaryProductLoss()
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        if self._v96_configured:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        encoder = getattr(self.network, "encoder", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0 or encoder is None:
-            raise RuntimeError("V114 expected encoder plus decoder.seg_layers for late-encoder adapter calibration.")
-
-        # [AUDIT][Risk:High][Scope:v114_methodology_check]
-        # V110-V113 kept support near 0.975 while the GT semantic support/contact
-        # oracle passed. This opens only late encoder stages in addition to the
-        # decoder, testing whether the previous frozen-representation methodology
-        # is the actual blocker before any broad fulltrain.
-        self._v98_teacher = copy.deepcopy(self.network).to(self.device)
-        self._v98_teacher.eval()
-        for param in self._v98_teacher.parameters():
-            param.requires_grad = False
-
-        for param in self.network.parameters():
-            param.requires_grad = False
-
-        stages = getattr(encoder, "stages", None)
-        if stages is not None:
-            for idx in (4, 5):
-                if idx < len(stages):
-                    for param in stages[idx].parameters():
-                        param.requires_grad = True
-
-        for module_name in ("stages", "transpconvs"):
-            module = getattr(decoder, module_name, None)
-            if module is not None:
-                for param in module.parameters():
-                    param.requires_grad = True
-
-        train_rows = set(int(v) for v in self.CALIBRATION_ROWS)
-        self._v96_restore_rows = []
-        for layer_idx, seg_layer in enumerate(seg_layers):
-            for name, param in seg_layer.named_parameters(recurse=False):
-                if param.ndim < 1 or int(param.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V114 seg_layers[{layer_idx}] parameter {name!r} must have first dim "
-                        f"{BICM_V68_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                    )
-                row_mask_1d = torch.tensor(
-                    [idx in train_rows for idx in range(int(param.shape[0]))],
-                    device=param.device,
-                    dtype=torch.bool,
-                )
-                view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-                grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-                frozen_snapshot = param.detach().clone()
-                param.requires_grad = True
-                param.register_hook(self._v96_masked_grad_hook(grad_mask))
-                self._v96_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v96_configured = True
-        restored_rows = [idx for idx in range(BICM_V68_OUTPUT_CHANNELS) if idx not in train_rows]
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] late-encoder adapter active: "
-            f"encoder_stages=[4,5] decoder_features=on train_rows={sorted(train_rows)} "
-            f"restored_rows={restored_rows} trainable_params={trainable}/{total}"
-        )
-
-
-class PengwinTrainerBICMSemanticOracleAdapterV115(PengwinTrainerBICMEncoderAdapterV114):
-    """Dataset537 V115 semantic oracle-contract adapter."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v115_semantic_oracle_adapter"
-    VERSION_TAG = "BICMSemanticOracleAdapterV115"
-    EPOCH_ENV = "PENGWIN_BICM_V115_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V115_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V115_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=semantic_oracle_contract_adapter; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=v68_semantic_contact lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic support/contact oracle adapter "
-            "with late encoder capacity and teacher-preserved row6 core"
-        )
-        return BICMV115SemanticOracleAdapterLoss()
-
-
-class PengwinTrainerBICMGraphCostSeparatorV116(PengwinTrainerBICMEncoderAdapterV114):
-    """Dataset537 V116 local separator costs for graph-cost assignment."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v116_graph_cost_separator"
-    VERSION_TAG = "BICMGraphCostSeparatorV116"
-    EPOCH_ENV = "PENGWIN_BICM_V116_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V116_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V116_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=local_separator_graph_cost_assignment; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6] "
-            f"decoder_profile=bicm_v116_graph_cost_assignment "
-            f"contact_contract=v68_edge_primary lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic support + local separator edge costs "
-            "for graph-cost seeded assignment with teacher-preserved row6 core"
-        )
-        return BICMV116GraphCostSeparatorLoss()
-
-
-class PengwinTrainerBICMSupportGateSemanticContactV117(PengwinTrainerBICMEncoderAdapterV114):
-    """Dataset537 V117 support-gated semantic contact contract."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v117_support_gate_semantic_contact"
-    VERSION_TAG = "BICMSupportGateSemanticContactV117"
-    EPOCH_ENV = "PENGWIN_BICM_V117_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V117_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V117_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=independent_support_gate_for_semantic_contact; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[6,7,8,9] "
-            f"decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=v117_support_gate_semantic_contact lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic support/contact + row5 support gate "
-            "with teacher-preserved row6 core"
-        )
-        return BICMV117SupportGateSemanticContactLoss()
-
-
-class PengwinTrainerBICMWarmSupportGateSemanticContactV118(PengwinTrainerBICMSupportGateSemanticContactV117):
-    """Dataset537 V118 warm-started support gate for the V117 contract."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v118_warm_support_gate_semantic_contact"
-    VERSION_TAG = "BICMWarmSupportGateSemanticContactV118"
-    EPOCH_ENV = "PENGWIN_BICM_V118_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V118_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V118_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self._v118_support_gate_initialized = False
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=warm_initialized_support_gate; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[6,7,8,9] "
-            f"contact_contract=v117_support_gate_semantic_contact lr={self.initial_lr}"
-        )
-
-    def _initialize_v118_support_gate_row(self) -> None:
-        if self._v118_support_gate_initialized:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V118 expected decoder.seg_layers for support-gate warm initialization.")
-        with torch.no_grad():
-            for layer_idx, seg_layer in enumerate(seg_layers):
-                weight = getattr(seg_layer, "weight", None)
-                bias = getattr(seg_layer, "bias", None)
-                if weight is None or int(weight.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V118 seg_layers[{layer_idx}] weight must have 10 output rows, "
-                        f"got {None if weight is None else tuple(weight.shape)}"
-                    )
-                support_weight = weight[2:5].mean(dim=0)
-                nonsupport_weight = weight[0:2].mean(dim=0)
-                weight[5].copy_(support_weight - nonsupport_weight)
-                if bias is not None:
-                    support_bias = bias[2:5].mean()
-                    nonsupport_bias = bias[0:2].mean()
-                    # [QC][Invariant:fixed_threshold_recall_start]
-                    # Row 5 is evaluated at a fixed 0.5 sigmoid threshold. The
-                    # +0.75 global prior prevents the V117 failure mode where a
-                    # contact-initialized support gate starts and remains closed.
-                    bias[5].copy_(support_bias - nonsupport_bias + 0.75)
-        self._v118_support_gate_initialized = True
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] initialized row5 from semantic support-vs-nonsupport rows"
-        )
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        super()._configure_v96_dense_band_gate()
-        self._initialize_v118_support_gate_row()
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = warm support gate + semantic contact "
-            "with recall-preserving gate penalties"
-        )
-        return BICMV118WarmSupportGateSemanticContactLoss()
-
-
-class PengwinTrainerBICMAllNetworkAdaptiveBoundaryV119(PengwinTrainerBICMEncoderAdapterV114):
-    """Dataset537 V119 all-network low-LR methodology probe."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v119_all_network_adaptive_boundary"
-    VERSION_TAG = "BICMAllNetworkAdaptiveBoundaryV119"
-    EPOCH_ENV = "PENGWIN_BICM_V119_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V119_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V119_LR"
-    CALIBRATION_ROWS = tuple(range(BICM_V68_OUTPUT_CHANNELS))
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "1.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=all_network_low_lr_methodology_probe; "
-            "train_scope=all_network preserved_signal=row6_teacher "
-            "decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=semantic_topology_v68 lr={self.initial_lr}"
-        )
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        if self._v96_configured:
-            return
-        # [AUDIT][Risk:High][Scope:v119_methodology_probe]
-        # V110-V118 repeatedly failed under final-row/decoder/late-encoder
-        # adapters. V119 tests the methodology itself by opening every network
-        # parameter at low LR while using the frozen teacher only as a stability
-        # reference. No full-volume metric or GT fragment count feeds back.
-        self._v98_teacher = copy.deepcopy(self.network).to(self.device)
-        self._v98_teacher.eval()
-        for param in self._v98_teacher.parameters():
-            param.requires_grad = False
-
-        for param in self.network.parameters():
-            param.requires_grad = True
-        self._v96_restore_rows = []
-        self._v96_configured = True
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] all-network low-LR active: "
-            f"trainable_params={trainable}/{total} restored_rows=[]"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V113 adaptive boundary/product "
-            "with stronger row6 teacher preservation for all-network probe"
-        )
-        return BICMV119AllNetworkAdaptiveBoundaryLoss()
-
-
-class PengwinTrainerBICMSameFragmentAffinityV120(PengwinTrainerBICMEncoderAdapterV114):
-    """Dataset537 V120 same-fragment affinity topology probe."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v120_same_fragment_affinity"
-    VERSION_TAG = "BICMSameFragmentAffinityV120"
-    EPOCH_ENV = "PENGWIN_BICM_V120_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V120_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V120_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=same_fragment_affinity_topology; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment "
-            f"contact_contract=v120_affinity_break lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic support + dense same-fragment "
-            "affinity rows with teacher-preserved dense contact/core"
-        )
-        return BICMV120SameFragmentAffinityLoss()
-
-
-class PengwinTrainerBICMWarmSameFragmentAffinityV121(PengwinTrainerBICMSameFragmentAffinityV120):
-    """Dataset537 V121 warm-started same-fragment affinity topology probe."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v121_warm_same_fragment_affinity"
-    VERSION_TAG = "BICMWarmSameFragmentAffinityV121"
-    EPOCH_ENV = "PENGWIN_BICM_V121_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V121_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V121_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self._v121_affinity_initialized = False
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=warm_started_same_fragment_affinity; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment "
-            f"contact_contract=v120_affinity_break lr={self.initial_lr}"
-        )
-
-    def _initialize_v121_affinity_rows(self) -> None:
-        if self._v121_affinity_initialized:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V121 expected decoder.seg_layers for affinity warm initialization.")
-        with torch.no_grad():
-            for layer_idx, seg_layer in enumerate(seg_layers):
-                weight = getattr(seg_layer, "weight", None)
-                bias = getattr(seg_layer, "bias", None)
-                if weight is None or int(weight.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V121 seg_layers[{layer_idx}] weight must have 10 output rows, "
-                        f"got {None if weight is None else tuple(weight.shape)}"
-                    )
-                support_weight = weight[2:5].mean(dim=0)
-                nonsupport_weight = weight[0:2].mean(dim=0)
-                affinity_weight = support_weight - nonsupport_weight
-                for row in (7, 8, 9):
-                    weight[row].copy_(affinity_weight)
-                if bias is not None:
-                    support_bias = bias[2:5].mean()
-                    nonsupport_bias = bias[0:2].mean()
-                    # [QC][Invariant:v121_affinity_start]
-                    # V120 kept rows7..9 near zero-affinity everywhere because it
-                    # started from sparse break-edge logits. Fixed 0.5 graph costs
-                    # need same-fragment interiors to start traversable before
-                    # sparse boundary negatives can carve local barriers.
-                    affinity_bias = support_bias - nonsupport_bias + 1.25
-                    for row in (7, 8, 9):
-                        bias[row].copy_(affinity_bias)
-        self._v121_affinity_initialized = True
-        self.print_to_log_file(f"[{self.VERSION_TAG}] initialized rows7..9 from semantic support-vs-background rows")
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        super()._configure_v96_dense_band_gate()
-        self._initialize_v121_affinity_rows()
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V120 same-fragment affinity with "
-            "support-derived affinity warm start"
-        )
-        return BICMV120SameFragmentAffinityLoss()
-
-
-class PengwinTrainerBICMWarmEdgeProductPrecisionV122(PengwinTrainerBICMEncoderAdapterV114):
-    """Dataset537 V122 support-warm edge rows under semantic-topology product contact."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v122_warm_edge_product_precision"
-    VERSION_TAG = "BICMWarmEdgeProductPrecisionV122"
-    EPOCH_ENV = "PENGWIN_BICM_V122_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V122_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V122_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self._v122_edge_initialized = False
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=warm_edge_product_precision_lock; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[6] "
-            f"decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=semantic_topology_v68 lr={self.initial_lr}"
-        )
-
-    def _initialize_v122_edge_rows(self) -> None:
-        if self._v122_edge_initialized:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V122 expected decoder.seg_layers for edge-row warm initialization.")
-        with torch.no_grad():
-            for layer_idx, seg_layer in enumerate(seg_layers):
-                weight = getattr(seg_layer, "weight", None)
-                bias = getattr(seg_layer, "bias", None)
-                if weight is None or int(weight.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V122 seg_layers[{layer_idx}] weight must have 10 output rows, "
-                        f"got {None if weight is None else tuple(weight.shape)}"
-                    )
-                support_weight = weight[2:5].mean(dim=0)
-                nonsupport_weight = weight[0:2].mean(dim=0)
-                edge_weight = 0.75 * (support_weight - nonsupport_weight)
-                for row in (7, 8, 9):
-                    weight[row].copy_(edge_weight)
-                if bias is not None:
-                    support_bias = bias[2:5].mean()
-                    nonsupport_bias = bias[0:2].mean()
-                    # [QC][Invariant:v122_edge_warm_start]
-                    # V121 showed that support-derived rows can open recall, but
-                    # broad high responses destroy precision. V122 uses a smaller
-                    # prior than V121 and relies on the loss to keep expansion
-                    # teacher-relative under the original product decoder.
-                    edge_bias = 0.75 * (support_bias - nonsupport_bias) + 0.55
-                    for row in (7, 8, 9):
-                        bias[row].copy_(edge_bias)
-        self._v122_edge_initialized = True
-        self.print_to_log_file(f"[{self.VERSION_TAG}] initialized rows7..9 from scaled semantic support-vs-background rows")
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        super()._configure_v96_dense_band_gate()
-        self._initialize_v122_edge_rows()
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic topology product contact "
-            "with teacher-relative precision lock"
-        )
-        return BICMV122WarmEdgeProductPrecisionLoss()
-
-
-class PengwinTrainerBICMHighRecallGateCleanupV123(PengwinTrainerBICMPrecisionLockedRecallV109):
-    """Dataset537 V123 row5 cleanup over V121 high-recall edge rows."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v123_high_recall_gate_cleanup"
-    VERSION_TAG = "BICMHighRecallGateCleanupV123"
-    EPOCH_ENV = "PENGWIN_BICM_V123_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V123_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V123_LR"
-    CALIBRATION_ROWS = (5,)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "6.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=row5_precision_cleanup_over_high_recall_edges; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,6,7,8,9] "
-            f"decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=semantic_topology_v68 lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = row5 product-gate cleanup with hard "
-            "false-mass budget over frozen high-recall edge rows"
-        )
-        return BICMV123HighRecallGateCleanupLoss()
-
-
-class PengwinTrainerBICMSupportConditionedEdgePrecisionV124(PengwinTrainerBICMPrecisionLockedRecallV109):
-    """Dataset537 V124 rows7..9 support-conditioned edge precision cleanup."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v124_support_conditioned_edge_precision"
-    VERSION_TAG = "BICMSupportConditionedEdgePrecisionV124"
-    EPOCH_ENV = "PENGWIN_BICM_V124_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V124_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V124_LR"
-    CALIBRATION_ROWS = (7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "6.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=support_conditioned_edge_false_field_cleanup; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,5,6] "
-            f"decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=semantic_topology_v68 lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = rows7..9 support-conditioned hard-negative "
-            "precision cleanup with row5/core/semantic frozen"
-        )
-        return BICMV124SupportConditionedEdgePrecisionLoss()
-
-
-class PengwinTrainerBICMSaturatedEdgeDenseGateV125(PengwinTrainerBICMTeacherDistilledDenseGateV98):
-    """Dataset537 V125 decoder-feature row5 gate after saturated-edge diagnosis."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v125_saturated_edge_dense_gate"
-    VERSION_TAG = "BICMSaturatedEdgeDenseGateV125"
-    EPOCH_ENV = "PENGWIN_BICM_V125_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V125_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V125_LR"
-    CALIBRATION_ROWS = (5,)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=decoder_feature_row5_gate_after_saturated_edges; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} distill_rows=[0,1,2,3,4,6,7,8,9] "
-            f"decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=semantic_topology_v68 lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = saturated-edge row5 contact geometry "
-            "with decoder-feature opening and teacher preservation"
-        )
-        return BICMV125SaturatedEdgeDenseGateLoss()
-
-
-class PengwinTrainerBICMLocalAdjacencyProductV126(PengwinTrainerBICMTeacherDistilledDenseGateV98):
-    """Dataset537 V126 local instance-adjacency product-contact probe."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v126_local_adjacency_product"
-    VERSION_TAG = "BICMLocalAdjacencyProductV126"
-    EPOCH_ENV = "PENGWIN_BICM_V126_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V126_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V126_LR"
-    CALIBRATION_ROWS = (5, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "5.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=instance_local_adjacency_product_contact; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} distill_rows=[0,1,2,3,4,6] "
-            f"decoder_profile=bicm_v92_core_union_peak17_watershed "
-            f"contact_contract=semantic_topology_v68 lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = local instance-adjacency contrast for "
-            "rows7..9 plus row5 product contact gate"
-        )
-        return BICMV126LocalAdjacencyProductLoss()
-
-
-class PengwinTrainerBICMLocalAdjacencyProductV126FromV96(PengwinTrainerBICMLocalAdjacencyProductV126):
-    """Dataset537 V126 paired probe name for V96 initialization."""
-
-    VERSION_TAG = "BICMLocalAdjacencyProductV126FromV96"
-    EPOCH_ENV = "PENGWIN_BICM_V126B_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V126B_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V126B_LR"
-
-
-class PengwinTrainerBICMEdgeResetLocalAdjacencyProductV127(PengwinTrainerBICMLocalAdjacencyProductV126):
-    """Dataset537 V127: V121 warm start with V96-reset edge rows.
-
-    The only intended variable from V126 is the initial state of rows 7..9.
-    Semantic/core/row5/decoder features come from the requested `--init`
-    checkpoint, while rows 7..9 are copied from the measured non-saturated V96
-    checkpoint before the V98 teacher snapshot and frozen-row snapshots are made.
-    """
-
-    VERSION_TAG = "BICMEdgeResetLocalAdjacencyProductV127"
-    EPOCH_ENV = "PENGWIN_BICM_V127_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V127_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V127_LR"
-    EDGE_RESET_ENV = "PENGWIN_BICM_V127_EDGE_RESET_CHECKPOINT"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self._v127_edge_reset_done = False
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=v121_init_with_v96_edge_row_reset; "
-            "loss=bicm_v126_local_adjacency_product reset_rows=[7,8,9]"
-        )
-
-    def _default_v127_edge_reset_path(self) -> Path:
-        return (
-            NN_RES / "Dataset537_PelvicBICMFragmentV5"
-            / "PengwinTrainerBICMDenseBandGateV96__nnUNetResEncUNetLPlans__3d_fullres"
-            / f"fold_{self.fold}" / "checkpoint_completed_0010.pth"
-        )
-
-    @staticmethod
-    def _v127_unwrapped_network(network: torch.nn.Module) -> torch.nn.Module:
-        net = network
-        if hasattr(net, "module"):
-            net = net.module
-        if hasattr(net, "_orig_mod"):
-            net = net._orig_mod
-        return net
-
-    def _reset_v127_edge_rows_from_checkpoint(self) -> None:
-        if self._v127_edge_reset_done:
-            return
-        if int(getattr(self, "current_epoch", 0)) != 0:
-            self.print_to_log_file(
-                f"[{self.VERSION_TAG}] edge-row reset skipped for resumed epoch={self.current_epoch}"
-            )
-            self._v127_edge_reset_done = True
-            return
-
-        path = Path(os.environ.get(self.EDGE_RESET_ENV, str(self._default_v127_edge_reset_path())))
-        if not path.exists():
-            raise FileNotFoundError(
-                f"{self.VERSION_TAG} requires V96 edge reset checkpoint at {path}. "
-                f"Override with {self.EDGE_RESET_ENV}."
-            )
-        checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
-        source = checkpoint.get("network_weights", checkpoint)
-        if not isinstance(source, dict):
-            raise RuntimeError(f"{self.VERSION_TAG} expected a checkpoint state dict at {path}.")
-
-        decoder = getattr(self._v127_unwrapped_network(self.network), "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError(f"{self.VERSION_TAG} expected decoder.seg_layers for edge-row reset.")
-
-        copied = 0
-        with torch.no_grad():
-            for layer_idx, seg_layer in enumerate(seg_layers):
-                for name, param in seg_layer.named_parameters(recurse=False):
-                    if name not in {"weight", "bias"}:
-                        continue
-                    key = f"decoder.seg_layers.{layer_idx}.{name}"
-                    if key not in source:
-                        raise KeyError(f"{self.VERSION_TAG} missing {key!r} in {path}")
-                    src = source[key]
-                    if tuple(src.shape) != tuple(param.shape):
-                        raise RuntimeError(
-                            f"{self.VERSION_TAG} shape mismatch for {key}: "
-                            f"checkpoint={tuple(src.shape)} network={tuple(param.shape)}"
-                        )
-                    if int(param.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                        raise RuntimeError(
-                            f"{self.VERSION_TAG} expected 10 output rows for {key}, got {tuple(param.shape)}"
-                        )
-                    # [AUDIT][Risk:High][Scope:v127_initialization]
-                    # V126 showed that local-adjacency gradients did not unsaturate
-                    # V121 rows7..9 in two epochs. Resetting only these rows from
-                    # V96 tests whether the same loss can learn from a measured
-                    # non-saturated edge distribution while preserving the V121
-                    # semantic/core/row5 initialization and evaluator contract.
-                    param.data[7:10].copy_(src[7:10].to(device=param.device, dtype=param.dtype))
-                    copied += 1
-
-        self._v127_edge_reset_done = True
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] reset rows7..9 from {path} tensors_copied={copied}"
-        )
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        if self._v96_configured:
-            return
-        self._reset_v127_edge_rows_from_checkpoint()
-        super()._configure_v96_dense_band_gate()
-
-
-class PengwinTrainerBICMSupportBridgeSuppressionV128(PengwinTrainerBICMSameFragmentAffinityV120):
-    """Dataset537 V128: support false-bridge suppression over V121 affinity."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v128_support_bridge_suppression"
-    VERSION_TAG = "BICMSupportBridgeSuppressionV128"
-    EPOCH_ENV = "PENGWIN_BICM_V128_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V128_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V128_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=support_false_bridge_suppression; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment "
-            f"contact_contract=v120_affinity_break lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = hard non-support bridge suppression "
-            "with teacher-preserved dense contact/core/affinity rows"
-        )
-        return BICMV128SupportBridgeSuppressionLoss()
-
-
-class PengwinTrainerBICMAffinitySharpeningV129(PengwinTrainerBICMSameFragmentAffinityV120):
-    """Dataset537 V129: affinity edge sharpening over V121 support/core."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v129_affinity_sharpening"
-    VERSION_TAG = "BICMAffinitySharpeningV129"
-    EPOCH_ENV = "PENGWIN_BICM_V129_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V129_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V129_LR"
-    CALIBRATION_ROWS = (7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=affinity_edge_sharpening; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,5,6] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment "
-            f"contact_contract=v120_affinity_break lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = sharper same-fragment affinity contrast "
-            "with teacher-preserved semantic support/contact/core"
-        )
-        return BICMV129AffinitySharpeningLoss()
-
-
-class PengwinTrainerBICMSupportTopologyRepairV130(PengwinTrainerBICMSupportBridgeSuppressionV128):
-    """Dataset537 V130: instance-aware support topology repair over V121."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v130_support_topology_repair"
-    VERSION_TAG = "BICMSupportTopologyRepairV130"
-    EPOCH_ENV = "PENGWIN_BICM_V130_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V130_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V130_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=instance_aware_support_false_bridge_repair; "
-            f"encoder_stages=[3,4,5] train_rows={list(self.CALIBRATION_ROWS)} "
-            f"preserved_rows=[5,6,7,8,9] decoder_profile=bicm_v120_affinity_graph_assignment "
-            f"contact_contract=v120_affinity_break lr={self.initial_lr}"
-        )
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        if self._v96_configured:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        encoder = getattr(self.network, "encoder", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0 or encoder is None:
-            raise RuntimeError("V130 expected encoder plus decoder.seg_layers for support-topology repair.")
-
-        self._v98_teacher = copy.deepcopy(self.network).to(self.device)
-        self._v98_teacher.eval()
-        for param in self._v98_teacher.parameters():
-            param.requires_grad = False
-
-        for param in self.network.parameters():
-            param.requires_grad = False
-
-        stages = getattr(encoder, "stages", None)
-        if stages is not None:
-            for idx in (3, 4, 5):
-                if idx < len(stages):
-                    for param in stages[idx].parameters():
-                        param.requires_grad = True
-
-        for module_name in ("stages", "transpconvs"):
-            module = getattr(decoder, module_name, None)
-            if module is not None:
-                for param in module.parameters():
-                    param.requires_grad = True
-
-        train_rows = set(int(v) for v in self.CALIBRATION_ROWS)
-        self._v96_restore_rows = []
-        for layer_idx, seg_layer in enumerate(seg_layers):
-            for name, param in seg_layer.named_parameters(recurse=False):
-                if param.ndim < 1 or int(param.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V130 seg_layers[{layer_idx}] parameter {name!r} must have first dim "
-                        f"{BICM_V68_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                    )
-                row_mask_1d = torch.tensor(
-                    [idx in train_rows for idx in range(int(param.shape[0]))],
-                    device=param.device,
-                    dtype=torch.bool,
-                )
-                view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-                grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-                frozen_snapshot = param.detach().clone()
-                param.requires_grad = True
-                param.register_hook(self._v96_masked_grad_hook(grad_mask))
-                self._v96_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v96_configured = True
-        restored_rows = [idx for idx in range(BICM_V68_OUTPUT_CHANNELS) if idx not in train_rows]
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] support-topology repair active: "
-            f"encoder_stages=[3,4,5] decoder_features=on train_rows={sorted(train_rows)} "
-            f"restored_rows={restored_rows} trainable_params={trainable}/{total}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = semantic support false-bridge suppression "
-            "plus instance-aware multi-fragment bridge-zone hard mining"
-        )
-        return BICMV130SupportTopologyRepairLoss()
-
-
-class PengwinTrainerBICMAllNetworkSupportTopologyRepairV131(PengwinTrainerBICMSupportTopologyRepairV130):
-    """Dataset537 V131: same V130 loss with all-network low-LR capacity."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v131_all_network_support_topology_repair"
-    VERSION_TAG = "BICMAllNetworkSupportTopologyRepairV131"
-    EPOCH_ENV = "PENGWIN_BICM_V131_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V131_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V131_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "1.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=all_network_capacity_for_support_topology; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment contact_contract=v120_affinity_break "
-            f"lr={self.initial_lr}"
-        )
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        if self._v96_configured:
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError("V131 expected decoder.seg_layers for all-network support-topology repair.")
-
-        self._v98_teacher = copy.deepcopy(self.network).to(self.device)
-        self._v98_teacher.eval()
-        for param in self._v98_teacher.parameters():
-            param.requires_grad = False
-
-        for param in self.network.parameters():
-            param.requires_grad = True
-
-        train_rows = set(int(v) for v in self.CALIBRATION_ROWS)
-        self._v96_restore_rows = []
-        for layer_idx, seg_layer in enumerate(seg_layers):
-            for name, param in seg_layer.named_parameters(recurse=False):
-                if param.ndim < 1 or int(param.shape[0]) != BICM_V68_OUTPUT_CHANNELS:
-                    raise RuntimeError(
-                        f"V131 seg_layers[{layer_idx}] parameter {name!r} must have first dim "
-                        f"{BICM_V68_OUTPUT_CHANNELS}, got {tuple(param.shape)}"
-                    )
-                row_mask_1d = torch.tensor(
-                    [idx in train_rows for idx in range(int(param.shape[0]))],
-                    device=param.device,
-                    dtype=torch.bool,
-                )
-                view_shape = [int(param.shape[0])] + [1] * (param.ndim - 1)
-                grad_mask = row_mask_1d.view(*view_shape).to(dtype=param.dtype)
-                frozen_snapshot = param.detach().clone()
-                param.requires_grad = True
-                param.register_hook(self._v96_masked_grad_hook(grad_mask))
-                self._v96_restore_rows.append((param, row_mask_1d, frozen_snapshot))
-
-        trainable = sum(p.numel() for p in self.network.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in self.network.parameters())
-        self._v96_configured = True
-        restored_rows = [idx for idx in range(BICM_V68_OUTPUT_CHANNELS) if idx not in train_rows]
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] all-network support-topology repair active: "
-            f"train_rows={sorted(train_rows)} restored_rows={restored_rows} "
-            f"trainable_params={trainable}/{total}"
-        )
-
-
-class PengwinTrainerBICMSupportVetoGateV132(PengwinTrainerBICMSupportTopologyRepairV130):
-    """Dataset537 V132: row5 support-veto gate over V121 affinity."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v132_support_veto_gate"
-    VERSION_TAG = "BICMSupportVetoGateV132"
-    EPOCH_ENV = "PENGWIN_BICM_V132_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V132_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V132_LR"
-    CALIBRATION_ROWS = (5,)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=row5_support_veto_gate; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,6,7,8,9] "
-            f"decoder_profile=row5_gated_v120_affinity_graph lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = row5 support-veto gate with instance bridge-zone negatives"
-        )
-        return BICMV132SupportVetoGateLoss()
-
-
-class PengwinTrainerBICMSupportVetoSemanticV133(PengwinTrainerBICMSupportVetoGateV132):
-    """Dataset537 V133: row5 support-veto gate plus semantic co-adaptation."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v133_support_veto_semantic"
-    VERSION_TAG = "BICMSupportVetoSemanticV133"
-    EPOCH_ENV = "PENGWIN_BICM_V133_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V133_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V133_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 5)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.5e-5"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=row5_support_veto_plus_semantic_rows; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[6,7,8,9] "
-            f"decoder_profile=row5_gated_v120_affinity_graph lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = row5 support-veto gate plus semantic support repair"
-        )
-        return BICMV133SupportVetoSemanticLoss()
-
-
-class PengwinTrainerBICMSupportVetoGateHighLRV134(PengwinTrainerBICMSupportVetoGateV132):
-    """Dataset537 V134: same V132 row5 support-veto gate at higher LR."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v134_support_veto_gate_highlr"
-    VERSION_TAG = "BICMSupportVetoGateHighLRV134"
-    EPOCH_ENV = "PENGWIN_BICM_V134_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V134_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V134_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=row5_support_veto_gate_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,6,7,8,9] "
-            f"decoder_profile=row5_gated_v120_affinity_graph lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMSupportVetoGateUltraLRV135(PengwinTrainerBICMSupportVetoGateV132):
-    """Dataset537 V135: same V132 row5 support-veto gate at ultra-high LR."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v135_support_veto_gate_ultralr"
-    VERSION_TAG = "BICMSupportVetoGateUltraLRV135"
-    EPOCH_ENV = "PENGWIN_BICM_V135_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V135_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V135_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "1.0e-3"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=row5_support_veto_gate_lr1e-3; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,6,7,8,9] "
-            f"decoder_profile=row5_gated_v120_affinity_graph lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMSupportTopologyHighLRV136(PengwinTrainerBICMSupportTopologyRepairV130):
-    """Dataset537 V136: V130 semantic support topology repair at higher LR."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v136_support_topology_highlr"
-    VERSION_TAG = "BICMSupportTopologyHighLRV136"
-    EPOCH_ENV = "PENGWIN_BICM_V136_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V136_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V136_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=semantic_support_topology_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMSupportTopologyUltraLRV137(PengwinTrainerBICMSupportTopologyRepairV130):
-    """Dataset537 V137: V130 semantic support topology repair at ultra-high LR."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v137_support_topology_ultralr"
-    VERSION_TAG = "BICMSupportTopologyUltraLRV137"
-    EPOCH_ENV = "PENGWIN_BICM_V137_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V137_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V137_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "1.0e-3"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=semantic_support_topology_lr1e-3; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMSupportTopologyMidLRV138(PengwinTrainerBICMSupportTopologyRepairV130):
-    """Dataset537 V138: V130 semantic support topology repair at mid LR."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v138_support_topology_midlr"
-    VERSION_TAG = "BICMSupportTopologyMidLRV138"
-    EPOCH_ENV = "PENGWIN_BICM_V138_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V138_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V138_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "5.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=semantic_support_topology_lr5e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMSupportTopologyUpperMidLRV139(PengwinTrainerBICMSupportTopologyRepairV130):
-    """Dataset537 V139: V130 semantic support topology repair at upper-mid LR."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v139_support_topology_uppermidlr"
-    VERSION_TAG = "BICMSupportTopologyUpperMidLRV139"
-    EPOCH_ENV = "PENGWIN_BICM_V139_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V139_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V139_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "7.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=semantic_support_topology_lr7e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMSupportTopologyLowBracketLRV140(PengwinTrainerBICMSupportTopologyRepairV130):
-    """Dataset537 V140: V130 semantic support topology repair below V136 LR."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v140_support_topology_lowbracket"
-    VERSION_TAG = "BICMSupportTopologyLowBracketLRV140"
-    EPOCH_ENV = "PENGWIN_BICM_V140_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V140_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V140_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=semantic_support_topology_lr2e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMSupportTopologyHighBracketLRV141(PengwinTrainerBICMSupportTopologyRepairV130):
-    """Dataset537 V141: V130 semantic support topology repair above V136 LR."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v141_support_topology_highbracket"
-    VERSION_TAG = "BICMSupportTopologyHighBracketLRV141"
-    EPOCH_ENV = "PENGWIN_BICM_V141_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V141_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V141_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "4.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=semantic_support_topology_lr4e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,6,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMSupportTopologyCoreSeedLowLRV142(PengwinTrainerBICMSupportTopologyLowBracketLRV140):
-    """Dataset537 V142: V140 LR with row6 core seed supervision enabled."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v142_support_topology_coreseed_lowlr"
-    VERSION_TAG = "BICMSupportTopologyCoreSeedLowLRV142"
-    EPOCH_ENV = "PENGWIN_BICM_V142_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V142_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V142_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 6)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_seed_row6_supervision_lr2e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = support-topology repair plus supervised row6 core seeds"
-        )
-        return BICMV142SupportTopologyCoreSeedLoss()
-
-
-class PengwinTrainerBICMSupportTopologyCoreSeedMidLRV143(PengwinTrainerBICMSupportTopologyHighLRV136):
-    """Dataset537 V143: V136 LR with row6 core seed supervision enabled."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v143_support_topology_coreseed_midlr"
-    VERSION_TAG = "BICMSupportTopologyCoreSeedMidLRV143"
-    EPOCH_ENV = "PENGWIN_BICM_V143_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V143_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V143_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 6)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_seed_row6_supervision_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = support-topology repair plus supervised row6 core seeds"
-        )
-        return BICMV142SupportTopologyCoreSeedLoss()
-
-
-class PengwinTrainerBICMStrongCoreSeedLowLRV144(PengwinTrainerBICMSupportTopologyCoreSeedLowLRV142):
-    """Dataset537 V144: V142 with stronger row6 seed pressure."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v144_strong_coreseed_lowlr"
-    VERSION_TAG = "BICMStrongCoreSeedLowLRV144"
-    EPOCH_ENV = "PENGWIN_BICM_V144_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V144_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V144_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=strong_core_seed_row6_lr2e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = support-topology repair plus strong supervised row6 core seeds"
-        )
-        return BICMV144StrongCoreSeedLoss()
-
-
-class PengwinTrainerBICMStrongCoreSeedMidLRV145(PengwinTrainerBICMSupportTopologyCoreSeedMidLRV143):
-    """Dataset537 V145: V143 with stronger row6 seed pressure."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v145_strong_coreseed_midlr"
-    VERSION_TAG = "BICMStrongCoreSeedMidLRV145"
-    EPOCH_ENV = "PENGWIN_BICM_V145_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V145_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V145_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=strong_core_seed_row6_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = support-topology repair plus strong supervised row6 core seeds"
-        )
-        return BICMV144StrongCoreSeedLoss()
-
-
-class PengwinTrainerBICMFragmentSeedPresenceLowLRV146(PengwinTrainerBICMStrongCoreSeedLowLRV144):
-    """Dataset537 V146: V144 plus fragment-support row6 presence floor."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v146_fragment_seed_presence_lowlr"
-    VERSION_TAG = "BICMFragmentSeedPresenceLowLRV146"
-    EPOCH_ENV = "PENGWIN_BICM_V146_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V146_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V146_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=fragment_support_seed_presence_lr2e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = strong row6 core seeds plus fragment-level seed presence"
-        )
-        return BICMV146FragmentSeedPresenceLoss()
-
-
-class PengwinTrainerBICMFragmentSeedPresenceMidLRV147(PengwinTrainerBICMStrongCoreSeedMidLRV145):
-    """Dataset537 V147: V145 plus fragment-support row6 presence floor."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v147_fragment_seed_presence_midlr"
-    VERSION_TAG = "BICMFragmentSeedPresenceMidLRV147"
-    EPOCH_ENV = "PENGWIN_BICM_V147_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V147_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V147_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=fragment_support_seed_presence_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = strong row6 core seeds plus fragment-level seed presence"
-        )
-        return BICMV146FragmentSeedPresenceLoss()
-
-
-class PengwinTrainerBICMCoreHeatmapSeedLowLRV148(PengwinTrainerBICMStrongCoreSeedLowLRV144):
-    """Dataset537 V148: row6 core seed supervision from target['core'] heatmap."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v148_core_heatmap_seed_lowlr"
-    VERSION_TAG = "BICMCoreHeatmapSeedLowLRV148"
-    EPOCH_ENV = "PENGWIN_BICM_V148_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V148_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V148_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "2.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_heatmap_seed_target_lr2e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = support-topology repair plus target['core'] heatmap row6 seeds"
-        )
-        return BICMV148CoreHeatmapSeedLoss()
-
-
-class PengwinTrainerBICMCoreHeatmapSeedMidLRV149(PengwinTrainerBICMStrongCoreSeedMidLRV145):
-    """Dataset537 V149: V148 core heatmap seed target at the V145 LR anchor."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v149_core_heatmap_seed_midlr"
-    VERSION_TAG = "BICMCoreHeatmapSeedMidLRV149"
-    EPOCH_ENV = "PENGWIN_BICM_V149_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V149_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V149_LR"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_heatmap_seed_target_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = support-topology repair plus target['core'] heatmap row6 seeds"
-        )
-        return BICMV148CoreHeatmapSeedLoss()
-
-
-class PengwinTrainerBICMCoreOnlyHeatmapSeedMidLRV150(PengwinTrainerBICMCoreHeatmapSeedMidLRV149):
-    """Dataset537 V150: row6-only heatmap seed calibration at 3e-4."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v150_core_only_heatmap_seed_midlr"
-    VERSION_TAG = "BICMCoreOnlyHeatmapSeedMidLRV150"
-    EPOCH_ENV = "PENGWIN_BICM_V150_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V150_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V150_LR"
-    CALIBRATION_ROWS = (6,)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_only_heatmap_seed_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = row6-only target['core'] heatmap seeds with teacher-preserved non-core rows"
-        )
-        return BICMV150CoreOnlyHeatmapSeedLoss()
-
-
-class PengwinTrainerBICMCoreOnlyHeatmapSeedHighLRV151(PengwinTrainerBICMCoreHeatmapSeedMidLRV149):
-    """Dataset537 V151: row6-only heatmap seed calibration at 5e-4."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v151_core_only_heatmap_seed_highlr"
-    VERSION_TAG = "BICMCoreOnlyHeatmapSeedHighLRV151"
-    EPOCH_ENV = "PENGWIN_BICM_V151_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V151_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V151_LR"
-    CALIBRATION_ROWS = (6,)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "5.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_only_heatmap_seed_lr5e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,5,7,8,9] "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = row6-only target['core'] heatmap seeds with teacher-preserved non-core rows"
-        )
-        return BICMV150CoreOnlyHeatmapSeedLoss()
-
-
-class PengwinTrainerBICMCoreOnlyCenterSeedMidLRV152(PengwinTrainerBICMCoreOnlyHeatmapSeedMidLRV150):
-    """Dataset537 V152: row6-only core calibration with instance-center seed target.
-
-    V150/V151 kept using the default semantic core crop for `target["core"]`.
-    This variant changes only the target geometry exposed by the dataloader:
-    one compact center marker per visible GT fragment. Non-core rows stay
-    teacher-preserved so the comparison against V150 isolates seed geometry.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v152_core_only_center_seed_midlr"
-    VERSION_TAG = "BICMCoreOnlyCenterSeedMidLRV152"
-    EPOCH_ENV = "PENGWIN_BICM_V152_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V152_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V152_LR"
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_only_instance_center_seed_radius3_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,5,7,8,9] "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX} "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMCoreHeatmapCenterSeedMidLRV153(PengwinTrainerBICMCoreHeatmapSeedMidLRV149):
-    """Dataset537 V153: support-topology branch with instance-center seed target.
-
-    This is the matched comparison for V149. It keeps the support-topology loss
-    and LR fixed, but changes `target["core"]` from the semantic core crop to a
-    compact per-fragment instance-center marker.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v153_core_heatmap_center_seed_midlr"
-    VERSION_TAG = "BICMCoreHeatmapCenterSeedMidLRV153"
-    EPOCH_ENV = "PENGWIN_BICM_V153_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V153_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V153_LR"
-    INSTANCE_CENTER_CORE_RADIUS_VOX = 3.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=support_topology_instance_center_seed_radius3_lr3e-4; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5,7,8,9] "
-            f"instance_center_core_radius_vox={self.INSTANCE_CENTER_CORE_RADIUS_VOX} "
-            f"decoder_profile=bicm_v120_affinity_graph_assignment lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMCoreOnlyCenterSeedSamplerV154(PengwinTrainerBICMCoreOnlyCenterSeedMidLRV152):
-    """Dataset537 V154: V152 plus GT fragment-center crop exposure.
-
-    [AUDIT][Risk:High][Scope:sampler_ablation]
-    V152 rejected center target geometry alone: hard sacrum fragments still
-    produced no row6 seed. This variant changes only the crop-center sampling
-    probability so we can test whether the failure is exposure-driven before
-    rewriting the contact/core representation.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v154_core_only_center_seed_sampler"
-    VERSION_TAG = "BICMCoreOnlyCenterSeedSamplerV154"
-    EPOCH_ENV = "PENGWIN_BICM_V154_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V154_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V154_LR"
-    CORE_CENTER_PROBABILITY = 0.60
-    CORE_CENTER_VAL_PROBABILITY = 0.25
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_center_sampler; "
-            f"core_center_probability={self.CORE_CENTER_PROBABILITY} "
-            f"core_center_val_probability={self.CORE_CENTER_VAL_PROBABILITY} "
-            f"fixed_loss={self.DEFAULT_LOSS_PROFILE} lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMCoreHeatmapCenterSeedSamplerV155(PengwinTrainerBICMCoreHeatmapCenterSeedMidLRV153):
-    """Dataset537 V155: V153 plus GT fragment-center crop exposure.
-
-    [AUDIT][Risk:High][Scope:sampler_ablation]
-    Matched support-topology comparison for V154. The only intended change
-    against V153 is crop selection toward GT fragment centers.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v155_core_heatmap_center_seed_sampler"
-    VERSION_TAG = "BICMCoreHeatmapCenterSeedSamplerV155"
-    EPOCH_ENV = "PENGWIN_BICM_V155_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V155_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V155_LR"
-    CORE_CENTER_PROBABILITY = 0.60
-    CORE_CENTER_VAL_PROBABILITY = 0.25
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_center_sampler; "
-            f"core_center_probability={self.CORE_CENTER_PROBABILITY} "
-            f"core_center_val_probability={self.CORE_CENTER_VAL_PROBABILITY} "
-            f"fixed_loss={self.DEFAULT_LOSS_PROFILE} lr={self.initial_lr}"
-        )
-
-
-class PengwinTrainerBICMCoreOnlyCenterSeedAffinitySamplerV158(PengwinTrainerBICMCoreOnlyCenterSeedSamplerV154):
-    """Dataset537 V158: V154 plus same-fragment affinity training.
-
-    [AUDIT][Risk:High][Scope:grouping_ablation]
-    V154 rejected sampler-only core exposure, and V156/V157 showed soft-peak
-    decoding helps but still fails fragment-specific grouping. This trainer keeps
-    V154's center sampler and row6 contract fixed, then opens rows7..9 so the
-    next gate tests grouping evidence rather than contact-product thresholds.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v158_core_only_center_seed_affinity_sampler"
-    VERSION_TAG = "BICMCoreOnlyCenterSeedAffinitySamplerV158"
-    EPOCH_ENV = "PENGWIN_BICM_V158_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V158_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V158_LR"
-    CALIBRATION_ROWS = (6, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_center_sampler_plus_affinity; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,5] "
-            f"core_center_probability={self.CORE_CENTER_PROBABILITY} "
-            f"core_center_val_probability={self.CORE_CENTER_VAL_PROBABILITY} "
-            f"decoder_profiles=[bicm_v120_affinity_graph_assignment,bicm_v156_affinity_graph_softpeak_assignment] "
-            f"lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V154 core center seed/sampler plus rows7..9 same-fragment affinity"
-        )
-        return BICMV158CoreOnlyCenterSeedAffinityLoss()
-
-
-class PengwinTrainerBICMCoreHeatmapCenterSeedAffinitySamplerV159(PengwinTrainerBICMCoreHeatmapCenterSeedSamplerV155):
-    """Dataset537 V159: V155 plus same-fragment affinity training.
-
-    [AUDIT][Risk:High][Scope:grouping_ablation]
-    This is the support-topology matched comparison for V158. Against V155, the
-    intended changed variable is opening rows7..9 under the same-fragment
-    affinity loss while keeping the center sampler and row6 target geometry.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v159_core_heatmap_center_seed_affinity_sampler"
-    VERSION_TAG = "BICMCoreHeatmapCenterSeedAffinitySamplerV159"
-    EPOCH_ENV = "PENGWIN_BICM_V159_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V159_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V159_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 6, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=support_core_center_sampler_plus_affinity; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5] "
-            f"core_center_probability={self.CORE_CENTER_PROBABILITY} "
-            f"core_center_val_probability={self.CORE_CENTER_VAL_PROBABILITY} "
-            f"decoder_profiles=[bicm_v120_affinity_graph_assignment,bicm_v156_affinity_graph_softpeak_assignment] "
-            f"lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V155 support/core center seed/sampler plus rows7..9 same-fragment affinity"
-        )
-        return BICMV159CoreHeatmapCenterSeedAffinityLoss()
-
-
-class _BICMOffsetRowsResetMixin:
-    """Reset rows7..9 before training them as raw offset vectors."""
-
-    def _configure_v96_dense_band_gate(self) -> None:
-        super()._configure_v96_dense_band_gate()
-        if getattr(self, "_bicm_offset_rows_reset", False):
-            return
-        decoder = getattr(self.network, "decoder", None)
-        seg_layers = getattr(decoder, "seg_layers", None)
-        if decoder is None or seg_layers is None or len(seg_layers) == 0:
-            raise RuntimeError(f"{self.VERSION_TAG} expected network.decoder.seg_layers for offset row reset.")
-        with torch.no_grad():
-            for layer_idx, seg_layer in enumerate(seg_layers):
-                weight = getattr(seg_layer, "weight", None)
-                bias = getattr(seg_layer, "bias", None)
-                if weight is None or int(weight.shape[0]) != int(BICM_V68_OUTPUT_CHANNELS):
-                    raise RuntimeError(
-                        f"{self.VERSION_TAG} seg_layers[{layer_idx}] weight must have 10 output rows, "
-                        f"got {None if weight is None else tuple(weight.shape)}"
-                    )
-                # [AUDIT][Risk:High][Scope:v160_v161_offset_initialization]
-                # Rows7..9 were same-fragment affinity logits in the V121/V158/V159
-                # lineage. V160/V161 reinterpret them as unconstrained z/y/x offsets,
-                # so keeping the affinity warm-start would give a biased positive
-                # vector field before any offset evidence is learned.
-                weight[7:10].zero_()
-                if bias is not None:
-                    bias[7:10].zero_()
-        self._bicm_offset_rows_reset = True
-        self.print_to_log_file(f"[{self.VERSION_TAG}] reset raw offset rows 7..9 to zero")
-
-
-class PengwinTrainerBICMCoreOnlyCenterSeedOffsetSamplerV160(
-    _BICMOffsetRowsResetMixin,
-    PengwinTrainerBICMCoreOnlyCenterSeedSamplerV154,
-):
-    """Dataset537 V160: V154 plus raw center-offset grouping rows.
-
-    [AUDIT][Risk:High][Scope:grouping_ablation]
-    V158/V159 rejected direct same-fragment affinity under the current row6
-    seed contract. V160 preserves V154's semantic/contact/core scaffold and
-    tests an explicit flow-style grouping representation in rows7..9.
-    """
-
-    DEFAULT_LOSS_PROFILE = "bicm_v160_core_only_center_seed_offset_sampler"
-    VERSION_TAG = "BICMCoreOnlyCenterSeedOffsetSamplerV160"
-    EPOCH_ENV = "PENGWIN_BICM_V160_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V160_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V160_LR"
-    CALIBRATION_ROWS = (6, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self._bicm_offset_rows_reset = False
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=core_center_sampler_plus_raw_offsets; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[0,1,2,3,4,5] "
-            f"core_center_probability={self.CORE_CENTER_PROBABILITY} "
-            f"core_center_val_probability={self.CORE_CENTER_VAL_PROBABILITY} "
-            f"decoder_profile=bicm_v160_offset_softpeak_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V154 core center seed/sampler plus rows7..9 raw center offsets"
-        )
-        return BICMV160CoreOnlyCenterSeedOffsetLoss()
-
-
-class PengwinTrainerBICMCoreHeatmapCenterSeedOffsetSamplerV161(
-    _BICMOffsetRowsResetMixin,
-    PengwinTrainerBICMCoreHeatmapCenterSeedSamplerV155,
-):
-    """Dataset537 V161: V155 plus raw center-offset grouping rows."""
-
-    DEFAULT_LOSS_PROFILE = "bicm_v161_core_heatmap_center_seed_offset_sampler"
-    VERSION_TAG = "BICMCoreHeatmapCenterSeedOffsetSamplerV161"
-    EPOCH_ENV = "PENGWIN_BICM_V161_EPOCHS"
-    SAVE_EVERY_ENV = "PENGWIN_BICM_V161_SAVE_EVERY"
-    LR_ENV = "PENGWIN_BICM_V161_LR"
-    CALIBRATION_ROWS = (0, 1, 2, 3, 4, 6, 7, 8, 9)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.initial_lr = float(os.environ.get(self.LR_ENV, "3.0e-4"))
-        self._bicm_offset_rows_reset = False
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] changed_variable=support_core_center_sampler_plus_raw_offsets; "
-            f"train_rows={list(self.CALIBRATION_ROWS)} preserved_rows=[5] "
-            f"core_center_probability={self.CORE_CENTER_PROBABILITY} "
-            f"core_center_val_probability={self.CORE_CENTER_VAL_PROBABILITY} "
-            f"decoder_profile=bicm_v160_offset_softpeak_assignment lr={self.initial_lr}"
-        )
-
-    def _build_loss(self):
-        self.print_to_log_file(
-            f"[{self.VERSION_TAG}] Loss = V155 support/core center seed/sampler plus rows7..9 raw center offsets"
-        )
-        return BICMV161CoreHeatmapCenterSeedOffsetLoss()
+                self.num_epochs = completed  # 메인 루프에 종료 신호를 보낸다
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class PengwinBoundaryFragmentDataLoader3D(nnUNetDataLoader3D):
@@ -11490,13 +3412,11 @@ class PengwinBoundaryFragmentSeedTargetSidecarDataLoader3D(PengwinBoundaryFragme
         centers = np.asarray(centers_zyx, dtype=np.float32)
         bbox = np.asarray(bbox_lbs, dtype=np.float32)
         seed_center = np.zeros(inst.shape, dtype=np.float32)
-        for frag_id in np.unique(inst):
-            fid = int(frag_id)
-            if fid <= 0 or fid > 150:
-                continue
-            coords = np.argwhere(inst == fid)
+        for fid, _sl in _present_fragment_slices(inst):
+            coords = np.argwhere(inst[_sl] == fid)
             if coords.size == 0:
                 continue
+            coords = coords + np.asarray([s.start for s in _sl], dtype=coords.dtype)
             center_global = centers[fid] if fid < centers.shape[0] else np.asarray(coords.mean(axis=0), dtype=np.float32)
             center_local = center_global - bbox if np.isfinite(center_global).all() else coords.mean(axis=0)
             nearest = coords[np.argmin(((coords.astype(np.float32) - center_local.reshape(1, 3)) ** 2).sum(axis=1))]
@@ -11518,14 +3438,12 @@ class PengwinBoundaryFragmentSeedTargetSidecarDataLoader3D(PengwinBoundaryFragme
         bbox = np.asarray(bbox_lbs, dtype=np.float32)
         denom = np.maximum(np.asarray(full_shape, dtype=np.float32) - 1.0, 1.0)
         embedding = np.zeros((3, *inst.shape), dtype=np.float32)
-        for frag_id in np.unique(inst):
-            fid = int(frag_id)
-            if fid <= 0 or fid > 150:
-                continue
-            frag = inst == fid
-            coords = np.argwhere(frag)
+        for fid, _sl in _present_fragment_slices(inst):
+            sub = inst[_sl] == fid
+            coords = np.argwhere(sub)
             if coords.size == 0:
                 continue
+            coords = coords + np.asarray([s.start for s in _sl], dtype=coords.dtype)
             center_global = (
                 centers[fid]
                 if fid < centers.shape[0]
@@ -11534,8 +3452,9 @@ class PengwinBoundaryFragmentSeedTargetSidecarDataLoader3D(PengwinBoundaryFragme
             if not np.isfinite(center_global).all():
                 center_global = coords.astype(np.float32).mean(axis=0) + bbox
             sink_norm = np.clip(center_global.astype(np.float32) / denom, 0.0, 1.0)
+            emb_sub = embedding[(slice(None), *_sl)]  # (3, bz, by, bx) view into embedding
             for axis in range(3):
-                embedding[axis][frag] = float(sink_norm[axis])
+                emb_sub[axis][sub] = float(sink_norm[axis])
         return embedding
 
     def _choose_decoder_contact_center(
@@ -11681,7 +3600,7 @@ class PengwinBoundaryFragmentSeedTargetSidecarDataLoader3D(PengwinBoundaryFragme
                 pad_value=0,
             )
             inst_crop, _ = self._crop_pad(inst_full, bbox_lbs, bbox_ubs, pad_value=0)
-            inst = np.where((inst_crop >= 1) & (inst_crop <= 150), inst_crop, 0).astype(np.uint16, copy=False)
+            inst = np.where((inst_crop >= 1) & (inst_crop <= MAX_INSTANCE_ID), inst_crop, 0).astype(np.uint16, copy=False)
             centers_zyx = np.asarray(sidecar["centers_zyx"], dtype=np.float32)
             seed_center = self._fragment_seed_centers(
                 inst,
@@ -11723,570 +3642,7 @@ class PengwinBoundaryFragmentSeedTargetSidecarDataLoader3D(PengwinBoundaryFragme
         }
 
 
-class PengwinBoundaryFragmentGlobalCoordDataLoader3D(PengwinBoundaryFragmentSeedTargetSidecarDataLoader3D):
-    """BFV3 sidecar loader that appends full-ROI z/y/x coordinate channels.
-
-    Args:
-        *args: nnU-Net dataloader arguments inherited from the sidecar loader.
-        **kwargs: Seed/sidecar sampling arguments inherited from the sidecar loader.
-
-    Raises:
-        ValueError: If image, BFV3 semantic sidecar, V5 segmentation, or dense
-            instance sidecar shapes disagree on the preprocessed ROI grid.
-    """
-
-    @staticmethod
-    def _full_roi_coordinate_channels(shape: tuple[int, int, int]) -> np.ndarray:
-        # [QC][Invariant:global_coord_space]
-        # V282의 CoordConv wrapper는 sliding-window tile 내부 좌표를 붙여 patch validation과
-        # full-volume inference의 좌표계가 달라졌다. V283은 전체 preprocessed ROI shape로
-        # 정규화한 좌표를 dataloader/predictor 양쪽에 동일하게 붙여 같은 voxel이 항상
-        # 같은 z/y/x 값을 보게 한다.
-        depth, height, width = (int(v) for v in shape)
-        denom = np.maximum(np.asarray([depth, height, width], dtype=np.float32) - 1.0, 1.0)
-        z = (np.arange(depth, dtype=np.float32) / float(denom[0]))[:, None, None]
-        y = (np.arange(height, dtype=np.float32) / float(denom[1]))[None, :, None]
-        x = (np.arange(width, dtype=np.float32) / float(denom[2]))[None, None, :]
-        return np.stack(
-            [
-                np.broadcast_to(z, (depth, height, width)),
-                np.broadcast_to(y, (depth, height, width)),
-                np.broadcast_to(x, (depth, height, width)),
-            ],
-            axis=0,
-        ).astype(np.float32, copy=False)
-
-    def generate_train_batch(self):
-        selected_keys = self.get_indices()
-        base_channels = int(self.data_shape[1])
-        data_all = np.zeros((self.batch_size, base_channels + 3, *self.patch_size), dtype=np.float32)
-        semantic_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        decoder_contact_semantic_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        seed_center_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        seed_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        instance_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        spatial_embedding_all = np.zeros((self.batch_size, 3, *self.patch_size), dtype=np.float32)
-
-        for j, key in enumerate(selected_keys):
-            data, seg, _properties = self._data.load_case(key)
-            shape = data.shape[1:]
-            force_fg = self.get_do_oversample(j)
-            sidecar = self._load_sidecar(key)
-            target = self._load_target(key)
-            inst_full = np.asarray(sidecar["instance"], dtype=np.uint16)
-            if tuple(target.shape[-3:]) != tuple(shape):
-                raise ValueError(
-                    f"{key}: BFV3 target shape {target.shape[-3:]} does not match image shape {tuple(shape)}"
-                )
-            if target.size:
-                target_min = int(np.min(target))
-                target_max = int(np.max(target))
-                if target_min < 0 or target_max > 4:
-                    raise ValueError(
-                        f"{key}: BFV3 semantic labels must be in [0, 4], "
-                        f"got min={target_min} max={target_max}"
-                    )
-            if tuple(inst_full.shape) != tuple(shape):
-                raise ValueError(
-                    f"{key}: instance sidecar shape {tuple(inst_full.shape)} does not match image shape {tuple(shape)}"
-                )
-            if seg is None:
-                raise ValueError(f"{key}: Dataset537 V5 segmentation is required for sidecar crop audits")
-            seg_full = np.asarray(seg)
-            if seg_full.ndim == 4 and int(seg_full.shape[0]) == 1:
-                decoder_contact_full = seg_full[0]
-            elif seg_full.ndim == 3:
-                decoder_contact_full = seg_full
-            else:
-                raise ValueError(
-                    f"{key}: expected V5 segmentation shape [1, Z, Y, X] or [Z, Y, X], "
-                    f"got {tuple(seg_full.shape)}"
-                )
-            if tuple(decoder_contact_full.shape) != tuple(shape):
-                raise ValueError(
-                    f"{key}: V5 segmentation shape {tuple(decoder_contact_full.shape)} "
-                    f"does not match image shape {tuple(shape)}"
-                )
-
-            center = None
-            if force_fg:
-                decoder_contact_center_full = (
-                    target
-                    if self.decoder_contact_center_source == "bfv3"
-                    else decoder_contact_full
-                )
-                center = self._choose_decoder_contact_center(
-                    decoder_contact_center_full,
-                    bfv3_full=target,
-                )
-                if center is None:
-                    center = self._choose_priority_center(sidecar, key=key)
-            if center is None:
-                bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg=False, class_locations=None)
-            else:
-                bbox_lbs, bbox_ubs = self._bbox_from_center(shape, center)
-
-            data_crop, _crop_lbs = self._crop_pad(data, bbox_lbs, bbox_ubs, pad_value=0)
-            target_crop, _ = self._crop_pad(target, bbox_lbs, bbox_ubs, pad_value=0)
-            decoder_contact_crop, _ = self._crop_pad(
-                decoder_contact_full,
-                bbox_lbs,
-                bbox_ubs,
-                pad_value=0,
-            )
-            inst_crop, _ = self._crop_pad(inst_full, bbox_lbs, bbox_ubs, pad_value=0)
-            coords_full = self._full_roi_coordinate_channels(tuple(int(v) for v in shape))
-            coord_crop, _ = self._crop_pad(coords_full, bbox_lbs, bbox_ubs, pad_value=0)
-            inst = np.where((inst_crop >= 1) & (inst_crop <= 150), inst_crop, 0).astype(np.uint16, copy=False)
-            centers_zyx = np.asarray(sidecar["centers_zyx"], dtype=np.float32)
-            seed_center = self._fragment_seed_centers(inst, centers_zyx, bbox_lbs)
-            seed = PengwinBICMV5EdgeAffinityDataLoader3D._fragment_center_core(
-                inst,
-                centers_zyx,
-                bbox_lbs,
-                self.seed_radius_vox,
-            )
-            spatial_embedding = self._fragment_spatial_embedding_targets(
-                inst,
-                centers_zyx,
-                bbox_lbs,
-                tuple(int(v) for v in shape),
-            )
-
-            # [DATA][Risk:High][Scope:v283_no_contact_input_contract]
-            # 입력에는 원본 ROI 채널과 global coordinate 세 채널만 추가한다. contact,
-            # fracture, query, seed map은 model input에 넣지 않아 active 구조가 다시
-            # contact supervision으로 되돌아가는 것을 막는다.
-            data_all[j, :base_channels] = data_crop.astype(np.float32, copy=False)
-            data_all[j, base_channels:] = coord_crop.astype(np.float32, copy=False)
-            semantic_all[j, 0] = target_crop.astype(np.int16, copy=False)
-            decoder_contact_semantic_all[j, 0] = decoder_contact_crop.astype(np.int16, copy=False)
-            seed_center_all[j, 0] = seed_center.astype(np.float32, copy=False)
-            seed_all[j, 0] = seed.astype(np.float32, copy=False)
-            instance_all[j, 0] = inst.astype(np.int16, copy=False)
-            spatial_embedding_all[j] = spatial_embedding.astype(np.float32, copy=False)
-
-        return {
-            "data": data_all,
-            "target": {
-                "semantic": semantic_all,
-                "decoder_contact_semantic": decoder_contact_semantic_all,
-                "seed_center": seed_center_all,
-                "seed": seed_all,
-                "instance": instance_all,
-                "spatial_embedding": spatial_embedding_all,
-            },
-            "keys": selected_keys,
-        }
-
-
-class PengwinBoundaryFragmentQueryMaskDataLoader3D(PengwinBoundaryFragmentSeedTargetSidecarDataLoader3D):
-    """Build V280 query-conditioned binary mask batches from instance sidecars."""
-
-    def __init__(self, *args, query_sigma_vox: float = 6.0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.query_sigma_vox = float(query_sigma_vox)
-        if self.query_sigma_vox <= 0.0:
-            raise ValueError(f"query_sigma_vox must be > 0, got {self.query_sigma_vox}")
-
-    @staticmethod
-    def _safe_fragment_center(inst_full: np.ndarray,
-                              centers_zyx: np.ndarray,
-                              frag_id: int) -> np.ndarray:
-        coords = np.argwhere(inst_full == int(frag_id))
-        if coords.size == 0:
-            raise ValueError(f"fragment {frag_id} has no voxels")
-        if int(frag_id) < int(centers_zyx.shape[0]):
-            center = np.asarray(centers_zyx[int(frag_id)], dtype=np.float32)
-            if np.isfinite(center).all():
-                return center
-        return coords.astype(np.float32).mean(axis=0)
-
-    @staticmethod
-    def _query_channels(shape: tuple[int, int, int],
-                        seed_zyx: np.ndarray,
-                        sigma_vox: float) -> np.ndarray:
-        # [DATA][Risk:High][Scope:v280_query_encoding]
-        # Interactive segmentation best practice는 click/seed를 distance map으로
-        # image channels에 concatenate하는 방식이다. 여기서는 positive query seed만
-        # 쓰며, contact/fracture scalar는 입력에도 target에도 넣지 않는다.
-        depth, height, width = (int(v) for v in shape)
-        seed = np.asarray(seed_zyx, dtype=np.float32)
-        z = np.arange(depth, dtype=np.float32)[:, None, None] - float(seed[0])
-        y = np.arange(height, dtype=np.float32)[None, :, None] - float(seed[1])
-        x = np.arange(width, dtype=np.float32)[None, None, :] - float(seed[2])
-        dist2 = z * z + y * y + x * x
-        gaussian = np.exp(-dist2 / (2.0 * float(sigma_vox) * float(sigma_vox))).astype(np.float32, copy=False)
-        diag = float(np.sqrt(max(depth - 1, 1) ** 2 + max(height - 1, 1) ** 2 + max(width - 1, 1) ** 2))
-        inv_distance = (1.0 - np.minimum(np.sqrt(dist2) / max(diag, 1.0), 1.0)).astype(np.float32, copy=False)
-        return np.stack([gaussian, inv_distance], axis=0).astype(np.float32, copy=False)
-
-    def generate_train_batch(self):
-        selected_keys = self.get_indices()
-        base_channels = int(self.data_shape[1])
-        data_all = np.zeros((self.batch_size, base_channels + 2, *self.patch_size), dtype=np.float32)
-        semantic_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        instance_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        query_mask_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        query_seed_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        query_id_all = np.zeros((self.batch_size, 1), dtype=np.int16)
-
-        for j, key in enumerate(selected_keys):
-            data, _seg, _properties = self._data.load_case(key)
-            shape = data.shape[1:]
-            sidecar = self._load_sidecar(key)
-            target = self._load_target(key)
-            inst_full = np.asarray(sidecar["instance"], dtype=np.uint16)
-            centers_zyx = np.asarray(sidecar["centers_zyx"], dtype=np.float32)
-            if tuple(target.shape[-3:]) != tuple(shape):
-                raise ValueError(f"{key}: BFV3 target shape {target.shape[-3:]} does not match image shape {tuple(shape)}")
-            if tuple(inst_full.shape) != tuple(shape):
-                raise ValueError(f"{key}: instance sidecar shape {tuple(inst_full.shape)} does not match image shape {tuple(shape)}")
-            ids = [int(v) for v in np.unique(inst_full) if 0 < int(v) <= 150]
-            if not ids:
-                raise ValueError(f"{key}: V280 query-mask batch requires at least one visible fragment")
-            query_id = int(np.random.choice(ids))
-            center_global = self._safe_fragment_center(inst_full, centers_zyx, query_id)
-            bbox_lbs, bbox_ubs = self._bbox_from_center(shape, center_global)
-
-            data_crop, _crop_lbs = self._crop_pad(data, bbox_lbs, bbox_ubs, pad_value=0)
-            target_crop, _ = self._crop_pad(target, bbox_lbs, bbox_ubs, pad_value=0)
-            inst_crop, _ = self._crop_pad(inst_full, bbox_lbs, bbox_ubs, pad_value=0)
-            inst = np.where((inst_crop >= 1) & (inst_crop <= 150), inst_crop, 0).astype(np.uint16, copy=False)
-            query_mask = inst == int(query_id)
-            if not bool(query_mask.any()):
-                raise ValueError(f"{key}: query fragment {query_id} disappeared after crop")
-            query_coords = np.argwhere(query_mask)
-            center_local = center_global.astype(np.float32) - np.asarray(bbox_lbs, dtype=np.float32)
-            nearest = query_coords[np.argmin(((query_coords.astype(np.float32) - center_local.reshape(1, 3)) ** 2).sum(axis=1))]
-            query_channels = self._query_channels(tuple(int(v) for v in self.patch_size), nearest, self.query_sigma_vox)
-            query_seed = np.zeros(tuple(int(v) for v in self.patch_size), dtype=np.float32)
-            query_seed[tuple(int(v) for v in nearest)] = 1.0
-
-            data_all[j, :base_channels] = data_crop.astype(np.float32, copy=False)
-            data_all[j, base_channels:] = query_channels
-            semantic_all[j, 0] = target_crop.astype(np.int16, copy=False)
-            instance_all[j, 0] = inst.astype(np.int16, copy=False)
-            query_mask_all[j, 0] = query_mask.astype(np.float32, copy=False)
-            query_seed_all[j, 0] = query_seed
-            query_id_all[j, 0] = np.int16(query_id)
-
-        return {
-            "data": data_all,
-            "target": {
-                "semantic": semantic_all,
-                "instance": instance_all,
-                "query_mask": query_mask_all,
-                "query_seed": query_seed_all,
-                "query_id": query_id_all,
-            },
-            "keys": selected_keys,
-        }
-
-
-class PengwinBoundaryFragmentGlobalCoordQueryMaskDataLoader3D(PengwinBoundaryFragmentQueryMaskDataLoader3D):
-    """V285 query-mask loader with explicit full-ROI coordinate channels.
-
-    [AUDIT][Risk:Blocker][Scope:v285_coordinate_contract]
-    V280 used query maps but still relied on CoordConv wrapper coordinates, which
-    are patch/tile-local. V283 showed that full-volume inference needs coordinates
-    computed on the whole preprocessed ROI. V285 keeps the no-contact query-mask
-    target and appends full-ROI z/y/x crops directly to the input tensor.
-    """
-
-    def generate_train_batch(self):
-        selected_keys = self.get_indices()
-        base_channels = int(self.data_shape[1])
-        data_all = np.zeros((self.batch_size, base_channels + 2 + 3, *self.patch_size), dtype=np.float32)
-        semantic_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        instance_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        query_mask_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        query_seed_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        query_id_all = np.zeros((self.batch_size, 1), dtype=np.int16)
-
-        for j, key in enumerate(selected_keys):
-            data, _seg, _properties = self._data.load_case(key)
-            shape = data.shape[1:]
-            sidecar = self._load_sidecar(key)
-            target = self._load_target(key)
-            inst_full = np.asarray(sidecar["instance"], dtype=np.uint16)
-            centers_zyx = np.asarray(sidecar["centers_zyx"], dtype=np.float32)
-            if tuple(target.shape[-3:]) != tuple(shape):
-                raise ValueError(f"{key}: BFV3 target shape {target.shape[-3:]} does not match image shape {tuple(shape)}")
-            if tuple(inst_full.shape) != tuple(shape):
-                raise ValueError(f"{key}: instance sidecar shape {tuple(inst_full.shape)} does not match image shape {tuple(shape)}")
-            ids = [int(v) for v in np.unique(inst_full) if 0 < int(v) <= 150]
-            if not ids:
-                raise ValueError(f"{key}: V285 query-mask batch requires at least one visible fragment")
-            query_id = int(np.random.choice(ids))
-            center_global = self._safe_fragment_center(inst_full, centers_zyx, query_id)
-            bbox_lbs, bbox_ubs = self._bbox_from_center(shape, center_global)
-
-            data_crop, _crop_lbs = self._crop_pad(data, bbox_lbs, bbox_ubs, pad_value=0)
-            target_crop, _ = self._crop_pad(target, bbox_lbs, bbox_ubs, pad_value=0)
-            inst_crop, _ = self._crop_pad(inst_full, bbox_lbs, bbox_ubs, pad_value=0)
-            coords_full = PengwinBoundaryFragmentGlobalCoordDataLoader3D._full_roi_coordinate_channels(
-                tuple(int(v) for v in shape)
-            )
-            coord_crop, _ = self._crop_pad(coords_full, bbox_lbs, bbox_ubs, pad_value=0)
-            inst = np.where((inst_crop >= 1) & (inst_crop <= 150), inst_crop, 0).astype(np.uint16, copy=False)
-            query_mask = inst == int(query_id)
-            if not bool(query_mask.any()):
-                raise ValueError(f"{key}: query fragment {query_id} disappeared after crop")
-            query_coords = np.argwhere(query_mask)
-            center_local = center_global.astype(np.float32) - np.asarray(bbox_lbs, dtype=np.float32)
-            nearest = query_coords[np.argmin(((query_coords.astype(np.float32) - center_local.reshape(1, 3)) ** 2).sum(axis=1))]
-            query_channels = self._query_channels(tuple(int(v) for v in self.patch_size), nearest, self.query_sigma_vox)
-            query_seed = np.zeros(tuple(int(v) for v in self.patch_size), dtype=np.float32)
-            query_seed[tuple(int(v) for v in nearest)] = 1.0
-
-            # [DATA][Risk:High][Scope:v285_no_contact_input]
-            # 입력은 image ROI + positive query maps + full-ROI 좌표뿐이다. contact,
-            # label2/label3, fracture surface scalar는 어떤 입력 채널에도 넣지 않는다.
-            data_all[j, :base_channels] = data_crop.astype(np.float32, copy=False)
-            data_all[j, base_channels:base_channels + 2] = query_channels
-            data_all[j, base_channels + 2:] = coord_crop.astype(np.float32, copy=False)
-            semantic_all[j, 0] = target_crop.astype(np.int16, copy=False)
-            instance_all[j, 0] = inst.astype(np.int16, copy=False)
-            query_mask_all[j, 0] = query_mask.astype(np.float32, copy=False)
-            query_seed_all[j, 0] = query_seed
-            query_id_all[j, 0] = np.int16(query_id)
-
-        return {
-            "data": data_all,
-            "target": {
-                "semantic": semantic_all,
-                "instance": instance_all,
-                "query_mask": query_mask_all,
-                "query_seed": query_seed_all,
-                "query_id": query_id_all,
-            },
-            "keys": selected_keys,
-        }
-
-
-class PengwinBoundaryFragmentPositiveNegativeQueryMaskDataLoader3D(PengwinBoundaryFragmentQueryMaskDataLoader3D):
-    """V281 positive/negative query-conditioned binary mask batches.
-
-    [AUDIT][Risk:Blocker][Scope:v281_query_contract]
-    V280의 single positive seed는 "이 점이 속한 fragment"만 알려주고, 인접 fragment를
-    어디까지 background로 볼지 충분히 제약하지 못했다. V281은 contact 없이 interactive
-    segmentation의 positive/negative click 계약을 따른다. positive seed map 2채널과
-    visible non-query fragment center를 모은 negative seed map 2채널을 입력에 붙인다.
-    """
-
-    @staticmethod
-    def _multi_seed_query_channels(shape: tuple[int, int, int],
-                                   seeds_zyx: list[np.ndarray],
-                                   sigma_vox: float) -> np.ndarray:
-        depth, height, width = (int(v) for v in shape)
-        if not seeds_zyx:
-            return np.zeros((2, depth, height, width), dtype=np.float32)
-        z_axis = np.arange(depth, dtype=np.float32)[:, None, None]
-        y_axis = np.arange(height, dtype=np.float32)[None, :, None]
-        x_axis = np.arange(width, dtype=np.float32)[None, None, :]
-        min_dist2 = np.full((depth, height, width), np.inf, dtype=np.float32)
-        for seed_raw in seeds_zyx:
-            seed = np.asarray(seed_raw, dtype=np.float32)
-            dz = z_axis - float(seed[0])
-            dy = y_axis - float(seed[1])
-            dx = x_axis - float(seed[2])
-            min_dist2 = np.minimum(min_dist2, dz * dz + dy * dy + dx * dx)
-        gaussian = np.exp(-min_dist2 / (2.0 * float(sigma_vox) * float(sigma_vox))).astype(np.float32, copy=False)
-        diag = float(np.sqrt(max(depth - 1, 1) ** 2 + max(height - 1, 1) ** 2 + max(width - 1, 1) ** 2))
-        inv_distance = (1.0 - np.minimum(np.sqrt(min_dist2) / max(diag, 1.0), 1.0)).astype(np.float32, copy=False)
-        return np.stack([gaussian, inv_distance], axis=0).astype(np.float32, copy=False)
-
-    @staticmethod
-    def _nearest_visible_seed(inst: np.ndarray,
-                              frag_id: int,
-                              center_local: np.ndarray) -> np.ndarray:
-        coords = np.argwhere(inst == int(frag_id))
-        if coords.size == 0:
-            raise ValueError(f"fragment {frag_id} has no visible voxels in crop")
-        center = np.asarray(center_local, dtype=np.float32)
-        nearest = coords[np.argmin(((coords.astype(np.float32) - center.reshape(1, 3)) ** 2).sum(axis=1))]
-        return nearest.astype(np.float32)
-
-    def generate_train_batch(self):
-        selected_keys = self.get_indices()
-        base_channels = int(self.data_shape[1])
-        data_all = np.zeros((self.batch_size, base_channels + 4, *self.patch_size), dtype=np.float32)
-        semantic_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        instance_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        query_mask_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        query_seed_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        negative_seed_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        query_id_all = np.zeros((self.batch_size, 1), dtype=np.int16)
-
-        for j, key in enumerate(selected_keys):
-            data, _seg, _properties = self._data.load_case(key)
-            shape = data.shape[1:]
-            sidecar = self._load_sidecar(key)
-            target = self._load_target(key)
-            inst_full = np.asarray(sidecar["instance"], dtype=np.uint16)
-            centers_zyx = np.asarray(sidecar["centers_zyx"], dtype=np.float32)
-            if tuple(target.shape[-3:]) != tuple(shape):
-                raise ValueError(f"{key}: BFV3 target shape {target.shape[-3:]} does not match image shape {tuple(shape)}")
-            if tuple(inst_full.shape) != tuple(shape):
-                raise ValueError(f"{key}: instance sidecar shape {tuple(inst_full.shape)} does not match image shape {tuple(shape)}")
-            ids = [int(v) for v in np.unique(inst_full) if 0 < int(v) <= 150]
-            if not ids:
-                raise ValueError(f"{key}: V281 query-mask batch requires at least one visible fragment")
-            query_id = int(np.random.choice(ids))
-            center_global = self._safe_fragment_center(inst_full, centers_zyx, query_id)
-            bbox_lbs, bbox_ubs = self._bbox_from_center(shape, center_global)
-
-            data_crop, _crop_lbs = self._crop_pad(data, bbox_lbs, bbox_ubs, pad_value=0)
-            target_crop, _ = self._crop_pad(target, bbox_lbs, bbox_ubs, pad_value=0)
-            inst_crop, _ = self._crop_pad(inst_full, bbox_lbs, bbox_ubs, pad_value=0)
-            inst = np.where((inst_crop >= 1) & (inst_crop <= 150), inst_crop, 0).astype(np.uint16, copy=False)
-            query_mask = inst == int(query_id)
-            if not bool(query_mask.any()):
-                raise ValueError(f"{key}: query fragment {query_id} disappeared after crop")
-
-            center_local = center_global.astype(np.float32) - np.asarray(bbox_lbs, dtype=np.float32)
-            positive_seed = self._nearest_visible_seed(inst, query_id, center_local)
-            negative_seeds: list[np.ndarray] = []
-            for neg_id in [int(v) for v in np.unique(inst) if 0 < int(v) <= 150 and int(v) != int(query_id)]:
-                neg_center_global = self._safe_fragment_center(inst_full, centers_zyx, int(neg_id))
-                neg_center_local = neg_center_global.astype(np.float32) - np.asarray(bbox_lbs, dtype=np.float32)
-                negative_seeds.append(self._nearest_visible_seed(inst, int(neg_id), neg_center_local))
-
-            # [DATA][Risk:High][Scope:v281_positive_negative_clicks]
-            # positive map은 target fragment 중심, negative map은 같은 crop 안의 non-query
-            # fragment 중심 전체다. fracture/contact label은 쓰지 않으며, ID 구분 신호를
-            # click constraint만으로 학습 가능한지 검증한다.
-            positive_channels = self._query_channels(tuple(int(v) for v in self.patch_size), positive_seed, self.query_sigma_vox)
-            negative_channels = self._multi_seed_query_channels(tuple(int(v) for v in self.patch_size), negative_seeds, self.query_sigma_vox)
-            query_seed = np.zeros(tuple(int(v) for v in self.patch_size), dtype=np.float32)
-            query_seed[tuple(int(v) for v in positive_seed)] = 1.0
-            negative_seed = np.zeros(tuple(int(v) for v in self.patch_size), dtype=np.float32)
-            for neg_seed in negative_seeds:
-                negative_seed[tuple(int(v) for v in neg_seed)] = 1.0
-
-            data_all[j, :base_channels] = data_crop.astype(np.float32, copy=False)
-            data_all[j, base_channels:base_channels + 2] = positive_channels
-            data_all[j, base_channels + 2:] = negative_channels
-            semantic_all[j, 0] = target_crop.astype(np.int16, copy=False)
-            instance_all[j, 0] = inst.astype(np.int16, copy=False)
-            query_mask_all[j, 0] = query_mask.astype(np.float32, copy=False)
-            query_seed_all[j, 0] = query_seed
-            negative_seed_all[j, 0] = negative_seed
-            query_id_all[j, 0] = np.int16(query_id)
-
-        return {
-            "data": data_all,
-            "target": {
-                "semantic": semantic_all,
-                "instance": instance_all,
-                "query_mask": query_mask_all,
-                "query_seed": query_seed_all,
-                "negative_seed": negative_seed_all,
-                "query_id": query_id_all,
-            },
-            "keys": selected_keys,
-        }
-
-
-class PengwinBoundaryFragmentGlobalCoordPositiveNegativeQueryMaskDataLoader3D(
-    PengwinBoundaryFragmentPositiveNegativeQueryMaskDataLoader3D
-):
-    """V286 positive/negative query-mask loader with full-ROI coordinates.
-
-    [AUDIT][Risk:Blocker][Scope:v286_negative_prompt_contract]
-    V285 final showed that a single positive query lets small fracture fragments
-    expand into neighboring anatomy. V286 adds explicit negative fragment seeds
-    while keeping V285's full-ROI coordinate contract and keeping contact out of
-    input/loss/decoder.
-    """
-
-    def generate_train_batch(self):
-        selected_keys = self.get_indices()
-        base_channels = int(self.data_shape[1])
-        data_all = np.zeros((self.batch_size, base_channels + 4 + 3, *self.patch_size), dtype=np.float32)
-        semantic_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        instance_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.int16)
-        query_mask_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        query_seed_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        negative_seed_all = np.zeros((self.batch_size, 1, *self.patch_size), dtype=np.float32)
-        query_id_all = np.zeros((self.batch_size, 1), dtype=np.int16)
-
-        for j, key in enumerate(selected_keys):
-            data, _seg, _properties = self._data.load_case(key)
-            shape = data.shape[1:]
-            sidecar = self._load_sidecar(key)
-            target = self._load_target(key)
-            inst_full = np.asarray(sidecar["instance"], dtype=np.uint16)
-            centers_zyx = np.asarray(sidecar["centers_zyx"], dtype=np.float32)
-            if tuple(target.shape[-3:]) != tuple(shape):
-                raise ValueError(f"{key}: BFV3 target shape {target.shape[-3:]} does not match image shape {tuple(shape)}")
-            if tuple(inst_full.shape) != tuple(shape):
-                raise ValueError(f"{key}: instance sidecar shape {tuple(inst_full.shape)} does not match image shape {tuple(shape)}")
-            ids = [int(v) for v in np.unique(inst_full) if 0 < int(v) <= 150]
-            if not ids:
-                raise ValueError(f"{key}: V286 query-mask batch requires at least one visible fragment")
-            query_id = int(np.random.choice(ids))
-            center_global = self._safe_fragment_center(inst_full, centers_zyx, query_id)
-            bbox_lbs, bbox_ubs = self._bbox_from_center(shape, center_global)
-
-            data_crop, _crop_lbs = self._crop_pad(data, bbox_lbs, bbox_ubs, pad_value=0)
-            target_crop, _ = self._crop_pad(target, bbox_lbs, bbox_ubs, pad_value=0)
-            inst_crop, _ = self._crop_pad(inst_full, bbox_lbs, bbox_ubs, pad_value=0)
-            coords_full = PengwinBoundaryFragmentGlobalCoordDataLoader3D._full_roi_coordinate_channels(
-                tuple(int(v) for v in shape)
-            )
-            coord_crop, _ = self._crop_pad(coords_full, bbox_lbs, bbox_ubs, pad_value=0)
-            inst = np.where((inst_crop >= 1) & (inst_crop <= 150), inst_crop, 0).astype(np.uint16, copy=False)
-            query_mask = inst == int(query_id)
-            if not bool(query_mask.any()):
-                raise ValueError(f"{key}: query fragment {query_id} disappeared after crop")
-
-            center_local = center_global.astype(np.float32) - np.asarray(bbox_lbs, dtype=np.float32)
-            positive_seed = self._nearest_visible_seed(inst, query_id, center_local)
-            negative_seeds: list[np.ndarray] = []
-            for neg_id in [int(v) for v in np.unique(inst) if 0 < int(v) <= 150 and int(v) != int(query_id)]:
-                neg_center_global = self._safe_fragment_center(inst_full, centers_zyx, int(neg_id))
-                neg_center_local = neg_center_global.astype(np.float32) - np.asarray(bbox_lbs, dtype=np.float32)
-                negative_seeds.append(self._nearest_visible_seed(inst, int(neg_id), neg_center_local))
-
-            positive_channels = self._query_channels(tuple(int(v) for v in self.patch_size), positive_seed, self.query_sigma_vox)
-            negative_channels = self._multi_seed_query_channels(tuple(int(v) for v in self.patch_size), negative_seeds, self.query_sigma_vox)
-            query_seed = np.zeros(tuple(int(v) for v in self.patch_size), dtype=np.float32)
-            query_seed[tuple(int(v) for v in positive_seed)] = 1.0
-            negative_seed = np.zeros(tuple(int(v) for v in self.patch_size), dtype=np.float32)
-            for neg_seed in negative_seeds:
-                negative_seed[tuple(int(v) for v in neg_seed)] = 1.0
-
-            # [DATA][Risk:High][Scope:v286_no_contact_input]
-            # V286은 positive/negative query maps와 full-ROI 좌표만 추가한다. contact
-            # surface/label2/label3 정보를 다시 넣지 않아 V247 계열 실패 경로를 차단한다.
-            data_all[j, :base_channels] = data_crop.astype(np.float32, copy=False)
-            data_all[j, base_channels:base_channels + 2] = positive_channels
-            data_all[j, base_channels + 2:base_channels + 4] = negative_channels
-            data_all[j, base_channels + 4:] = coord_crop.astype(np.float32, copy=False)
-            semantic_all[j, 0] = target_crop.astype(np.int16, copy=False)
-            instance_all[j, 0] = inst.astype(np.int16, copy=False)
-            query_mask_all[j, 0] = query_mask.astype(np.float32, copy=False)
-            query_seed_all[j, 0] = query_seed
-            negative_seed_all[j, 0] = negative_seed
-            query_id_all[j, 0] = np.int16(query_id)
-
-        return {
-            "data": data_all,
-            "target": {
-                "semantic": semantic_all,
-                "instance": instance_all,
-                "query_mask": query_mask_all,
-                "query_seed": query_seed_all,
-                "negative_seed": negative_seed_all,
-                "query_id": query_id_all,
-            },
-            "keys": selected_keys,
-        }
-
-
-class PengwinTrainerBoundaryFragmentV3(nnUNetTrainer):
+class PengwinTrainerBoundaryFragmentV3(_GroupedSplitMixin, nnUNetTrainer):
     """Native nnU-Net BoundaryFragment V3 specialist.
 
     Contract:
@@ -13079,6 +4435,33 @@ class PengwinTrainerBoundaryFragmentV3(nnUNetTrainer):
                     )
                     self.num_epochs = completed
 
+    def run_training(self):
+        # [ES-ENFORCE][2026-06-05] nnUNetTrainer.run_training drives the epoch loop with
+        # `for epoch in range(self.current_epoch, self.num_epochs)`, whose range() is frozen
+        # at loop entry. The ES handler in on_validation_epoch_end signals stop by lowering
+        # self.num_epochs, but a frozen range ignores that — so ES *fired* (logged the message)
+        # yet training kept running to the original num_epochs (observed 2026-06-04: ES at ep95
+        # ignored, ran to ep206+). Mirror the base PengwinTrainer fix: re-check self.num_epochs
+        # every epoch via a while-loop. Body is otherwise byte-identical to nnUNetTrainer.run_training;
+        # on_epoch_end increments self.current_epoch, so after ES sets num_epochs=current_epoch+1 the
+        # next while-check (current_epoch == num_epochs) exits cleanly and on_train_end runs.
+        self.on_train_start()
+        while self.current_epoch < self.num_epochs:
+            self.on_epoch_start()
+            self.on_train_epoch_start()
+            train_outputs = []
+            for batch_id in range(self.num_iterations_per_epoch):
+                train_outputs.append(self.train_step(next(self.dataloader_train)))
+            self.on_train_epoch_end(train_outputs)
+            with torch.no_grad():
+                self.on_validation_epoch_start()
+                val_outputs = []
+                for batch_id in range(self.num_val_iterations_per_epoch):
+                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                self.on_validation_epoch_end(val_outputs)
+            self.on_epoch_end()
+        self.on_train_end()
+
     def on_epoch_end(self):
         self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
         self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
@@ -13130,72 +4513,6 @@ class PengwinTrainerBoundaryFragmentV3(nnUNetTrainer):
         return None
 
 
-class PengwinTrainerBICMBoundaryFragmentRemapV162(PengwinTrainerBoundaryFragmentV3):
-    """Dataset537 V162 ABBC probe with explicit V5 semantic-to-BFV3 remap.
-
-    Input labels remain the existing Dataset537 V5 semantic contract:
-        0 background, 1 exterior, 2 interior shell, 3 core, 4 contact surface.
-
-    The BoundaryFragmentV3 loss/metric contract expects:
-        0 background, 1 exterior, 2 barrier, 3 shell, 4 core.
-    """
-
-    NUM_EPOCHS_DEFAULT = 2
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_v5_remap"
-    V5_FORCED_CLASS_DISTRIBUTION = (
-        (4, 0.50),  # contact surface -> BFV3 barrier
-        (1, 0.20),  # exterior context
-        (2, 0.20),  # interior shell -> BFV3 shell
-        (3, 0.10),  # core -> BFV3 core
-    )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V162_EPOCHS", self.NUM_EPOCHS_DEFAULT))
-        if os.environ.get("PENGWIN_BICM_V162_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BICM_V162_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BICM_V162_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BICM_V162_VAL_ITERS"])
-        self._pengwin_oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE
-        ).strip().lower()
-        self.oversample_foreground_percent = 0.85
-        self.print_to_log_file(
-            "[BICMBoundaryFragmentRemapV162] changed_variable=v5_semantic_to_abbc_bfv3_remap "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch} oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    def _boundary_fragment_forced_distribution(self):
-        if self._pengwin_oversample_profile == "boundary_fragment_v3_ridge80":
-            return PengwinBoundaryFragmentDataLoader3D.RIDGE80_CLASS_DISTRIBUTION
-        return self.V5_FORCED_CLASS_DISTRIBUTION
-
-    @staticmethod
-    def _remap_v5_semantic_to_bfv3(target: torch.Tensor) -> torch.Tensor:
-        # [DATA][Risk:High][Scope:target_contract_alignment]
-        # Dataset537 V5 label 4 is contact_surface, but BoundaryFragmentV3 class
-        # 4 means core. Remapping is done immediately before loss/metrics so raw
-        # Dataset537 files, splits, and preprocessing stay unchanged while this
-        # experiment tests exactly one variable: ABBC-style boundary/core labels.
-        source = target.long()
-        remapped = target.clone()
-        remapped[source == 2] = 3
-        remapped[source == 3] = 4
-        remapped[source == 4] = 2
-        return remapped
-
-    def _prepare_boundary_fragment_target(self, target):
-        if isinstance(target, list):
-            return [self._prepare_boundary_fragment_target(item) for item in target]
-        if isinstance(target, tuple):
-            return tuple(self._prepare_boundary_fragment_target(item) for item in target)
-        if not torch.is_tensor(target):
-            raise TypeError(f"V162 expected tensor target or deep-supervision list, got {type(target)!r}")
-        return self._remap_v5_semantic_to_bfv3(target)
 
 
 class PengwinTrainerBoundaryFragmentSidecarV164(PengwinTrainerBoundaryFragmentV3):
@@ -13297,6 +4614,11 @@ class PengwinTrainerBoundaryFragmentSidecarV164(PengwinTrainerBoundaryFragmentV3
             hard_negative_center_probability=0.10,
             core_center_probability=min(0.50, max(0.0, core_prob)),
         )
+        # [V0.x][NOTE:DATALOADER][2026-06-04] SingleThreadedAugmenter kept on purpose:
+        # NonDetMultiThreadedAugmenter was measured WORSE here (GPU util 5/12 vs 8/12,
+        # workers spawn poorly under DDP for this custom sidecar loader). The real lever
+        # is reducing per-sample CPU in the _fragment_* loops (see _present_fragment_slices
+        # bbox optimization), not background workers.
         mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
         mt_gen_val = SingleThreadedAugmenter(dl_val, None)
         _ = next(mt_gen_train)
@@ -13311,72 +4633,8 @@ class PengwinTrainerBoundaryFragmentSidecarV164(PengwinTrainerBoundaryFragmentV3
         return None
 
 
-class PengwinTrainerBoundaryFragmentSidecarPrecisionV165(PengwinTrainerBoundaryFragmentSidecarV164):
-    """Dataset537 V165: same BFV3 sidecar target with ridge precision loss."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_ridgefit_precision"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_precision"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V165_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V165_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V165_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V165_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V165_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self._pengwin_oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE
-        ).strip().lower()
-        self.oversample_foreground_percent = float(os.environ.get("PENGWIN_BFV3_SIDECAR_OVERSAMPLE_FG", "0.95"))
-        # [AUDIT][Risk:Major][Scope:controlled_pair]
-        # V165 keeps V164's target/data contract and changes only the BFV3 loss
-        # toward class-2 ridge precision. It tests whether the actual target is
-        # learnable without changing decoder thresholds or data split.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarPrecisionV165] changed_variable=bfv3_ridgefit_precision_loss "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreSeedV166(PengwinTrainerBoundaryFragmentSidecarV164):
-    """Dataset537 V166: BFV3 sidecar target with explicit class-4 core loss."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_seed"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_seed"
-    CORE_CENTER_PROBABILITY = 0.40
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V166_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V166_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V166_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V166_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V166_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self._pengwin_oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE
-        ).strip().lower()
-        # [AUDIT][Risk:High][Scope:core_seed_recoverability]
-        # V164/V165 learned support/shell but failed class-4 seeds. V166 changes
-        # only the BFV3 loss and crop exposure needed to answer whether core
-        # markers are learnable at all under the current sidecar target.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreSeedV166] changed_variable=class4_core_seed_loss "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRidgeV167(PengwinTrainerBoundaryFragmentSidecarV164):
@@ -13475,295 +4733,22 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallRidgeV169(
         )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallMassCapV170(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallRidgeV169
-):
-    """Dataset537 V170: V169 with a moderate class-2 barrier mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_masscap"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V170_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V170_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V170_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V170_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V170_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self._pengwin_oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE
-        ).strip().lower()
-        # [AUDIT][Risk:High][Scope:barrier_overprediction_control]
-        # V169 proved class-2 recall is recoverable but overpredicted barrier
-        # mass by tens of times on cached hard-case target diagnostics. V170 keeps
-        # data, crop exposure, core terms, and decoder contract fixed; it changes
-        # only the differentiable class-2 false-mass budget.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallMassCapV170] changed_variable=class2_mass_ratio_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallTightMassCapV171(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallRidgeV169
-):
-    """Dataset537 V171: V169 with a tighter class-2 barrier mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_masscap_tight"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V171_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V171_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V171_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V171_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V171_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self._pengwin_oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE
-        ).strip().lower()
-        # [AUDIT][Risk:High][Scope:barrier_precision_recall_bracket]
-        # V171 changes only the mass cap strength relative to V170. The paired
-        # run brackets whether barrier precision improves before core seeds
-        # collapse, without changing split, target, or crop exposure.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallTightMassCapV171] changed_variable=tight_class2_mass_ratio_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallPositiveMassCapV172(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallRidgeV169
-):
-    """Dataset537 V172: V169 with positive-patch-only class-2 mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_pos_masscap"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V172_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V172_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V172_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V172_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V172_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self._pengwin_oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE
-        ).strip().lower()
-        # [AUDIT][Risk:High][Scope:barrier_mass_cap_isolation]
-        # V170 closed class-2 predictions. V172 removes the empty-patch penalty
-        # while keeping the positive-patch mass cap, isolating whether the
-        # no-barrier patch budget was too strong.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallPositiveMassCapV172] changed_variable=positive_only_class2_mass_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftPositiveMassCapV173(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallRidgeV169
-):
-    """Dataset537 V173: V169 with softer positive-patch-only class-2 mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_soft_pos_masscap"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V173_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V173_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V173_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V173_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V173_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self._pengwin_oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE
-        ).strip().lower()
-        # [AUDIT][Risk:High][Scope:barrier_mass_cap_strength]
-        # V173 changes only cap strength relative to V172. It checks whether a
-        # softer budget can retain V169 barrier recall while reducing the measured
-        # 20x-60x thresholded overprediction.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallSoftPositiveMassCapV173] changed_variable=soft_positive_class2_mass_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallVerySoftPositiveMassCapV174(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallRidgeV169
-):
-    """Dataset537 V174: V169 with very soft positive-patch-only class-2 mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_very_soft_pos_masscap"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V174_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V174_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V174_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V174_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V174_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self._pengwin_oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE
-        ).strip().lower()
-        # [AUDIT][Risk:High][Scope:barrier_mass_cap_recall_recovery]
-        # V173 reduced barrier overprediction but recall was too low. V174 changes
-        # only the positive mass cap strength to test whether recall can recover
-        # without returning to V169's broad false-barrier mask.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallVerySoftPositiveMassCapV174] changed_variable=very_soft_positive_class2_mass_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftMassCapStableScoreV175(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftPositiveMassCapV173
-):
-    """Dataset537 V175: V173 loss with barrier-stable checkpoint scoring."""
-
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V175_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V175_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V175_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V175_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V175_VAL_ITERS"])
-        # [AUDIT][Risk:High][Scope:checkpoint_selection]
-        # V173 produced a useful barrier/core epoch before later overpredicting
-        # class 2. V175 keeps the V173 loss fixed and changes only checkpoint
-        # selection so hard-case prediction uses a barrier-stable checkpoint.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallSoftMassCapStableScoreV175] "
-            "changed_variable=barrier_stable_checkpoint_score "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallVerySoftMassCapStableScoreV176(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallVerySoftPositiveMassCapV174
-):
-    """Dataset537 V176: V174 loss with barrier-stable checkpoint scoring."""
-
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V176_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V176_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V176_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V176_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V176_VAL_ITERS"])
-        # [AUDIT][Risk:High][Scope:checkpoint_selection]
-        # V174 restored more barrier recall but still exceeded the ratio gate.
-        # V176 keeps that loss fixed and lets checkpoint scoring select only
-        # epochs that balance recall with a bounded class-2 mass ratio.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallVerySoftMassCapStableScoreV176] "
-            "changed_variable=barrier_stable_checkpoint_score "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftMassCapStrictStableV177(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftMassCapStableScoreV175
-):
-    """Dataset537 V177: V175 with strict nonzero barrier-stable gate."""
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V177_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V177_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V177_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V177_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V177_VAL_ITERS"])
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallSoftMassCapStrictStableV177] "
-            "changed_variable=strict_nonzero_barrier_stable_checkpoint_gate "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallVerySoftMassCapStrictStableV178(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallVerySoftMassCapStableScoreV176
-):
-    """Dataset537 V178: V176 with strict nonzero barrier-stable gate."""
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V178_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V178_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V178_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V178_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V178_VAL_ITERS"])
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallVerySoftMassCapStrictStableV178] "
-            "changed_variable=strict_nonzero_barrier_stable_checkpoint_gate "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallLogitCalibratedV179(
@@ -13805,99 +4790,10 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallLogitCalibratedV179(
         )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallPrecisionLogitCalibratedV180(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallLogitCalibratedV179
-):
-    """Dataset537 V180: precision-biased class-2 logit calibration."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_precision_logit_calibrated"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V180_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V180_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V180_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V180_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V180_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        # [AUDIT][Risk:High][Scope:barrier_false_positive_control]
-        # V180 pairs V179 on the second GPU with stronger top-k false-barrier
-        # pressure. It tests the same calibration hypothesis under a
-        # precision-biased setting without changing data split or decoder target.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallPrecisionLogitCalibratedV180] "
-            "changed_variable=precision_biased_class2_logit_calibration "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallShellContrastV181(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallLogitCalibratedV179
-):
-    """Dataset537 V181: V180 follow-up targeting shell->barrier false positives."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_shell_contrast_logit_calibrated"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V181_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V181_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V181_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V181_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V181_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        # [AUDIT][Risk:High][Scope:barrier_shell_contrast]
-        # V180 hard-case threshold 0.4 false positives were dominated by shell
-        # voxels. V181 keeps the 5-class BFV3 scaffold and changes only the
-        # shell-vs-class2 contrast pressure.
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallShellContrastV181] "
-            "changed_variable=shell_vs_barrier_contrast "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallStrongShellContrastV182(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallShellContrastV181
-):
-    """Dataset537 V182: stronger shell-vs-barrier contrast."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_strong_shell_contrast_logit_calibrated"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V182_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V182_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V182_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V182_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V182_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallStrongShellContrastV182] "
-            "changed_variable=strong_shell_vs_barrier_contrast "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallBinaryBarrierHeadV183(
@@ -13997,91 +4893,10 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallBinaryBarrierHeadV183(
         }
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallPrecisionBinaryBarrierHeadV184(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallBinaryBarrierHeadV183
-):
-    """Dataset537 V184: precision-biased independent binary barrier head."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_precision_binary_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V184_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V184_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V184_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V184_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V184_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallPrecisionBinaryBarrierHeadV184] "
-            "output_channels=6 changed_variable=precision_biased_binary_barrier_head "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallPositiveFloorBinaryBarrierHeadV185(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallBinaryBarrierHeadV183
-):
-    """Dataset537 V185: binary barrier head with positive threshold floor."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_positive_floor_binary_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V185_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V185_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V185_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V185_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V185_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallPositiveFloorBinaryBarrierHeadV185] "
-            "output_channels=6 changed_variable=binary_barrier_positive_floor "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallPositiveFloorMassCapBinaryBarrierHeadV186(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallBinaryBarrierHeadV183
-):
-    """Dataset537 V186: positive-floor binary barrier head with mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_positive_floor_masscap_binary_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V186_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V186_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V186_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V186_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V186_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallPositiveFloorMassCapBinaryBarrierHeadV186] "
-            "output_channels=6 changed_variable=binary_barrier_positive_floor_plus_mass_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateBinaryBarrierHeadV187(
@@ -14151,149 +4966,14 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateBinaryBarrierHeadV
         }
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateMassCapBinaryBarrierHeadV188(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateBinaryBarrierHeadV187
-):
-    """Dataset537 V188: candidate-restricted binary barrier head with mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_candidate_masscap_binary_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V188_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V188_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V188_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V188_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V188_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallCandidateMassCapBinaryBarrierHeadV188] "
-            "output_channels=6 changed_variable=candidate_restricted_binary_barrier_head_plus_mass_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateSoftRidgeBarrierHeadV189(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateBinaryBarrierHeadV187
-):
-    """Dataset537 V189: candidate barrier head with soft ridge supervision."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_candidate_soft_ridge_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V189_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V189_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V189_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V189_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V189_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallCandidateSoftRidgeBarrierHeadV189] "
-            "output_channels=6 changed_variable=candidate_soft_ridge_barrier_target "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateSoftRidgeContrastBarrierHeadV190(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateSoftRidgeBarrierHeadV189
-):
-    """Dataset537 V190: soft ridge barrier head with stronger shell contrast."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_candidate_soft_ridge_contrast_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V190_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V190_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V190_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V190_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V190_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallCandidateSoftRidgeContrastBarrierHeadV190] "
-            "output_channels=6 changed_variable=candidate_soft_ridge_plus_shell_contrast_masscap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateLogitRidgeBarrierHeadV191(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateBinaryBarrierHeadV187
-):
-    """Dataset537 V191: pure soft-target logit ridge aux barrier head."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_candidate_logit_ridge_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V191_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V191_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V191_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V191_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V191_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallCandidateLogitRidgeBarrierHeadV191] "
-            "output_channels=6 changed_variable=pure_candidate_logit_ridge_barrier_target "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateLogitRidgePrecisionBarrierHeadV192(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateLogitRidgeBarrierHeadV191
-):
-    """Dataset537 V192: precision-biased pure soft-target logit ridge head."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_candidate_logit_ridge_precision_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V192_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V192_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V192_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V192_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V192_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallCandidateLogitRidgePrecisionBarrierHeadV192] "
-            "output_channels=6 changed_variable=precision_pure_candidate_logit_ridge_barrier_target "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193(
@@ -14325,329 +5005,26 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrier
         )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateMassCapBarrierHeadV194(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V194: dense local aux target with original-barrier mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_masscap_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V194_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V194_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V194_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V194_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V194_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateMassCapBarrierHeadV194] "
-            "output_channels=6 changed_variable=dense_local_barrier_aux_positive_target_plus_original_masscap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateWeakMassCapBarrierHeadV195(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V195: V193 dense aux target with weak original-mass control."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_weak_masscap_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V195_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V195_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V195_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V195_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V195_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateWeakMassCapBarrierHeadV195] "
-            "output_channels=6 changed_variable=dense_local_barrier_aux_target_plus_weak_original_masscap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftDenseCandidateBarrierHeadV196(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V196: adjacent shell is a soft dense aux target."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_soft_dense_candidate_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V196_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V196_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V196_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V196_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V196_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallSoftDenseCandidateBarrierHeadV196] "
-            "output_channels=6 changed_variable=soft_adjacent_shell_dense_barrier_aux_target "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateLongProbeV197(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V197: V193 dense aux target with a longer validation probe."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_binary_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V197_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V197_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V197_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V197_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V197_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateLongProbeV197] "
-            "output_channels=6 changed_variable=v193_dense_target_longer_probe "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateLowLRLongProbeV198(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V198: V193 dense aux target with a lower-LR longer probe."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_binary_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        # [AUDIT][Risk:Major][Scope:v198_optimizer_stability_bracket]
-        # V193 was the strongest short-gate dense-target signal but remained
-        # non-stable. V198 changes only the optimizer scale to test whether the
-        # same target collapses because the default BFV3 LR is too aggressive.
-        self.initial_lr = float(os.environ.get("PENGWIN_BFV3_V198_LR", "5e-3"))
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V198_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V198_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V198_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V198_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V198_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateLowLRLongProbeV198] "
-            "output_channels=6 changed_variable=v193_dense_target_low_lr_longer_probe "
-            f"lr={self.initial_lr:.6g} "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactV199(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V199: V197 dense barrier head with compact-biased core loss."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V199_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V199_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V199_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V199_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V199_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactV199] "
-            "output_channels=6 changed_variable=v197_dense_target_core_compact_loss "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreRecallV200(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V200: V197 dense barrier head with recall-biased core loss."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core_recall_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V200_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V200_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V200_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V200_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V200_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCoreRecallV200] "
-            "output_channels=6 changed_variable=v197_dense_target_core_recall_loss "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBarrierContrastV205(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V205: V197 dense barrier head with original-barrier contrast."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_barrier_contrast_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V205_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V205_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V205_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V205_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V205_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateBarrierContrastV205] "
-            "output_channels=6 changed_variable=v197_dense_target_original_barrier_shell_contrast "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftDenseCandidateBarrierContrastV206(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V206: soft-dense target bracket with original-barrier contrast."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_soft_dense_candidate_barrier_contrast_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V206_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V206_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V206_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V206_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V206_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallSoftDenseCandidateBarrierContrastV206] "
-            "output_channels=6 changed_variable=soft_dense_target_original_barrier_shell_contrast "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCoverageOpenV209(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V209: V197 dense barrier head with open core coverage bias."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core_coverage_open_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V209_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V209_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V209_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V209_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V209_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCoreCoverageOpenV209] "
-            "output_channels=6 changed_variable=v197_dense_target_open_core_coverage_loss "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCoverageGuardedV210(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V210: V209 core coverage bias with weak false-core guard."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core_coverage_guarded_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V210_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V210_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V210_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V210_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V210_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCoreCoverageGuardedV210] "
-            "output_channels=6 changed_variable=v197_dense_target_guarded_core_coverage_loss "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class _PengwinTrainerBoundaryFragmentSeedHeadBase(
@@ -14773,6 +5150,11 @@ class _PengwinTrainerBoundaryFragmentSeedHeadBase(
             hard_negative_center_probability=0.10,
             core_center_probability=min(0.50, max(0.0, core_prob)),
         )
+        # [V0.x][NOTE:DATALOADER][2026-06-04] SingleThreadedAugmenter kept on purpose:
+        # NonDetMultiThreadedAugmenter was measured WORSE here (GPU util 5/12 vs 8/12,
+        # workers spawn poorly under DDP for this custom sidecar loader). The real lever
+        # is reducing per-sample CPU in the _fragment_* loops (see _present_fragment_slices
+        # bbox optimization), not background workers.
         mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
         mt_gen_val = SingleThreadedAugmenter(dl_val, None)
         _ = next(mt_gen_train)
@@ -14886,586 +5268,34 @@ class _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase(
         }
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateInstanceCoreGuardV213(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V213: V197 six-channel head with instance-aware core guard."""
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_instance_core_guard_barrier_head"
 
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V213_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V213_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V213_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V213_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V213_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateInstanceCoreGuardV213] "
-            "output_channels=6 changed_variable=v197_instance_aware_core_mass_bridge_guard "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateInstanceCoreStrongGuardV214(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V214: stronger V213 bracket for bridge-core suppression."""
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_instance_core_strong_guard_barrier_head"
 
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V214_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V214_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V214_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V214_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V214_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateInstanceCoreStrongGuardV214] "
-            "output_channels=6 changed_variable=v197_strong_instance_aware_core_mass_bridge_guard "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBalancedContactV215(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193
-):
-    """Dataset537 V215: V197 six-channel head with bounded contact calibration."""
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_balanced_contact_barrier_head"
 
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V215_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V215_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V215_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V215_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V215_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateBalancedContactV215] "
-            "output_channels=6 changed_variable=v197_balanced_original_class2_contact_mass "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateFragmentPeakCoreV216(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V216: V197 six-channel head with weak per-fragment core peak shaping."""
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_fragment_peak_core_barrier_head"
 
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V216_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V216_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V216_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V216_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V216_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateFragmentPeakCoreV216] "
-            "output_channels=6 changed_variable=v197_weak_fragment_core_peak_gap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateWeakFragmentMassCoreV217(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V217: weak fragment core mass guard without bridge suppression."""
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_weak_fragment_mass_core_barrier_head"
 
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V217_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V217_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V217_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V217_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V217_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateWeakFragmentMassCoreV217] "
-            "output_channels=6 changed_variable=v197_weak_fragment_core_mass_guard_no_bridge "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateLooseFragmentMassCoreV218(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V218: looser V217 bracket for core mass pressure."""
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_loose_fragment_mass_core_barrier_head"
 
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V218_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V218_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V218_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V218_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V218_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateLooseFragmentMassCoreV218] "
-            "output_channels=6 changed_variable=v197_loose_fragment_core_mass_guard_no_bridge "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025WeakPeakCompactV219(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V219: V197 scaffold with weak core-0.25 peak compactness."""
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_weak_peak_compact_barrier_head"
 
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V219_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V219_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V219_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V219_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V219_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025WeakPeakCompactV219] "
-            "output_channels=6 changed_variable=v197_core025_weak_peak_compact_no_mass_bridge "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCompactV220(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V220: V197 scaffold with stronger core-0.25 peak compactness."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_strong_peak_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V220_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V220_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V220_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V220_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V220_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCompactV220] "
-            "output_channels=6 changed_variable=v197_core025_strong_peak_compact_no_mass_bridge "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakBalancedContactV241(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V241: V220 compactness plus mild bounded contact calibration."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_strong_peak_balanced_contact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V241_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V241_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V241_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V241_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V241_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakBalancedContactV241] "
-            "output_channels=6 changed_variable=v220_strong_peak_plus_mild_bounded_contact_calibration "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakTightBalancedContactV242(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V242: V241 paired bracket with tighter contact mass bounds."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_strong_peak_tight_balanced_contact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V242_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V242_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V242_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V242_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V242_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakTightBalancedContactV242] "
-            "output_channels=6 changed_variable=v220_strong_peak_plus_tight_bounded_contact_calibration "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakSoftContactRidgeV243(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V243: V220 compactness with soft logit-ridge contact targets."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_strong_peak_soft_contact_ridge_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V243_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V243_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V243_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V243_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V243_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakSoftContactRidgeV243] "
-            "output_channels=6 changed_variable=v220_strong_peak_plus_soft_contact_logit_ridge "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakPrecisionSoftContactRidgeV244(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V244: V243 paired bracket with precision-biased soft targets."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_strong_peak_precision_soft_contact_ridge_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V244_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V244_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V244_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V244_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V244_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakPrecisionSoftContactRidgeV244] "
-            "output_channels=6 changed_variable=v243_precision_biased_soft_contact_logit_ridge "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakContactShellContrastV245(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V245: V220 compactness with explicit contact-shell contrast."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_strong_peak_contact_shell_contrast_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V245_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V245_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V245_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V245_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V245_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakContactShellContrastV245] "
-            "output_channels=6 changed_variable=v220_strong_peak_plus_contact_shell_contrast "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakStrongContactShellContrastV246(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V246: V245 paired bracket with stronger shell suppression."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_strong_peak_strong_contact_shell_contrast_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V246_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V246_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V246_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V246_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V246_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakStrongContactShellContrastV246] "
-            "output_channels=6 changed_variable=v245_stronger_contact_shell_contrast "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakDecoderContactV247(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V247: decoder-facing channel5 contact contract.
-
-    [AUDIT][Risk:High][Scope:v247_single_variable]
-    V247은 V220의 core compactness/semantic scaffold를 유지하고, channel5만
-    `decoder_contact_logit`으로 재정의한다. V241-V246의 mass floor/cap,
-    soft ridge, shell contrast bracket은 섞지 않는다.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_decoder_contact_head"
-    DECODER_CONTACT_CENTER_SOURCE = "bfv3"
-    DECODER_CONTACT_CENTER_PROBABILITY = 0.35
-    DECODER_CONTACT_NEGATIVE_CENTER_PROBABILITY = 0.35
-    # [AUDIT][Risk:High][Scope:v247_checkpoint_selection]
-    # `PENGWIN_BFV3_V247_VAL_ITERS=1` short run에서 validation crop이 BFV3 label2를
-    # 포함하지 않으면 barrier recall/ratio가 no-contact crop의 false-positive count로
-    # 결정되어 stable checkpoint gate가 무의미해진다. V247 validation만 BFV3
-    # contact-positive crop을 강제해 checkpoint selection이 decoder-contact target을
-    # 실제로 보게 한다.
-    VAL_DECODER_CONTACT_CENTER_PROBABILITY = 1.0
-    VAL_DECODER_CONTACT_NEGATIVE_CENTER_PROBABILITY = 0.0
-    VAL_OVERSAMPLE_FOREGROUND_PERCENT = 1.0
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V247_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V247_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V247_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V247_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V247_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakDecoderContactV247] "
-            "output_channels=6 changed_variable=decoder_facing_contact_head_bfv3_label2_positive_label1_label3_label4_hard_negative_mass_budget "
-            "contact_contract=boundary_fragment_decoder_contact_v1 "
-            f"decoder_contact_center_source={self.DECODER_CONTACT_CENTER_SOURCE} "
-            f"decoder_contact_center_probability={self.DECODER_CONTACT_CENTER_PROBABILITY:.2f} "
-            f"decoder_contact_negative_center_probability={self.DECODER_CONTACT_NEGATIVE_CENTER_PROBABILITY:.2f} "
-            f"val_decoder_contact_center_probability={self.VAL_DECODER_CONTACT_CENTER_PROBABILITY:.2f} "
-            f"val_decoder_contact_negative_center_probability={self.VAL_DECODER_CONTACT_NEGATIVE_CENTER_PROBABILITY:.2f} "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def on_train_start(self):
-        super().on_train_start()
-        if self.local_rank == 0:
-            for filename in ("checkpoint_barrier_stable.pth", "checkpoint_barrier_stable_metrics.json"):
-                path = Path(self.output_folder) / filename
-                if path.exists():
-                    # [REPRO][Risk:High][Scope:checkpoint_selection]
-                    # V247 strict gate에서는 10e20i run 전체에서 ratio<=3 후보가 없을 수 있다.
-                    # 이전 run의 barrier-stable checkpoint가 남아 있으면 후속 hard-case
-                    # evaluation이 현재 run이 아니라 stale checkpoint를 평가하게 된다.
-                    # training start에서 V247 전용 stable artifact만 초기화해 current-run
-                    # checkpoint selection의 증거성을 보장한다.
-                    path.unlink()
-
-    def _sync_decoder_contact_loss_epoch(self) -> None:
-        if hasattr(self.loss, "set_current_epoch"):
-            # [REPRO][Risk:High][Scope:v247_contact_curriculum]
-            # V247 channel5 curriculum은 epoch에 따라 positive-only warmup에서
-            # BFV3 label3 hard-negative 단계로 넘어간다. train/validation step 전에
-            # loss에 같은 current_epoch를 전달해야 checkpoint score와 optimizer update가
-            # 동일한 decoder-contact contract를 본다.
-            self.loss.set_current_epoch(int(self.current_epoch))
-
-    def train_step(self, batch: dict) -> dict:
-        self._sync_decoder_contact_loss_epoch()
-        return super().train_step(batch)
-
-    @staticmethod
-    def _boundary_fragment_stable_score(metrics: dict[str, float]) -> float:
-        """V247 checkpoint score aligned to the fixed 0.50 decoder-contact contract."""
-        barrier_p = float(metrics.get("barrier_precision", 0.0))
-        barrier_r = float(metrics.get("barrier_recall", 0.0))
-        barrier_f05 = float(metrics.get("barrier_f0_5", 0.0))
-        barrier_ratio = float(metrics.get("barrier_pred_target_ratio", 0.0))
-        core_f1 = float(metrics.get("core_f1", 0.0))
-        shell_f1 = float(metrics.get("shell_f1", 0.0))
-        support_f1 = float(metrics.get("support_f1", 0.0))
-
-        # [AUDIT][Risk:High][Scope:v247_checkpoint_selection]
-        # V247의 decoder contract는 contact_prob >= 0.50 및 contact_ratio <= 3x다.
-        # 부모 BFV3 stable gate는 ratio 12x까지 허용해, 10e20i fresh run에서 내부
-        # ratio 5.68 checkpoint가 저장되고 hard-case ratio 3.99로 실패했다. V247만
-        # strict gate를 오버라이드해 checkpoint selection도 train/eval contract와 같은
-        # 실패 조건을 보게 한다.
-        if barrier_f05 <= 0.0 or barrier_p < 0.01 or barrier_r <= 0.0:
-            return 0.0
-        if barrier_ratio < 0.25 or barrier_ratio > 3.0:
-            return 0.0
-
-        ratio_safe = max(barrier_ratio, 1e-6)
-        ratio_score = float(np.exp(-abs(np.log(ratio_safe))))
-        base = (
-            0.18 * support_f1
-            + 0.16 * shell_f1
-            + 0.28 * barrier_f05
-            + 0.16 * barrier_p
-            + 0.12 * barrier_r
-            + 0.05 * core_f1
-            + 0.10 * ratio_score
-        )
-        # [QA][Status:Not run][Test:v247_checkpoint_ratio_gate]
-        # Expected: patch validation에서 contact_ratio > 3x인 epoch는
-        # checkpoint_barrier_stable 후보가 될 수 없다. ratio가 너무 낮아 recall이
-        # 사실상 닫힌 checkpoint도 `barrier_r <= 0`와 ratio lower bound로 제외한다.
-        return float(base)
-
-    def validation_step(self, batch: dict) -> dict:
-        self._sync_decoder_contact_loss_epoch()
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if (
-            not isinstance(target_for_loss, dict)
-            or "semantic" not in target_for_loss
-        ):
-            raise ValueError(
-                "V247 validation requires target dict with semantic labels"
-            )
-        semantic_target = target_for_loss["semantic"]
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_BINARY_BARRIER_OUTPUT_CHANNELS):
-            raise ValueError(f"V247 expected validation logits [B, 6, D, H, W], got {tuple(logits.shape)}")
-
-        semantic_logits = logits[:, :5].float()
-        semantic_prob = torch.softmax(semantic_logits, dim=1)
-        semantic_pred = torch.argmax(semantic_logits, dim=1)
-        labels = semantic_target[:, 0].long() if semantic_target.ndim == 5 else semantic_target.long()
-        support_t = (labels == 2) | (labels == 3) | (labels == 4)
-        # [METRIC][Scope:contact_threshold]
-        # V247 loss target은 BFV3 label2(thin_contact_ridge)다. Patch validation도
-        # 같은 decoder-facing target을 사용해야 checkpoint selection이 train target과
-        # 같은 channel5 calibration을 본다. Full hard-case eval은 별도로 V5 label4
-        # contact band에 대해 recall/ratio를 측정한다.
-        barrier_t = labels == 2
-        core_t = labels == 4
-        shell_t = (labels == 2) | (labels == 3)
-
-        # [AUDIT][Risk:High][Scope:v247_checkpoint_selection]
-        # V247 eval decoder는 channel5 direct contact와 support gate `(p2+p3+p4) >= 0.50`를
-        # 함께 적용한다. patch validation이 support gate 없이 channel5만 세면 background
-        # false contact가 checkpoint score를 지배해 실제 decoder contract와 다른 checkpoint를
-        # 고른다.
-        support_p = torch.clamp(semantic_prob[:, 2] + semantic_prob[:, 3] + semantic_prob[:, 4], 0.0, 1.0) >= 0.5
-        barrier_p = (torch.sigmoid(logits[:, 5].float()) >= 0.5) & support_p
-        core_p = semantic_pred == 4
-        shell_p = barrier_p | (semantic_pred == 3)
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": self._binary_counts(support_p, support_t),
-            "barrier_counts": self._binary_counts(barrier_p, barrier_t),
-            "core_counts": self._binary_counts(core_p, core_t),
-            "shell_counts": self._binary_counts(shell_p, shell_t),
-            "pred_target_barrier": np.asarray([
-                float(barrier_p.sum().detach().cpu()),
-                float(barrier_t.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakXYZAffinityV248(
@@ -15748,7 +5578,7 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
         if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_AFFINITY13_SEED_OUTPUT_CHANNELS):
             raise ValueError(f"V253 expected validation logits [B, 18, D, H, W], got {tuple(logits.shape)}")
         labels = semantic_target[:, 0].long() if semantic_target.ndim == 5 else semantic_target.long()
-        support_t = (instance_for_edges > 0) & (instance_for_edges <= 150)
+        support_t = (instance_for_edges > 0) & (instance_for_edges <= MAX_INSTANCE_ID)
         fracture_t = labels == 2
         seed_t = seed_target.float() > 0.5
         support_p = torch.sigmoid(logits[:, 0].float()) >= 0.5
@@ -15773,48 +5603,6 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
                 float(barrier_t.sum().detach().cpu()),
             ], dtype=np.float64),
         }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakAffinity13ContactHardNegativeSeedHealedV254(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakAffinity13SeedHealedV253
-):
-    """Dataset537 V254: V253 decoder contract with explicit contact hard-negative affinity loss.
-
-    [AUDIT][Risk:High][Scope:v254_fulltrain_gate]
-    V253 forensic showed support Dice below 0.90 and different-fragment/contact
-    edge join rate around 0.97. This trainer keeps the 18-channel V253 output and
-    seed-healed decoder fixed, changing only affinity supervision for hard negatives.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_affinity13_contact_hard_negative_seed_healed_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V254_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V254_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V254_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V254_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V254_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V254_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V254_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakAffinity13ContactHardNegativeSeedHealedV254] "
-            "output_channels=18 changed_variable=explicit_different_fragment_contact_hard_negative_affinity "
-            "decoder=task1_v253_affinity13_seed_healed "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedHealedV255(
@@ -15913,7 +5701,7 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
         if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_MUTEX13_SEED_OUTPUT_CHANNELS):
             raise ValueError(f"V255 expected validation logits [B, 31, D, H, W], got {tuple(logits.shape)}")
         labels = semantic_target[:, 0].long() if semantic_target.ndim == 5 else semantic_target.long()
-        support_t = (instance_for_edges > 0) & (instance_for_edges <= 150)
+        support_t = (instance_for_edges > 0) & (instance_for_edges <= MAX_INSTANCE_ID)
         fracture_t = labels == 2
         seed_t = seed_target.float() > 0.5
         support_p = torch.sigmoid(logits[:, 0].float()) >= 0.5
@@ -15939,246 +5727,6 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
                 float(barrier_t.sum().detach().cpu()),
             ], dtype=np.float64),
         }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SupportLeakGuardSeedHealedV256(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedHealedV255
-):
-    """Dataset537 V256: V255 mutex decoder with false-support edge supervision.
-
-    [AUDIT][Risk:High][Scope:v256_fulltrain_gate]
-    V255 oracle는 통과했지만 learned hard3에서 predicted support가 넓어지고
-    support 밖 edge가 전부 join되었다. V256은 31채널 output/decoder를 유지한 채
-    decoder가 실제로 보는 support-leak edge를 hard negative로 추가한다.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_mutex13_support_leak_guard_seed_healed_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V256_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V256_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V256_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V256_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V256_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V256_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V256_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SupportLeakGuardSeedHealedV256] "
-            "output_channels=31 changed_variable=decoder_visible_support_leak_edge_hard_negative "
-            "decoder=task1_v255_mutex13_seed_healed "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedStableSupportLeakGuardSeedHealedV257(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SupportLeakGuardSeedHealedV256
-):
-    """Dataset537 V257: V256 plus decoder-facing seed-body stability.
-
-    [AUDIT][Risk:High][Scope:v257_fulltrain_gate]
-    V256 hard3 showed channel4 seed_body collapse in both directions: fold0
-    produced massive threshold-level seed voxels while fold1 produced none.
-    Task1 Instance/Topology cannot reach 0.90+ if the seed-healed decoder has no
-    stable fragment anchors, so V257 keeps the 31-channel mutex decoder and adds
-    fragment-level seed presence plus false-seed suppression.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_mutex13_seed_stable_support_leak_guard_seed_healed_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V257_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V257_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V257_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V257_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V257_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V257_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V257_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedStableSupportLeakGuardSeedHealedV257] "
-            "output_channels=31 changed_variable=decoder_seed_body_stability "
-            "decoder=task1_v255_mutex13_seed_healed "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedPeakSupportLeakGuardSeedHealedV258(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SupportLeakGuardSeedHealedV256
-):
-    """Dataset537 V258: V256 plus decoder-facing seed-center peak markers.
-
-    [AUDIT][Risk:High][Scope:v258_fulltrain_gate]
-    V257 proved that a dense seed threshold mask is unstable: one fold produced
-    zero seed markers while another produced a broad seed_center field. Task1
-    Instance/Merge/Split/Topology needs stable markers, so V258 keeps the 31ch
-    mutex graph and changes the seed contract to local peak markers from
-    channel3 seed_center.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_mutex13_seed_peak_support_leak_guard_seed_healed_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V258_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V258_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V258_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V258_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V258_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V258_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V258_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedPeakSupportLeakGuardSeedHealedV258] "
-            "output_channels=31 changed_variable=decoder_seed_center_peak_nms "
-            "decoder=task1_v258_mutex13_seed_peak_healed "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedPeakBodySupportLeakGuardSeedHealedV259(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SupportLeakGuardSeedHealedV256
-):
-    """Dataset537 V259: V258 peak decoder, compact seed-body training target.
-
-    [AUDIT][Risk:High][Scope:v259_fulltrain_gate]
-    V258 hard3 folded into one predicted fragment per anatomy because channel3
-    seed_center stayed below threshold and decoder used top1 fallback. V259 keeps
-    the same peak-NMS decoder but trains channel3 from compact seed_body positives
-    so local peaks can appear without relying on fallback.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_mutex13_seed_peak_body_support_leak_guard_seed_healed_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V259_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V259_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V259_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V259_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V259_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V259_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V259_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedPeakBodySupportLeakGuardSeedHealedV259] "
-            "output_channels=31 changed_variable=decoder_seed_center_peak_body_target "
-            "decoder=task1_v258_mutex13_seed_peak_healed "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13FractureSeedCalibratedSupportLeakGuardSeedHealedV260(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SupportLeakGuardSeedHealedV256
-):
-    """Dataset537 V260: decoder-visible fracture barrier and seed peak calibration.
-
-    [AUDIT][Risk:High][Scope:v260_fulltrain_gate]
-    V259 proved support/local Dice can reach 0.90+, but fracture/seed logits stayed
-    below 0.50 and every hard3 anatomy decoded as one fragment or over-split under
-    geometry-only watershed. V260 keeps the 31-channel mutex contract and changes
-    the train/eval contract toward Task1 Instance/Fracture/Topology metrics.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_mutex13_fracture_seed_calibrated_support_leak_guard_seed_healed_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V260_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V260_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V260_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V260_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V260_VAL_ITERS"])
-        # [QC][Risk:High][Scope:v260_gpu_memory]
-        # V260 smoke에서 batch_size=2는 RTX 3090 24GB에서 기존 support-leak hard
-        # negative 선택부가 OOM을 냈다. fulltrain gate가 시작 전에 실패하지 않도록
-        # V260 기본 batch는 1로 고정하고, 명시 env가 있을 때만 override한다.
-        batch_override = os.environ.get("PENGWIN_BFV3_V260_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V260_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13FractureSeedCalibratedSupportLeakGuardSeedHealedV260] "
-            "output_channels=31 changed_variable=decoder_visible_fracture_barrier_and_seed_peak_calibration "
-            "decoder=task1_v260_seed_fracture_watershed "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakPairwiseSoftmaxMutex13SeedHealedV266(
@@ -16258,7 +5806,7 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
         if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_MUTEX13_SEED_OUTPUT_CHANNELS):
             raise ValueError(f"V266 expected validation logits [B, 31, D, H, W], got {tuple(logits.shape)}")
         labels = semantic_target[:, 0].long() if semantic_target.ndim == 5 else semantic_target.long()
-        support_t = (instance_for_edges > 0) & (instance_for_edges <= 150)
+        support_t = (instance_for_edges > 0) & (instance_for_edges <= MAX_INSTANCE_ID)
         same_edge, contact_edge, _leak_edge, valid_edge = BoundaryFragmentV3Core025StrongPeakPairwiseSoftmaxMutex13SeedHealedHeadLoss._same_contact_leak_edges(
             instance_for_edges.to(device=logits.device)
         )
@@ -16364,7 +5912,7 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
         if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_MUTEX13_SEED_OUTPUT_CHANNELS):
             raise ValueError(f"V268 expected validation logits [B, 31, D, H, W], got {tuple(logits.shape)}")
 
-        support_t = (instance_for_edges > 0) & (instance_for_edges <= 150)
+        support_t = (instance_for_edges > 0) & (instance_for_edges <= MAX_INSTANCE_ID)
         same_edge, different_fragment_edge, _leak_edge, valid_edge = (
             BoundaryFragmentV3Core025StrongPeakNoContactPairwiseSoftmaxMutex13SeedHealedHeadLoss
             ._same_contact_leak_edges(instance_for_edges.to(device=logits.device))
@@ -16488,7 +6036,7 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
         if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_NO_CONTACT_PAIRWISE_V273_OUTPUT_CHANNELS):
             raise ValueError(f"V273 expected validation logits [B, 28, D, H, W], got {tuple(logits.shape)}")
 
-        support_t = (instance_for_edges > 0) & (instance_for_edges <= 150)
+        support_t = (instance_for_edges > 0) & (instance_for_edges <= MAX_INSTANCE_ID)
         same_edge, different_fragment_edge, _leak_edge, valid_edge = (
             BoundaryFragmentV3Core025StrongPeakNoContactPairwiseSoftmaxSeedHealedV273HeadLoss
             ._same_contact_leak_edges(instance_for_edges.to(device=logits.device))
@@ -16515,386 +6063,6 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
                 float(barrier_t.sum().detach().cpu()),
             ], dtype=np.float64),
         }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxSeedCalibratedV274(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxSeedHealedV273
-):
-    """Dataset537 V274: V273 no-contact pairwise graph with sparse seed calibration.
-
-    [AUDIT][Risk:Blocker][Scope:v274_fulltrain_gate]
-    V273 true overfit003 failed before fulltrain: support Dice reached ~0.91-0.93,
-    but seed channel predicted hundreds of thousands of support voxels as seed for
-    targets of only 113-890 voxels. V274 keeps the 28-channel no-contact decoder
-    and changes only the seed calibration loss.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_pairwise_softmax_seed_calibrated_v274_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V274_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V274_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V274_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V274_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V274_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V274_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V274_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxSeedCalibratedV274] "
-            "output_channels=28 changed_variable=seed_anchor_calibration_no_contact "
-            "decoder=task1_v273_no_contact_pairwise_seed_healed "
-            f"channel_names={','.join(BFV3_NO_CONTACT_PAIRWISE_V273_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordPairwiseV284(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxSeedHealedV273
-):
-    """Dataset537 V284: no-contact V273 pairwise graph with full-ROI coordinates.
-
-    [AUDIT][Risk:Blocker][Scope:v284_partition_topology]
-    V283 proved support/geometry can be learned without contact, but GT-support
-    evaluation still failed on LeftHip partition/topology. V273's no-contact
-    pairwise oracle already reaches the Task1 proxy gate, so V284 keeps that
-    decoder-facing join/cut graph and changes only the input representation to
-    the full-ROI global coordinate channels that fixed V282's patch/full-volume
-    coordinate mismatch.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_global_coord_pairwise_v284_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:channel_contract]
-        # V284 input is original preprocessed ROI channels + full-ROI z/y/x
-        # coordinate channels. Output is exactly V273-compatible 28 logits:
-        # support, seed_body, join13, cut13. No contact/fracture scalar row is
-        # reintroduced.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            int(num_input_channels) + 3,
-            BFV3_NO_CONTACT_PAIRWISE_V273_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V284_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V284_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V284_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V284_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V284_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V284_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V284_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordPairwiseV284] "
-            "output_channels=28 changed_variable=full_roi_global_coords_plus_no_contact_pairwise_join_cut "
-            "decoder=task1_v273_no_contact_pairwise_seed_healed "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_NO_CONTACT_PAIRWISE_V273_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        if len(patch_size) != 3:
-            raise RuntimeError("V284 global-coordinate pairwise training supports only 3D fullres training.")
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        instance_sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        target_sidecar_dir = Path(self.preprocessed_dataset_folder) / BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR
-        if not instance_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BICM V5 instance sidecar directory missing: {instance_sidecar_dir}")
-        if not target_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BoundaryFragment V3 target sidecar directory missing: {target_sidecar_dir}")
-        edge_prob = float(os.environ.get(
-            "PENGWIN_BFV3_SIDECAR_CONTACT_CENTER_PROB",
-            str(getattr(self, "EDGE_CENTER_PROBABILITY", 0.65)),
-        ))
-        support_prob = float(os.environ.get("PENGWIN_BFV3_SIDECAR_SUPPORT_CENTER_PROB", "0.15"))
-        tiny_prob = float(os.environ.get("PENGWIN_BFV3_SIDECAR_TINY_CENTER_PROB", "0.15"))
-        hard_prob = float(os.environ.get("PENGWIN_BFV3_SIDECAR_HARD_CENTER_PROB", "0.05"))
-        core_prob = float(os.environ.get(
-            "PENGWIN_BFV3_SIDECAR_CORE_CENTER_PROB",
-            str(getattr(self, "CORE_CENTER_PROBABILITY", 0.0)),
-        ))
-        seed_radius_vox = float(os.environ.get("PENGWIN_BFV3_SEED_RADIUS_VOX", "2.0"))
-        decoder_contact_center_source = os.environ.get(
-            "PENGWIN_BFV3_DECODER_CONTACT_CENTER_SOURCE",
-            str(getattr(self, "DECODER_CONTACT_CENTER_SOURCE", "v5")),
-        ).strip().lower()
-        val_oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BFV3_VAL_OVERSAMPLE_FOREGROUND_PERCENT",
-            str(getattr(self, "VAL_OVERSAMPLE_FOREGROUND_PERCENT", 0.33)),
-        ))
-        self.print_to_log_file(
-            "[BoundaryFragmentGlobalCoordPairwiseV284] sidecar dirs "
-            f"instance={instance_sidecar_dir} target={target_sidecar_dir} "
-            f"seed_radius_vox={seed_radius_vox} "
-            f"center_probs(core/contact/support/tiny/hard)=({core_prob},{edge_prob},{support_prob},{tiny_prob},{hard_prob}) "
-            "global_coord_channels=3 contact_input_channels=0 contact_loss_channels=0"
-        )
-        # [DATA][Risk:High][Scope:v284_no_contact_sampler]
-        # V284는 contact scalar를 버린 active path다. crop exposure는 instance sidecar의
-        # fragment/support priority center와 BFV3 sidecar target만 사용하고, decoder-contact
-        # centered sampling은 0으로 고정한다.
-        dl_tr = PengwinBoundaryFragmentGlobalCoordDataLoader3D(
-            dataset_tr,
-            self.batch_size,
-            patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=self.oversample_foreground_percent,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            seed_radius_vox=seed_radius_vox,
-            decoder_contact_center_probability=0.0,
-            decoder_contact_negative_center_probability=0.0,
-            decoder_contact_center_source=decoder_contact_center_source,
-            edge_center_probability=edge_prob,
-            support_negative_center_probability=support_prob,
-            tiny_center_probability=tiny_prob,
-            hard_negative_center_probability=hard_prob,
-            core_center_probability=core_prob,
-        )
-        dl_val = PengwinBoundaryFragmentGlobalCoordDataLoader3D(
-            dataset_val,
-            self.batch_size,
-            self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=val_oversample_foreground_percent,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            seed_radius_vox=seed_radius_vox,
-            decoder_contact_center_probability=0.0,
-            decoder_contact_negative_center_probability=0.0,
-            decoder_contact_center_source=decoder_contact_center_source,
-            edge_center_probability=0.40,
-            support_negative_center_probability=0.30,
-            tiny_center_probability=0.20,
-            hard_negative_center_probability=0.10,
-            core_center_probability=min(0.50, max(0.0, core_prob)),
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFragmentPositionV275(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxSeedHealedV273
-):
-    """Dataset537 V275: contact/seed/pairwise 없는 dense fragment-position contract.
-
-    [AUDIT][Risk:Blocker][Scope:v275_fulltrain_gate]
-    V273/V274는 support를 학습했지만 learned seed/pairwise graph가 split 폭발을
-    만들었다. V275는 graph decoder를 제거하고, Task1 공식 ID range의 anatomy-local
-    fragment position class 0..50을 직접 예측한다. fulltrain 승격은 contact 지표가
-    아니라 Task1 proxy와 visual audit로만 판단한다.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_fragment_position_v275_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = True
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = True
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:output_contract]
-        # V275 output is exactly 51 logits: 0 background, 1..50 anatomy-local
-        # fragment position classes. There are no contact, seed, join, or cut rows.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BFV3_FRAGMENT_POSITION_V275_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxMutex13SeedHealedV268.__init__(
-            self,
-            plans,
-            configuration,
-            fold,
-            dataset_json,
-            unpack_dataset=unpack_dataset,
-            device=device,
-        )
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V275_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V275_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V275_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V275_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V275_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V275_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V275_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFragmentPositionV275] "
-            "output_channels=51 changed_variable=remove_contact_seed_pairwise_predict_fragment_position "
-            "decoder=task1_v275_fragment_position_argmax "
-            f"channel_names={','.join(BFV3_FRAGMENT_POSITION_V275_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if not isinstance(target_for_loss, dict) or "instance" not in target_for_loss:
-            raise ValueError("V275 validation requires instance targets")
-        instance = target_for_loss["instance"]
-        if instance.ndim == 5 and int(instance.shape[1]) == 1:
-            instance_for_position = instance[:, 0].long()
-        else:
-            instance_for_position = instance.long()
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_FRAGMENT_POSITION_V275_OUTPUT_CHANNELS):
-            raise ValueError(f"V275 expected validation logits [B, 51, D, H, W], got {tuple(logits.shape)}")
-
-        local_target = (
-            BoundaryFragmentV3Core025StrongPeakNoContactFragmentPositionV275HeadLoss
-            ._local_position_target(instance_for_position.to(device=logits.device))
-        )
-        local_pred = torch.argmax(logits.float(), dim=1).long()
-        support_t = local_target > 0
-        support_p = local_pred > 0
-        exact_position_p = (local_pred == local_target) & support_t
-        same_edge_p, different_edge_p, _leak_p, _valid_p = (
-            BoundaryFragmentV3Core025StrongPeakNoContactPairwiseSoftmaxSeedHealedV273HeadLoss
-            ._same_contact_leak_edges(local_pred.to(device=logits.device))
-        )
-        same_edge_t, different_edge_t, _leak_t, _valid_t = (
-            BoundaryFragmentV3Core025StrongPeakNoContactPairwiseSoftmaxSeedHealedV273HeadLoss
-            ._same_contact_leak_edges(local_target.to(device=logits.device))
-        )
-        barrier_p = self._affinity13_edge_mask_to_voxel_mask(different_edge_p)
-        barrier_t = self._affinity13_edge_mask_to_voxel_mask(different_edge_t)
-        # [METRIC][Scope:validation_proxy]
-        # V275 patch validation은 argmax class/surface sanity만 본다. fulltrain gate는
-        # hard3/true-overfit Task1 proxy와 visual audit이며 IoU-F/contact는 승격 기준이 아니다.
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": self._binary_counts(support_p, support_t),
-            "barrier_counts": self._binary_counts(barrier_p, barrier_t),
-            "core_counts": self._binary_counts(exact_position_p, support_t),
-            "shell_counts": self._binary_counts(barrier_p | support_p, barrier_t | support_t),
-            "pred_target_barrier": np.asarray([
-                float(barrier_p.sum().detach().cpu()),
-                float(barrier_t.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFragmentPositionDiceV276(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFragmentPositionV275
-):
-    """Dataset537 V276: V275 decoder 유지, rare fragment class Dice만 추가한다."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_fragment_position_dice_v276_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V276_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V276_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V276_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V276_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V276_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V276_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V276_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFragmentPositionDiceV276] "
-            "output_channels=51 changed_variable=rare_fragment_position_class_dice_no_contact "
-            "decoder=task1_v275_fragment_position_argmax "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSeparatorGapV277(
@@ -17014,47 +6182,6 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
                 float(separator_t.sum().detach().cpu()),
             ], dtype=np.float64),
         }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSeparatorEnergyV278(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSeparatorGapV277
-):
-    """Dataset537 V278: V277 decoder 유지 + dense separator-energy supervision."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_separator_energy_v278_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V278_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V278_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V278_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V278_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V278_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V278_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V278_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSeparatorEnergyV278] "
-            "output_channels=2 changed_variable=dense_separator_energy_no_contact "
-            "decoder=task1_v278_separator_energy_cc_min100 "
-            f"channel_names={','.join(BFV3_SEPARATOR_ENERGY_V278_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSeparatorSoftmaxV287(
@@ -17284,6 +6411,11 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
         # eval.py Task1 official-aligned proxy로 판단한다. on_validation_epoch_end는
         # V277/V287 시절의 키를 그대로 기대하므로 boundary/support를 V287의
         # barrier/shell 슬롯에 alias한다 (의미적으로 동일 — separator == boundary).
+        #
+        # [METRIC][FIX:M6][2026-05-31] shell_counts 가 support_counts 와 동일했던
+        # copy-paste 버그를 수정. V287 의 shell 의도 (support ∪ separator, 즉 표면
+        # 강조) 를 V288 ABBC 4-class 컨트랙트에서는 boundary alone 으로 매핑한다.
+        # boundary 가 V287 separator 의 후속 클래스이므로 가장 의미적으로 정합.
         boundary_counts = self._binary_counts(boundary_p, boundary_t)
         support_counts = self._binary_counts(support_p, support_t)
         return {
@@ -17293,7 +6425,7 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
             "boundary_counts": boundary_counts,
             "core_counts": self._binary_counts(core_p, core_t),
             "border_counts": self._binary_counts(border_p, border_t),
-            "shell_counts": support_counts,
+            "shell_counts": boundary_counts,  # FIX:M6 — support_counts 와 동일했던 버그
             "pred_target_barrier": np.asarray([
                 float(boundary_p.sum().detach().cpu()),
                 float(boundary_t.sum().detach().cpu()),
@@ -17305,147 +6437,20 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
         }
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSDFV289(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV288
-):
-    """Dataset537 V289: ABBC representation with channel 2 SDF regression.
-
-    [AUDIT][Risk:Blocker][Scope:v289_boundary_supervision_redesign]
-    V288 50e20i hard-trio reached Dice 0.9275 / Local Dice 0.9055 but Instance F1
-    stayed at 0.5317 because boundary head precision/recall stayed below 0.10/0.22.
-    V289 replaces the softmax boundary class with a per-voxel signed distance
-    field on channel 2; channels 0/1/3 still carry softmax logits for
-    {background, border, core}. Decoder uses softmax-argmax over (0,1,3) and an
-    SDF threshold for the boundary mask used by the watershed.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_abbc_sdf_v289_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:output_contract]
-        # V289 output is 4 channels: 0 background logit, 1 border logit,
-        # 2 boundary SDF regression (no activation), 3 core logit.
-        # Softmax is applied at decode time over channels {0, 1, 3} only.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BFV3_ABBC_SDF_V289_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V289_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V289_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V289_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V289_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V289_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V289_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V289_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSDFV289] "
-            "output_channels=4 changed_variable=boundary_softmax_class_replaced_by_sdf_regression "
-            "decoder=task1_v289_abbc_sdf_core_seed_watershed "
-            f"channel_names={','.join(BFV3_ABBC_SDF_V289_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if not isinstance(target_for_loss, dict) or "instance" not in target_for_loss:
-            raise ValueError("V289 validation requires instance targets")
-        instance = target_for_loss["instance"]
-        if instance.ndim == 5 and int(instance.shape[1]) == 1:
-            instance_for_target = instance[:, 0].long()
-        else:
-            instance_for_target = instance.long()
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_ABBC_SDF_V289_OUTPUT_CHANNELS):
-            raise ValueError(f"V289 expected validation logits [B, 4, D, H, W], got {tuple(logits.shape)}")
-        # 3-class softmax over (0, 1, 3); channel 2 is SDF regression.
-        softmax_logits = torch.stack([logits[:, 0], logits[:, 1], logits[:, 3]], dim=1)
-        probs = torch.softmax(softmax_logits.float(), dim=1)
-        background_p = probs[:, 0] >= 0.5
-        support_p = ~background_p
-        core_p = (probs[:, 2] >= 0.5) & support_p
-        border_p = (probs[:, 1] >= 0.5) & support_p
-        sdf_threshold = float(os.environ.get("PENGWIN_BFV3_V289_SDF_THRESHOLD", "2.0"))
-        sdf_pred = logits[:, 2].float()
-        boundary_p = (sdf_pred < float(sdf_threshold)) & support_p
-        # Build patch targets for diagnostic metrics.
-        v288_class_target, support_t = (
-            BoundaryFragmentV3Core025StrongPeakNoContactABBCV288HeadLoss
-            ._abbc_class_target(
-                instance_for_target.to(device=logits.device),
-                boundary_dilate_vox=2,
-                core_erode_vox=2,
-            )
-        )
-        core_t = v288_class_target == 3
-        boundary_t = v288_class_target == 2
-        border_t = v288_class_target == 1
-        boundary_counts = self._binary_counts(boundary_p, boundary_t)
-        support_counts = self._binary_counts(support_p, support_t)
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": support_counts,
-            "barrier_counts": boundary_counts,
-            "boundary_counts": boundary_counts,
-            "core_counts": self._binary_counts(core_p, core_t),
-            "border_counts": self._binary_counts(border_p, border_t),
-            "shell_counts": support_counts,
-            "pred_target_barrier": np.asarray([
-                float(boundary_p.sum().detach().cpu()),
-                float(boundary_t.sum().detach().cpu()),
-            ], dtype=np.float64),
-            "pred_target_core": np.asarray([
-                float(core_p.sum().detach().cpu()),
-                float(core_t.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
 
 
 class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV291(
     PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV288
 ):
-    """Dataset537 V291: V288 ABBC with boundary class weight on CE+Dice (no SDF).
+    """Dataset537 V291: V288 ABBC 기반 트레이너에 경계(boundary) 클래스 가중치를 CE+Dice 손실에 적용한 버전 (SDF 미사용).
 
     [AUDIT][Risk:Blocker][Scope:v291_boundary_class_weight]
-    V288 boundary head precision/recall ~0.07/0.21 because the boundary class is
-    sparse and equally weighted in the 4-class softmax loss. V291 multiplies the
-    boundary class CE and Dice terms by 5x. No SDF, no EDT -- inherits V288
-    throughput (~38 sec/epoch). Decoder/predict/eval all reuse V288 paths.
+    V288의 boundary head precision/recall이 약 0.07/0.21에 그치는 이유는
+    경계 클래스가 희소(sparse)한데 4-class softmax 손실에서 다른 클래스와
+    동일한 가중치로 학습되기 때문이다. V291은 경계 클래스의 CE와 Dice 항을
+    5배로 곱해 학습 신호를 강화한다. SDF나 EDT는 사용하지 않으므로
+    V288의 처리량(에폭당 약 38초)을 그대로 물려받는다.
+    디코더/예측/평가 경로는 모두 V288의 것을 재사용한다.
     """
 
     DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_abbc_v291_head"
@@ -17500,24 +6505,157 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
         )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSDFFDMV290(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSDFV289
-):
-    """Dataset537 V290: V289 ABBC+SDF with FDM-weighted SmoothL1 on the SDF channel.
 
-    [AUDIT][Risk:Blocker][Scope:v290_fdm_weighted_sdf]
-    V289 50e validation barrier_pred_target_ratio collapsed to 0.0 because the SDF
-    target is dominated by mid-range distances. V290 keeps the V289 output/decoder
-    contract and changes only the SDF loss: weighted SmoothL1 where the weight
-    decays exp(-sdf_target / fdm_scale_vox) so boundary-proximal voxels get up
-    to ~10x more gradient than far-from-boundary support voxels.
+
+# =============================================================================
+# [V0.x][PHASE 2A][2026-05-31] BADB: Boundary Attention Decoder Branch
+# =============================================================================
+#
+# V0~V72 ablation 의 종합 교훈: contact precision/recall 트레이드오프는 BICM 5-class
+# softmax + factorized head 의 fundamental 한계. V0.x 의 진단 #4 에서 ABBC 의 contact
+# 비율이 0.03% 수준으로 sparse class collapse 가 확인됨.
+#
+# PENGWIN 2024 1위 (MIC-DKFZ) 의 차별점: ABBC + medial axis 기반 dynamic boundary
+# thickness. 그러나 architecture 측 inductive bias 없이는 (= V291 처럼 단순 loss
+# weight 변경만으로는) 0.03% sparse contact 학습이 어려움.
+#
+# Phase 1 (Dynamic boundary, utils.compute_abbc_official_target_dynamic): target 측
+#   contact ratio 를 0.03% → 1-3% 로 자연 확장.
+#
+# Phase 2A (본 V300, BADB): network 측 boundary-aware inductive bias 도입. 기존
+#   V291 의 4-class ABBC softmax 출력을 base 로 하되, 입력 CT 와 함께 refinement
+#   conv block 을 추가하여 boundary 채널을 명시적으로 학습시킨다. base + delta
+#   residual 구조이므로 학습 초기에는 V291 와 동일하게 시작, 학습 진행에 따라
+#   boundary refinement 가 활성화됨.
+# =============================================================================
+
+
+class _V300BoundaryAttentionRefinementNetwork(nn.Module):
+    """V0.x Phase 2A: V291 base + boundary refinement residual block.
+
+    구조:
+        x (3-ch input: ct_lut, anatomy prob, sdf)
+          ↓
+        base_net (nnUNet ResEnc-L, V291 backbone)
+          ↓ [B, 4, D, H, W] logits (4-class ABBC)
+          ↓
+        boundary_refine_conv([logits || ct]):
+          Conv3D(5→16) → InstanceNorm → LeakyReLU →
+          Conv3D(16→8) → InstanceNorm → LeakyReLU →
+          Conv3D(8→1)
+          ↓ delta_boundary [B, 1, D, H, W]
+          ↓
+        refined_logits = logits.clone()
+        refined_logits[:, 2] += delta_boundary  (boundary channel = 2)
+          ↓
+        return refined_logits  (deep supervision tuple 보존)
+
+    Note:
+        - 4-class ABBC 채널 레이아웃: [0=background, 1=border, 2=boundary, 3=core]
+          (BFV3_ABBC_V288_CHANNEL_NAMES, core.py:330). boundary = channel 2.
+        - delta 가 0 으로 초기화되도록 마지막 Conv3D 의 weight/bias 를 0 으로 초기화 →
+          학습 초기 V291 와 byte-identical, 학습 진행에 따라 refinement 활성.
+        - Channel 2 (boundary) 만 refinement 대상. background/border/core 는 base 그대로.
+        - Refinement 입력은 (logits, ct) 5-channel — ct 가 boundary 의 raw signal 제공.
     """
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_abbc_sdf_fdm_v290_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
+    def __init__(self, base_network: nn.Module, num_output_channels: int = 4,
+                 boundary_channel_index: int = 2):
+        super().__init__()
+        self.base = base_network
+        self.boundary_channel_index = int(boundary_channel_index)
+        self.num_output_channels = int(num_output_channels)
+
+        # Boundary refinement: 3-layer 3D conv residual block.
+        # 입력: (num_output_channels logits) + (1 CT channel) = N+1 channels.
+        self.boundary_refine = nn.Sequential(
+            nn.Conv3d(self.num_output_channels + 1, 16, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(16, affine=True),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Conv3d(16, 8, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(8, affine=True),
+            nn.LeakyReLU(negative_slope=0.01, inplace=True),
+            nn.Conv3d(8, 1, kernel_size=1),
+        )
+        # 마지막 Conv3D 의 weight/bias 0 으로 초기화 → delta=0 학습 시작 → V291 byte-identical 초기 상태.
+        with torch.no_grad():
+            self.boundary_refine[-1].weight.zero_()
+            self.boundary_refine[-1].bias.zero_()
+
+    @property
+    def decoder(self):
+        # [QC][Invariant:nnunet_trainer_api][FIX:DS][2026-06-01]
+        # nnUNetTrainer.on_train_start 가 set_deep_supervision_enabled →
+        # network.decoder.deep_supervision 를 직접 토글한다. wrapper 가 decoder 를
+        # 숨기면 첫 step 전에 AttributeError 로 깨진다. base 의 decoder 를 그대로 노출.
+        # (_CoordConvInputWrapper 와 동일한 패턴, core.py:926)
+        return self.base.decoder
+
+    @property
+    def encoder(self):
+        # [QC][Invariant:nnunet_trainer_api][FIX:STUNET][2026-06-01] 일부 nnUNet utility 가
+        # encoder attribute 를 전제하지만, STUNet 등 일부 백본은 .encoder 가 없다(.decoder 만 노출).
+        # 방어적으로 반환 — 없으면 None (set_deep_supervision_enabled 는 .decoder 만 필요).
+        return getattr(self.base, "encoder", None)
+
+    def forward(self, x):
+        """x: [B, in_C, D, H, W] (in_C=3 for Ds538: ct_lut+anatprob+sdf)."""
+        base_out = self.base(x)
+        # nnUNetv2 deep supervision → tuple/list of logits at multiple resolutions.
+        if isinstance(base_out, (list, tuple)):
+            # Refinement only on the highest resolution output (index 0).
+            primary_logits = base_out[0]
+            other_outputs = list(base_out[1:])
+        else:
+            primary_logits = base_out
+            other_outputs = []
+
+        # Refinement input: primary_logits + first input channel (CT).
+        # x[:, :1] = ct_lut channel (input channel 0).
+        refine_in = torch.cat([primary_logits, x[:, :1]], dim=1)
+        delta = self.boundary_refine(refine_in)  # [B, 1, D, H, W]
+
+        # Residual add to boundary channel only.
+        refined = primary_logits.clone()
+        refined[:, self.boundary_channel_index:self.boundary_channel_index + 1] = (
+            refined[:, self.boundary_channel_index:self.boundary_channel_index + 1] + delta
+        )
+
+        if other_outputs:
+            return tuple([refined] + other_outputs)
+        return refined
+
+
+class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV300(
+    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV291
+):
+    """[V0.x][PHASE 2A][2026-05-31] V300 = V291 + BADB (Boundary Attention Decoder Branch).
+
+    V291 의 4-class ABBC softmax 학습 위에 boundary-aware residual refinement block 을
+    추가한 V0.x novelty. V291 의 5x boundary weight 만으로 0.03% sparse contact class
+    가 학습되지 않는 문제를 architecture 측 inductive bias 로 해결.
+
+    학습 안정성:
+        - Refinement block 의 마지막 conv weight/bias 가 0 으로 초기화 → 학습 초기에는
+          V291 와 byte-identical 동작 → V291 의 학습 curve 와 동등하게 출발.
+        - 학습 진행하며 boundary refinement 가 활성화 → 후반에 contact 학습 강화.
+
+    예상 효과 (literature 기반):
+        - barrier_f0_5: V291 의 0.10-0.18 정체 → 0.25+ 도달 가능
+        - barrier_pred_target_ratio: 자가 보정 (refinement 가 sparse class 의 over-prediction 방지)
+        - 학습 시간: V291 대비 +5-10% (refinement block 의 small overhead)
+
+    의존성:
+        - Dataset538 (4-anatomy BICM V5 with femur) 필요.
+        - Phase 1 의 dynamic boundary target 와 조합 시 시너지 기대 (sparse → 1-3% contact + arch bias).
+
+    TODO:
+        - [P1] PyTorch DDP 호환 검증 (다중 GPU 학습 시 module wrapping).
+        - [P2] Refinement block 의 출력 magnitude clamp (delta 가 너무 크면 학습 unstable).
+        - [P3] Boundary attention (multiplicative gating) 추가 옵션 (현재는 additive residual).
+    """
+
+    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_abbc_v291_head"
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
@@ -17526,3731 +6664,485 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
                                    num_input_channels: int,
                                    num_output_channels: int,
                                    enable_deep_supervision: bool = True):
-        # V290 keeps the V289 4-channel layout: 0 bg / 1 border / 2 boundary SDF / 3 core.
-        return nnUNetTrainer.build_network_architecture(
+        # Step 1: nnUNet ResEnc-L base network 구성 (V291 와 동일).
+        base = nnUNetTrainer.build_network_architecture(
             architecture_class_name,
             arch_init_kwargs,
             arch_init_kwargs_req_import,
             num_input_channels,
-            BFV3_ABBC_SDF_FDM_V290_OUTPUT_CHANNELS,
+            BFV3_ABBC_BWEIGHT_V291_OUTPUT_CHANNELS,  # 4-class output
             enable_deep_supervision=False,
         )
+        # Step 2: BADB wrapper 로 감싸기 — boundary refinement residual block 추가.
+        # [V0.x][FIX:CH][2026-06-01] boundary_channel_index 1→2 수정.
+        #   4-class ABBC 채널 레이아웃(BFV3_ABBC_V288_CHANNEL_NAMES, core.py:330)은
+        #   [0=background, 1=border, 2=boundary, 3=core] 이다. loss/validation 의
+        #   barrier_target = (labels==2), boundary_p = probs[:,2] (loss.py:125, core.py:7537)
+        #   도 모두 channel 2 를 boundary 로 정의한다. 이전 값 1 은 "border" 를 가리켜
+        #   refinement 가 엉뚱한 클래스를 최적화하고 barrier_f0_5 개선이 불가능했다.
+        wrapped = _V300BoundaryAttentionRefinementNetwork(
+            base_network=base,
+            num_output_channels=BFV3_ABBC_BWEIGHT_V291_OUTPUT_CHANNELS,
+            boundary_channel_index=2,  # ABBC: 0=background, 1=border, 2=boundary, 3=core
+        )
+        return wrapped
 
     def __init__(self, plans: dict, configuration: str, fold: int,
                  dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device("cuda")):
         super().__init__(plans, configuration, fold, dataset_json,
                          unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V290_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V290_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V290_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V290_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V290_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V290_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V290_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
         self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSDFFDMV290] "
-            "output_channels=4 changed_variable=fdm_weighted_smooth_l1_on_boundary_sdf "
-            "decoder=task1_v289_abbc_sdf_core_seed_watershed "
-            f"channel_names={','.join(BFV3_ABBC_SDF_FDM_V290_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
+            "[V300 BADB Phase 2A] V291 base + boundary refinement residual conv "
+            "(delta 초기값 0 → V291 byte-identical 학습 시작) "
+            f"output_channels={BFV3_ABBC_BWEIGHT_V291_OUTPUT_CHANNELS} "
+            f"refinement_block_params="
+            f"Conv3d(5→16)+InstanceNorm+LReLU+Conv3d(16→8)+InstanceNorm+LReLU+Conv3d(8→1)"
         )
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterFlowV261(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakAffinity13SeedHealedV253
-):
-    """Dataset537 V261: dense center-flow target aligned to Task1 official proxy metrics.
+# =============================================================================
+# (위는 V300 BADB Phase 2A skeleton 종료)
+# =============================================================================
 
-    [AUDIT][Risk:High][Scope:v261_fulltrain_gate]
-    Fulltrain 기준은 IoU-F가 아니라 Task1 Dice/Fracture Dice/Local Dice/HD95/ASSD와
-    Instance F1/Recall/Precision, Merge/Split, Topology Consistency다. V260 시각화에서
-    fracture barrier가 0 voxel이거나 과분할되어 이 기준을 통과할 수 없었으므로,
-    V261은 support voxel이 center로 직접 vote하는 8채널 center-flow contract로 리셋한다.
+
+# =============================================================================
+# [V0.x][BACKBONE][2026-06-01] STU-Net-B 백본 trainer (anatomy + ABBC fracture)
+# =============================================================================
+def _build_stunet_from_plan(variant: str, arch_init_kwargs: dict,
+                            num_input_channels: int, num_output_channels: int,
+                            enable_deep_supervision: bool = True):
+    """nnU-Net 2.5.2 plan 의 arch_init_kwargs 에서 strides 를 뽑아 STUNet 을 구성한다.
+
+    STUNet 원본은 configuration_manager.pool_op_kernel_sizes[1:] 를 strides 로 썼다.
+    2.5.2 에서는 동일 값이 arch_init_kwargs['strides'] 에 들어있다(첫 entry=[1,1,1]=stage0
+    no-downsample). [1:] 로 다운샘플 strides 5개를 취하고, 6-stage(dims 6개)에 맞춰
+    cap(5)/pad([1,1,1]) 한다. conv 가중치는 stride 무관 shape 이므로 사전학습 가중치가
+    그대로 로드된다.
+    """
+    if not _STUNET_AVAILABLE:
+        raise RuntimeError("STUNet 백본 import 실패 — stunet.py 확인 필요")
+    strides = [list(s) for s in arch_init_kwargs["strides"][1:]]
+    if len(strides) > 5:
+        strides = strides[:5]
+    while len(strides) < 5:
+        strides.append([1, 1, 1])
+    kernel_sizes = [[3, 3, 3]] * 6
+    v = STUNET_VARIANTS[variant]
+    return STUNet(num_input_channels, num_output_channels,
+                  depth=v["depth"], dims=v["dims"],
+                  pool_op_kernel_sizes=strides, conv_kernel_sizes=kernel_sizes,
+                  enable_deep_supervision=enable_deep_supervision)
+
+
+def _maybe_apply_stunet_warmstart(trainer):
+    """[V0.x][FIX:DDP][2026-06-01] env `PENGWIN_STUNET_PRETRAINED` 의 STU-Net 사전학습
+    가중치를 trainer.network 에 warm-start 한다.
+
+    DDP-safe: nnUNet 의 `-pretrained_weights` 경로는 단일 GPU(부모 프로세스)에서만
+    monkey-patch 가능하다 — `num_gpus>1` 이면 `mp.spawn(run_ddp)` 로 뜨는 자식 프로세스가
+    run_training 을 fresh import 하므로 부모의 patch 가 적용되지 않아 STUNet 기본 로더가
+    깨진다. 본 훅은 각 프로세스의 initialize() 끝에서 직접 적용하므로 DDP child 에서도
+    동작한다. 따라서 STU-Net warm-start 는 `-pretrained_weights` 대신
+    `PENGWIN_STUNET_PRETRAINED` 환경변수를 사용한다(둘 다 주면 이중 적용되니 금지).
+
+    모든 rank 가 동일 파일을 로드 → 가중치 일관(DDP 시작 불변식 유지). 로더는 DDP/compile
+    래퍼를 자동 언랩한다. continue(-c) 체크포인트는 initialize() 이후 별도로 로드되어
+    warm-start 를 덮어쓰므로(재개 시 올바름) 상호 안전하다.
+    """
+    import os as _os
+    path = _os.environ.get("PENGWIN_STUNET_PRETRAINED", "").strip()
+    if not path or getattr(trainer, "_stunet_warmstart_done", False):
+        return
+    if not _STUNET_AVAILABLE:
+        trainer.print_to_log_file("[STU-Net warm-start] stunet 모듈 없음 — 스킵")
+        return
+    from stunet import load_stunet_pretrained_weights
+    inflate = _os.environ.get("PENGWIN_STUNET_INFLATE", "ct0")
+    stats = load_stunet_pretrained_weights(trainer.network, path, inflate=inflate)
+    trainer._stunet_warmstart_done = True
+    trainer.print_to_log_file(f"[STU-Net warm-start] {path}: {stats}")
+
+
+# =============================================================================
+# [V0.x][PARTIAL-LABEL][2026-06-02] Marginal Dice+CE loss (Shi et al., MedIA 2021)
+# =============================================================================
+class MarginalDiceCELoss(nn.Module):
+    """Partial-label marginal Dice+CE — 부분 라벨 충돌 supervision 을 loss 레벨에서 근본 해결.
+
+    조사 B 결론: Ds539 는 pelvic(=sacrum/LHip/RHip 만 라벨) 과 femur(=femur 만 라벨) 의 disjoint
+    부분 라벨이라, 보이는데 미라벨된 뼈가 'background' 로 학습돼 충돌(같은 뼈가 한 케이스에선
+    sacrum, 다른 케이스에선 background). Marginal loss 는 케이스별 '미라벨 foreground 클래스' 를
+    **background marginal 로 접어** 페널티를 제거한다.
+
+    - labeled_mask[B, C] (bool): 케이스별 라벨된 클래스. c=0(bg) 은 항상 labeled 취급.
+      트레이너가 매 배치 batch['keys'] → case 라벨셋으로 설정한다(None 이면 전부 labeled = 표준).
+    - CE: 미라벨 fg 클래스 logit 을 {bg}∪{미라벨} logsumexp 로 묶어 marginal bg log-prob 계산
+      → bg 영역(미라벨 뼈 포함)에서 미라벨 클래스 예측에 페널티 0. labeled 클래스는 표준 log-softmax.
+    - Dice(do_bg=False, batch_dice=False): labeled fg 클래스만 per-sample soft dice, 미라벨 제외.
+    - softmax 유지 → STU-Net TotalSeg warm-start 보존. nnUNet DC_and_CE 관례(weight 1/1, smooth 1e-5).
+
+    DeepSupervisionWrapper 와 호환: labeled_mask 는 클래스 단위(해상도 무관)이므로 모든 DS scale 에
+    동일 적용된다.
     """
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_center_flow_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
+    def __init__(self, num_classes: int, batch_dice: bool = False, smooth: float = 1e-5,
+                 weight_ce: float = 1.0, weight_dice: float = 1.0):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.batch_dice = bool(batch_dice)
+        self.smooth = float(smooth)
+        self.weight_ce = float(weight_ce)
+        self.weight_dice = float(weight_dice)
+        self.labeled_mask = None  # [B, C] bool — 트레이너가 배치마다 설정
 
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:output_contract]
-        # V261 output is exactly 8 independent heads:
-        # 0 support, 1 exterior, 2 fracture, 3 center, 4 distance auxiliary,
-        # 5..7 voxel-space offset-to-center z/y/x. This has the same channel count
-        # as V248 but a different decoder contract, so channel meaning must be fixed here.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BFV3_CENTER_FLOW_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V261_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V261_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V261_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V261_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V261_VAL_ITERS"])
-        # [QC][Risk:High][Scope:v261_gpu_memory]
-        # center-flow는 support/center/offset heads를 동시에 학습한다. V260에서 batch=2가
-        # RTX 3090 24GB OOM을 냈으므로 smoke와 short gate의 기본 batch는 1로 둔다.
-        batch_override = os.environ.get("PENGWIN_BFV3_V261_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V261_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterFlowV261] "
-            "output_channels=8 changed_variable=dense_center_flow_offset_decoder_contract "
-            "decoder=task1_v261_center_flow "
-            f"channel_names={','.join(BFV3_CENTER_FLOW_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if (
-            not isinstance(target_for_loss, dict)
-            or "semantic" not in target_for_loss
-            or "instance" not in target_for_loss
-        ):
-            raise ValueError("V261 validation requires semantic and instance targets")
-        semantic_target = target_for_loss["semantic"]
-        instance = target_for_loss["instance"]
-        seed_target = target_for_loss.get("seed_center", target_for_loss.get("seed"))
-        if seed_target is None:
-            raise ValueError("V261 validation requires seed_center or seed target")
-        if instance.ndim == 5 and int(instance.shape[1]) == 1:
-            instance = instance[:, 0].long()
+    def forward(self, logits, target):
+        B, C = logits.shape[:2]
+        if target.shape[1] != 1:
+            target = target[:, :1]
+        tgt = target.long()
+        dev = logits.device
+        mask = self.labeled_mask
+        if mask is None:
+            mask = torch.ones(B, C, dtype=torch.bool, device=dev)
         else:
-            instance = instance.long()
-        if seed_target.ndim == 5 and int(seed_target.shape[1]) == 1:
-            seed_target = seed_target[:, 0]
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_CENTER_FLOW_OUTPUT_CHANNELS):
-            raise ValueError(f"V261 expected validation logits [B, 8, D, H, W], got {tuple(logits.shape)}")
-        labels = semantic_target[:, 0].long() if semantic_target.ndim == 5 else semantic_target.long()
-        support_t = (instance > 0) & (instance <= 150)
-        fracture_t = labels == 2
-        center_t = seed_target.float() > 0.5
-        support_p = torch.sigmoid(logits[:, 0].float()) >= 0.5
-        fracture_p = (torch.sigmoid(logits[:, 2].float()) >= 0.5) & support_p
-        center_p = (torch.sigmoid(logits[:, 3].float()) >= 0.5) & support_p
-        # [METRIC][Scope:task1_proxy_checkpoint_diagnostic]
-        # Patch validation의 barrier/core/shell 이름은 nnU-Net trainer 집계 호환용이다.
-        # V261 promotion은 full-volume eval.py의 Task1 official-aligned proxy와
-        # 시각화 audit로만 판단하며, IoU-F는 보조 진단값이다.
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": self._binary_counts(support_p, support_t),
-            "barrier_counts": self._binary_counts(fracture_p, fracture_t),
-            "core_counts": self._binary_counts(center_p, center_t),
-            "shell_counts": self._binary_counts(fracture_p | center_p, fracture_t | center_t),
-            "pred_target_barrier": np.asarray([
-                float(fracture_p.sum().detach().cpu()),
-                float(fracture_t.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterPeakFlowV262(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterFlowV261
-):
-    """Dataset537 V262: V261 center-flow with decoder-facing center peak contract.
-
-    [AUDIT][Risk:High][Scope:v262_fulltrain_gate]
-    Fulltrain 기준은 사용자가 준 Task1 proxy 지표다. V261은 Dice/Local Dice는 살아났지만
-    center head가 support 전역으로 열려 Instance Precision, Split Errors, Topology가
-    실패했다. V262는 출력 8채널과 offset 구조를 유지하고, channel3만 peak/rank/mass
-    supervision 및 peak-NMS decoder에 맞게 바꾼다.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_center_peak_flow_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V262_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V262_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V262_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V262_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V262_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V262_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V262_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterPeakFlowV262] "
-            "output_channels=8 changed_variable=center_peak_rank_masscap_decoder_contract "
-            "decoder=task1_v262_center_peak_flow "
-            f"channel_names={','.join(BFV3_CENTER_FLOW_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if (
-            not isinstance(target_for_loss, dict)
-            or "semantic" not in target_for_loss
-            or "instance" not in target_for_loss
-        ):
-            raise ValueError("V262 validation requires semantic and instance targets")
-        semantic_target = target_for_loss["semantic"]
-        instance = target_for_loss["instance"]
-        seed_target = target_for_loss.get("seed_center", target_for_loss.get("seed"))
-        if seed_target is None:
-            raise ValueError("V262 validation requires seed_center or seed target")
-        if instance.ndim == 5 and int(instance.shape[1]) == 1:
-            instance = instance[:, 0].long()
-        else:
-            instance = instance.long()
-        if seed_target.ndim == 5 and int(seed_target.shape[1]) == 1:
-            seed_target = seed_target[:, 0]
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_CENTER_FLOW_OUTPUT_CHANNELS):
-            raise ValueError(f"V262 expected validation logits [B, 8, D, H, W], got {tuple(logits.shape)}")
-        labels = semantic_target[:, 0].long() if semantic_target.ndim == 5 else semantic_target.long()
-        support_t = (instance > 0) & (instance <= 150)
-        fracture_t = labels == 2
-        center_t = seed_target.float() > 0.5
-        support_p = torch.sigmoid(logits[:, 0].float()) >= 0.5
-        fracture_p = (torch.sigmoid(logits[:, 2].float()) >= 0.5) & support_p
-        center_prob = torch.sigmoid(logits[:, 3].float())
-        pool_size = 31
-        pooled = F.max_pool3d(
-            center_prob.unsqueeze(1),
-            kernel_size=pool_size,
-            stride=1,
-            padding=pool_size // 2,
-        ).squeeze(1)
-        center_p = (center_prob >= 0.5) & (center_prob >= pooled - 1e-6) & support_p
-        # [METRIC][Scope:v262_patch_validation]
-        # Patch validation은 fulltrain 승인 지표가 아니다. 그래도 center count 진단은
-        # V262 decoder와 같은 peak-NMS contract를 따라야 V261 broad-center 실패를
-        # 조기에 볼 수 있다. 실제 승인은 eval.py Task1 proxy/시각화에서 판단한다.
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": self._binary_counts(support_p, support_t),
-            "barrier_counts": self._binary_counts(fracture_p, fracture_t),
-            "core_counts": self._binary_counts(center_p, center_t),
-            "shell_counts": self._binary_counts(fracture_p | center_p, fracture_t | center_t),
-            "pred_target_barrier": np.asarray([
-                float(fracture_p.sum().detach().cpu()),
-                float(fracture_t.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterPeakFlowCalibratedV263(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterPeakFlowV262
-):
-    """Dataset537 V263: calibrated support/fracture + center-peak-flow.
-
-    [AUDIT][Risk:High][Scope:v263_fulltrain_gate]
-    V262 failed the Task1 gate because support overpaint, fracture inversion, and
-    center peak over-splitting happened together. V263 keeps the V262 peak-NMS
-    instance decoder but changes the train contract so support and fracture are
-    calibrated before center-flow assignment is trusted.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_center_peak_flow_calibrated_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V263_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V263_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V263_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V263_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V263_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V263_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V263_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterPeakFlowCalibratedV263] "
-            "output_channels=8 changed_variable=support_fracture_calibrated_center_peak_flow "
-            "decoder=task1_v263_center_peak_flow_calibrated "
-            "support_threshold=0.60 "
-            f"channel_names={','.join(BFV3_CENTER_FLOW_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def validation_step(self, batch: dict) -> dict:
-        out = super().validation_step(batch)
-        # [METRIC][Scope:v263_patch_validation]
-        # V263 fulltrain gate는 eval.py의 source-space Task1 proxy다. Patch validation의
-        # support/center diagnostic은 V263 decoder threshold 0.60에 맞는 별도 장기
-        # metric이 아니므로 smoke plumbing 확인에만 사용한다.
-        return out
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakDenseCenterHeatmapFlowCalibratedV264(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterPeakFlowCalibratedV263
-):
-    """Dataset537 V264: dense center heatmap repair for V263 center collapse.
-
-    [AUDIT][Risk:Blocker][Scope:v264_fulltrain_gate]
-    V263 learned good support but emitted zero fragments because center probability
-    stayed below 0.001 even at GT centers. V264 keeps the 8-channel center-flow
-    decoder and calibrated support/fracture contract, but changes the center target
-    from sparse binary seed/core to a dense Gaussian heatmap around each fragment
-    center. Fulltrain is still blocked until hard3 Task1 proxy and visual audit pass.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_dense_center_heatmap_flow_calibrated_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V264_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V264_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V264_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V264_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V264_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V264_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V264_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakDenseCenterHeatmapFlowCalibratedV264] "
-            "output_channels=8 changed_variable=dense_center_heatmap_target_after_v263_center_collapse "
-            "decoder=task1_v264_dense_center_heatmap_flow_calibrated "
-            "support_threshold=0.60 center_threshold=0.50 "
-            f"channel_names={','.join(BFV3_CENTER_FLOW_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakTopologyConstrainedCenterHeatmapFlowCalibratedV265(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakDenseCenterHeatmapFlowCalibratedV264
-):
-    """Dataset537 V265: fragment-count constrained marker topology.
-
-    [AUDIT][Risk:Blocker][Scope:v265_fulltrain_gate]
-    V264 reached support Dice/Local Dice >0.96 but failed Instance Precision,
-    Split Errors, and Topology because false center peaks created too many
-    predicted fragments. V265 keeps the successful support geometry and adds a
-    center topology loss that promotes one exact center peak per GT fragment while
-    suppressing same-fragment false marker tails.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_topology_constrained_center_heatmap_flow_calibrated_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V265_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V265_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V265_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V265_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V265_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V265_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V265_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakTopologyConstrainedCenterHeatmapFlowCalibratedV265] "
-            "output_channels=8 changed_variable=fragment_count_constrained_center_marker_topology "
-            "decoder=task1_v265_topology_constrained_center_heatmap_flow_calibrated "
-            "support_threshold=0.60 center_threshold=0.50 "
-            f"channel_names={','.join(BFV3_CENTER_FLOW_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCenterHeatmapFlowV267(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakTopologyConstrainedCenterHeatmapFlowCalibratedV265
-):
-    """Dataset537 V267: contact를 버리고 Task1 instance contract만 학습한다.
-
-    [AUDIT][Risk:Blocker][Scope:v267_fulltrain_gate]
-    V247-V266은 contact/fracture/contact-edge를 decoder-facing signal로 계속
-    재설계했지만 사용자가 준 Task1 gate에서 Instance/Fracture/Topology를 열지 못했다.
-    V267은 contact를 제거하고 support + center heatmap + center-offset만 남긴다.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_center_heatmap_flow_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:output_contract]
-        # V267 output is exactly 5 heads:
-        # 0 support, 1 center_heatmap, 2..4 raw voxel offsets z/y/x.
-        # Contact/fracture channels are intentionally absent so no downstream code can
-        # accidentally tune on a contact probability again.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BFV3_NO_CONTACT_CENTER_FLOW_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V267_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V267_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V267_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V267_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V267_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V267_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V267_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCenterHeatmapFlowV267] "
-            "output_channels=5 changed_variable=remove_contact_supervision_keep_support_center_offset "
-            "decoder=task1_v267_no_contact_center_heatmap_flow "
-            "support_threshold=0.60 center_threshold=0.50 "
-            f"channel_names={','.join(BFV3_NO_CONTACT_CENTER_FLOW_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if (
-            not isinstance(target_for_loss, dict)
-            or "instance" not in target_for_loss
-        ):
-            raise ValueError("V267 validation requires instance target")
-        instance = target_for_loss["instance"]
-        seed_target = target_for_loss.get("seed_center", target_for_loss.get("seed"))
-        if seed_target is None:
-            raise ValueError("V267 validation requires seed_center or seed target")
-        if instance.ndim == 5 and int(instance.shape[1]) == 1:
-            instance = instance[:, 0].long()
-        else:
-            instance = instance.long()
-        if seed_target.ndim == 5 and int(seed_target.shape[1]) == 1:
-            seed_target = seed_target[:, 0]
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_NO_CONTACT_CENTER_FLOW_OUTPUT_CHANNELS):
-            raise ValueError(f"V267 expected validation logits [B, 5, D, H, W], got {tuple(logits.shape)}")
-        support_t = (instance > 0) & (instance <= 150)
-        center_t = seed_target.float() > 0.5
-        support_p = torch.sigmoid(logits[:, 0].float()) >= 0.6
-        center_prob = torch.sigmoid(logits[:, 1].float())
-        pool_size = 31
-        pooled = F.max_pool3d(
-            center_prob.unsqueeze(1),
-            kernel_size=pool_size,
-            stride=1,
-            padding=pool_size // 2,
-        ).squeeze(1)
-        center_p = (center_prob >= 0.5) & (center_prob >= pooled - 1e-6) & support_p
-        # [METRIC][Scope:v267_patch_validation]
-        # trainer 내부 score 이름은 기존 logger 호환 때문에 barrier/core를 요구한다.
-        # V267에는 contact barrier가 없으므로 barrier_counts는 center marker diagnostic으로
-        # 채운다. fulltrain 여부는 eval.py Task1 proxy와 시각화만으로 판단한다.
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": self._binary_counts(support_p, support_t),
-            "barrier_counts": self._binary_counts(center_p, center_t),
-            "core_counts": self._binary_counts(center_p, center_t),
-            "shell_counts": self._binary_counts(support_p, support_t),
-            "pred_target_barrier": np.asarray([
-                float(center_p.sum().detach().cpu()),
-                float(center_t.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSpatialEmbeddingV270(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCenterHeatmapFlowV267
-):
-    """Dataset537 V270: contact-free dense spatial embedding instance contract.
-
-    [AUDIT][Risk:Blocker][Scope:v270_fulltrain_gate]
-    V269 dense flow oracle showed endpoint-cluster split/merge instability.
-    V270 uses the oracle-pass spatial embedding contract: support plus normalized
-    fragment sink z/y/x. Fulltrain remains blocked until learned hard3 Task1
-    proxy and visual audit exceed the user's 0.90+ gate.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_spatial_embedding_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-    BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
-    BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:output_contract]
-        # V270 output is exactly 4 heads: support + normalized sink z/y/x. There
-        # are no center/contact/fracture/edge channels in the active contract.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            BFV3_SPATIAL_EMBEDDING_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V270_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V270_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V270_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V270_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V270_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V270_BATCH_SIZE", "1").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V270_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSpatialEmbeddingV270] "
-            "output_channels=4 changed_variable=remove_contact_use_dense_spatial_embedding_sink_coordinates "
-            "decoder=task1_v270_dense_spatial_embedding "
-            f"channel_names={','.join(BFV3_SPATIAL_EMBEDDING_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if (
-            not isinstance(target_for_loss, dict)
-            or "instance" not in target_for_loss
-        ):
-            raise ValueError("V270 validation requires instance target")
-        instance = target_for_loss["instance"]
-        seed_target = target_for_loss.get("seed_center", target_for_loss.get("seed"))
-        if seed_target is None:
-            raise ValueError("V270 validation requires seed_center or seed target")
-        if instance.ndim == 5 and int(instance.shape[1]) == 1:
-            instance = instance[:, 0].long()
-        else:
-            instance = instance.long()
-        if seed_target.ndim == 5 and int(seed_target.shape[1]) == 1:
-            seed_target = seed_target[:, 0]
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_SPATIAL_EMBEDDING_OUTPUT_CHANNELS):
-            raise ValueError(f"V270 expected validation logits [B, 4, D, H, W], got {tuple(logits.shape)}")
-        support_t = (instance > 0) & (instance <= 150)
-        support_p = torch.sigmoid(logits[:, 0].float()) >= 0.6
-        support_mask = (instance > 0) & (instance <= 150)
-        if isinstance(target_for_loss, dict) and "spatial_embedding" in target_for_loss:
-            embedding_target = target_for_loss["spatial_embedding"].to(device=logits.device, dtype=logits.dtype)
-            if embedding_target.ndim == 6 and int(embedding_target.shape[1]) == 1:
-                embedding_target = embedding_target[:, 0]
-        else:
-            embedding_target, support_mask = self.loss._spatial_sink_targets(
-                instance,
-                seed_target.float(),
-                dtype=logits.dtype,
-                device=logits.device,
-            )
-        embedding_err = torch.abs(torch.sigmoid(logits[:, 1:4].float()) - embedding_target.float()).mean(dim=1)
-        embedding_close = (embedding_err <= 0.05) & support_mask
-        # [METRIC][Scope:v270_patch_validation]
-        # barrier/core slots are logger-compatible diagnostics only. Fulltrain
-        # 판단은 eval.py hard3 Task1 proxy와 visual audit가 담당한다.
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": self._binary_counts(support_p, support_t),
-            "barrier_counts": self._binary_counts(embedding_close, support_t),
-            "core_counts": self._binary_counts(embedding_close, support_t),
-            "shell_counts": self._binary_counts(support_p, support_t),
-            "pred_target_barrier": np.asarray([
-                float(embedding_close.sum().detach().cpu()),
-                float(support_t.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSpatialEmbeddingContrastiveV271(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSpatialEmbeddingV270
-):
-    """Dataset537 V271: V270 decoder contract plus fragment-balanced pull/push loss.
-
-    [AUDIT][Risk:Blocker][Scope:v271_fulltrain_gate]
-    V270 short learned anatomy support but collapsed fragment identity to three
-    anatomy-level sinks. V271 keeps the no-contact 4-channel output and decoder,
-    then adds fragment-balanced same-instance pull / different-instance push
-    supervision. Fulltrain remains blocked until hard3 Task1 proxy and visual
-    audit pass the 0.90+ gate.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_spatial_embedding_contrastive_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V271_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V271_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V271_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V271_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V271_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V271_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V271_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSpatialEmbeddingContrastiveV271] "
-            "output_channels=4 changed_variable=fragment_balanced_spatial_embedding_pull_push "
-            "decoder=task1_v270_dense_spatial_embedding "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_SPATIAL_EMBEDDING_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCoordSpatialEmbeddingV279(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSpatialEmbeddingContrastiveV271
-):
-    """Dataset537 V279: contact-free CoordConv spatial embedding contract.
-
-    [AUDIT][Risk:Blocker][Scope:v279_fulltrain_gate]
-    V277/V278 proved that simply deleting contact is not enough: learned support
-    remains high but split surfaces collapse. V271 proved the normalized sink
-    embedding also collapses without explicit coordinate access. V279 keeps the
-    no-contact 4-channel decoder/loss family and changes only input
-    representation by appending z/y/x coordinate channels inside model forward.
-    Fulltrain remains blocked until learned Task1 proxy and visual audit pass.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_coord_spatial_embedding_v279_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:channel_contract]
-        # 외부 dataloader/predictor 입력 채널 수는 바꾸지 않는다. base network만
-        # CoordConv용 z/y/x 3채널을 더 받으며, wrapper가 forward 시점에 붙인다.
-        # output은 V270/V271과 같은 support + sink z/y/x 4채널이다.
-        base_network = nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            int(num_input_channels) + 3,
-            BFV3_SPATIAL_EMBEDDING_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-        return _CoordConvInputWrapper(base_network)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V279_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V279_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V279_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V279_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V279_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V279_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V279_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCoordSpatialEmbeddingV279] "
-            "output_channels=4 changed_variable=contact_removed_coordconv_input_for_spatial_embedding "
-            "decoder=task1_v270_dense_spatial_embedding "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_SPATIAL_EMBEDDING_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskV280(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCoordSpatialEmbeddingV279
-):
-    """Dataset537 V280: query-conditioned no-contact fragment mask decoder.
-
-    [AUDIT][Risk:Blocker][Scope:v280_fragment_identity]
-    V279 proved coordinate access is not enough: full-volume learned logits still
-    collapsed to one embedding point per anatomy. V280 follows interactive
-    segmentation practice: a seed/query is encoded as input distance maps and
-    the network predicts one binary fragment mask. This isolates fragment mask
-    learnability from seed proposal and keeps contact out of the active path.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_query_mask_v280_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:channel_contract]
-        # External input is original ROI channels + two query channels. The
-        # CoordConv wrapper adds z/y/x internally. Output is a single binary mask
-        # logit for the queried fragment, not a contact or multiclass ID field.
-        base_network = nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            int(num_input_channels) + 2 + 3,
-            BFV3_QUERY_MASK_V280_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-        return _CoordConvInputWrapper(base_network)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V280_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V280_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V280_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V280_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V280_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V280_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V280_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskV280] "
-            "output_channels=1 changed_variable=contact_removed_query_conditioned_fragment_mask "
-            "decoder=task1_v280_oracle_query_mask "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_QUERY_MASK_V280_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        if len(patch_size) != 3:
-            raise RuntimeError("V280 query-mask sidecar training supports only 3D fullres training.")
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        instance_sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        target_sidecar_dir = Path(self.preprocessed_dataset_folder) / BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR
-        if not instance_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BICM V5 instance sidecar directory missing: {instance_sidecar_dir}")
-        if not target_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BoundaryFragment V3 target sidecar directory missing: {target_sidecar_dir}")
-        query_sigma_vox = float(os.environ.get("PENGWIN_BFV3_V280_QUERY_SIGMA_VOX", "6.0"))
-        self.print_to_log_file(
-            "[BoundaryFragmentQueryMaskV280] sidecar dirs "
-            f"instance={instance_sidecar_dir} target={target_sidecar_dir} "
-            f"query_sigma_vox={query_sigma_vox}"
-        )
-        dl_tr = PengwinBoundaryFragmentQueryMaskDataLoader3D(
-            dataset_tr,
-            self.batch_size,
-            patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=1.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            query_sigma_vox=query_sigma_vox,
-        )
-        dl_val = PengwinBoundaryFragmentQueryMaskDataLoader3D(
-            dataset_val,
-            self.batch_size,
-            self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=1.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            query_sigma_vox=query_sigma_vox,
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if not isinstance(target_for_loss, dict) or "query_mask" not in target_for_loss:
-            raise ValueError("V280 validation requires target['query_mask']")
-        query_mask = target_for_loss["query_mask"].float()
-        if query_mask.ndim == 5 and int(query_mask.shape[1]) == 1:
-            query_mask = query_mask[:, 0]
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_QUERY_MASK_V280_OUTPUT_CHANNELS):
-            raise ValueError(f"V280 expected validation logits [B, 1, D, H, W], got {tuple(logits.shape)}")
-        pred = torch.sigmoid(logits[:, 0].float()) >= 0.5
-        target_mask = query_mask > 0.5
-        # [METRIC][Scope:v280_patch_validation]
-        # logger slots are reused for query-mask PR/F. Fulltrain 판단은 별도
-        # task1-v280 oracle-query full-volume proxy와 시각화 결과로만 한다.
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": self._binary_counts(pred, target_mask),
-            "barrier_counts": self._binary_counts(pred, target_mask),
-            "core_counts": self._binary_counts(pred, target_mask),
-            "shell_counts": self._binary_counts(pred, target_mask),
-            "pred_target_barrier": np.asarray([
-                float(pred.sum().detach().cpu()),
-                float(target_mask.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordQueryMaskV285(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskV280
-):
-    """Dataset537 V285: no-contact query mask with full-ROI coordinate input.
-
-    [AUDIT][Risk:Blocker][Scope:v285_fragment_mask_learnability]
-    V284 removed contact but learned pairwise join/cut still collapsed fracture
-    fragments into the main LeftHip instance and created many extra components.
-    V285 changes the question to the smallest defensible one: given an oracle
-    fragment seed, can the model learn the exact binary fragment mask when the
-    input coordinate system is identical between crop training and full-volume
-    sliding-window prediction?
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_global_coord_query_mask_v285_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:channel_contract]
-        # V285 input is original preprocessed ROI channels + two oracle query maps
-        # + full-ROI z/y/x channels. No CoordConv wrapper is used because wrapper
-        # coordinates are tile-local at inference. Output is one binary fragment
-        # mask logit, matching the V280 loss.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            int(num_input_channels) + 2 + 3,
-            BFV3_GLOBAL_COORD_QUERY_MASK_V285_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V285_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V285_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V285_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V285_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V285_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V285_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V285_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordQueryMaskV285] "
-            "output_channels=1 changed_variable=full_roi_global_coords_plus_no_contact_query_fragment_mask "
-            "decoder=task1_v285_oracle_query_mask "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_GLOBAL_COORD_QUERY_MASK_V285_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        if len(patch_size) != 3:
-            raise RuntimeError("V285 global-coordinate query-mask training supports only 3D fullres training.")
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        instance_sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        target_sidecar_dir = Path(self.preprocessed_dataset_folder) / BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR
-        if not instance_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BICM V5 instance sidecar directory missing: {instance_sidecar_dir}")
-        if not target_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BoundaryFragment V3 target sidecar directory missing: {target_sidecar_dir}")
-        query_sigma_vox = float(os.environ.get("PENGWIN_BFV3_V285_QUERY_SIGMA_VOX", "6.0"))
-        self.print_to_log_file(
-            "[BoundaryFragmentGlobalCoordQueryMaskV285] sidecar dirs "
-            f"instance={instance_sidecar_dir} target={target_sidecar_dir} "
-            f"query_sigma_vox={query_sigma_vox} global_coord_channels=3 contact_input_channels=0"
-        )
-        # [DATA][Risk:High][Scope:v285_oracle_query_training]
-        # 이 단계는 seed proposal 문제가 아니라 fragment mask learnability만 검증한다.
-        # 따라서 GT instance sidecar에서 query fragment를 샘플링하되, contact label은
-        # input/loss/decoder 어디에도 사용하지 않는다.
-        dl_tr = PengwinBoundaryFragmentGlobalCoordQueryMaskDataLoader3D(
-            dataset_tr,
-            self.batch_size,
-            patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=1.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            query_sigma_vox=query_sigma_vox,
-        )
-        dl_val = PengwinBoundaryFragmentGlobalCoordQueryMaskDataLoader3D(
-            dataset_val,
-            self.batch_size,
-            self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=1.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            query_sigma_vox=query_sigma_vox,
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskPositiveNegativeV281(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskV280
-):
-    """Dataset537 V281: no-contact positive/negative query mask decoder.
-
-    [AUDIT][Risk:Blocker][Scope:v281_identity_signal]
-    V280 LeftHip oracle-query 결과는 fragment count는 맞췄지만 GT support argmax에서도
-    mean IoU-F가 낮았다. 원인은 single positive seed가 target fragment와 adjacent
-    fragments를 충분히 분리하지 못하는 입력 계약이다. V281은 output/loss를 그대로 두고
-    positive/negative query maps만 추가해, contact 없이 ID disambiguation이 가능한지 검증한다.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_query_mask_pn_v281_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:channel_contract]
-        # 외부 입력은 원본 ROI + positive query 2채널 + negative query 2채널이다.
-        # CoordConv z/y/x 3채널은 wrapper가 내부에서 붙인다. output은 V280과 같은
-        # 단일 binary query-mask logit으로 고정한다.
-        base_network = nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            int(num_input_channels) + 4 + 3,
-            BFV3_QUERY_MASK_PN_V281_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-        return _CoordConvInputWrapper(base_network)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V281_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V281_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V281_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V281_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V281_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V281_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V281_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskPositiveNegativeV281] "
-            "output_channels=1 changed_variable=positive_negative_query_maps_without_contact "
-            "decoder=task1_v281_oracle_positive_negative_query_mask "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_QUERY_MASK_PN_V281_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        if len(patch_size) != 3:
-            raise RuntimeError("V281 positive/negative query-mask sidecar training supports only 3D fullres training.")
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        instance_sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        target_sidecar_dir = Path(self.preprocessed_dataset_folder) / BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR
-        if not instance_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BICM V5 instance sidecar directory missing: {instance_sidecar_dir}")
-        if not target_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BoundaryFragment V3 target sidecar directory missing: {target_sidecar_dir}")
-        query_sigma_vox = float(os.environ.get("PENGWIN_BFV3_V281_QUERY_SIGMA_VOX", os.environ.get("PENGWIN_BFV3_V280_QUERY_SIGMA_VOX", "6.0")))
-        self.print_to_log_file(
-            "[BoundaryFragmentQueryMaskPositiveNegativeV281] sidecar dirs "
-            f"instance={instance_sidecar_dir} target={target_sidecar_dir} "
-            f"query_sigma_vox={query_sigma_vox}"
-        )
-        dl_tr = PengwinBoundaryFragmentPositiveNegativeQueryMaskDataLoader3D(
-            dataset_tr,
-            self.batch_size,
-            patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=1.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            query_sigma_vox=query_sigma_vox,
-        )
-        dl_val = PengwinBoundaryFragmentPositiveNegativeQueryMaskDataLoader3D(
-            dataset_val,
-            self.batch_size,
-            self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=1.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            query_sigma_vox=query_sigma_vox,
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordQueryMaskPositiveNegativeV286(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskPositiveNegativeV281
-):
-    """Dataset537 V286: no-contact positive/negative query mask with global coords.
-
-    [AUDIT][Risk:Blocker][Scope:v286_fragment_mask_constraint]
-    V285 proved that full-ROI coordinates help but a positive seed alone lets
-    small fracture fragments expand into adjacent structures. V286 keeps the
-    same one-logit mask loss and adds negative fragment seed maps, with no
-    contact channel or contact supervision.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_global_coord_query_mask_pn_v286_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:channel_contract]
-        # V286 input is image ROI + positive query maps + negative query maps +
-        # full-ROI z/y/x. It intentionally removes CoordConv wrapper coordinates
-        # so train crops and sliding-window inference share one coordinate frame.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            int(num_input_channels) + 4 + 3,
-            BFV3_GLOBAL_COORD_QUERY_MASK_PN_V286_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V286_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V286_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V286_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V286_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V286_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V286_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V286_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordQueryMaskPositiveNegativeV286] "
-            "output_channels=1 changed_variable=full_roi_global_coords_plus_positive_negative_query_fragment_mask "
-            "decoder=task1_v286_oracle_positive_negative_query_mask "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_GLOBAL_COORD_QUERY_MASK_PN_V286_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        if len(patch_size) != 3:
-            raise RuntimeError("V286 global-coordinate PN query-mask training supports only 3D fullres training.")
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        instance_sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        target_sidecar_dir = Path(self.preprocessed_dataset_folder) / BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR
-        if not instance_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BICM V5 instance sidecar directory missing: {instance_sidecar_dir}")
-        if not target_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BoundaryFragment V3 target sidecar directory missing: {target_sidecar_dir}")
-        query_sigma_vox = float(os.environ.get("PENGWIN_BFV3_V286_QUERY_SIGMA_VOX", "6.0"))
-        self.print_to_log_file(
-            "[BoundaryFragmentGlobalCoordQueryMaskPositiveNegativeV286] sidecar dirs "
-            f"instance={instance_sidecar_dir} target={target_sidecar_dir} "
-            f"query_sigma_vox={query_sigma_vox} global_coord_channels=3 contact_input_channels=0"
-        )
-        dl_tr = PengwinBoundaryFragmentGlobalCoordPositiveNegativeQueryMaskDataLoader3D(
-            dataset_tr,
-            self.batch_size,
-            patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=1.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            query_sigma_vox=query_sigma_vox,
-        )
-        dl_val = PengwinBoundaryFragmentGlobalCoordPositiveNegativeQueryMaskDataLoader3D(
-            dataset_val,
-            self.batch_size,
-            self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=1.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            query_sigma_vox=query_sigma_vox,
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFreeEmbeddingV282(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCoordSpatialEmbeddingV279
-):
-    """Dataset537 V282: no-contact support-constrained free instance embedding.
-
-    [AUDIT][Risk:Blocker][Scope:v282_partition_contract]
-    GT-support + GT-center nearest assignment produced LeftHip IoU-F 0.3288, so
-    center/Voronoi partition is structurally insufficient. V280/V281 query masks
-    also failed even with oracle centers. V282 keeps contact removed and trains a
-    free discriminative embedding where every support voxel contributes to
-    fragment partition.
-    """
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_free_embedding_v282_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:channel_contract]
-        # External input channels stay unchanged; CoordConv z/y/x is appended by
-        # the wrapper. Output is support + 4D free embedding, not V267 center-flow
-        # despite the same 5-channel count.
-        base_network = nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            int(num_input_channels) + 3,
-            BFV3_FREE_EMBEDDING_V282_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-        return _CoordConvInputWrapper(base_network)
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V282_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V282_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V282_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V282_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V282_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V282_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V282_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFreeEmbeddingV282] "
-            "output_channels=5 changed_variable=support_constrained_free_instance_embedding_no_contact "
-            "decoder=task1_v282_oracle_prototype_embedding "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_FREE_EMBEDDING_V282_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    @staticmethod
-    def _oracle_embedding_assignment_counts(logits: torch.Tensor,
-                                            instance: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_FREE_EMBEDDING_V282_OUTPUT_CHANNELS):
-            raise ValueError(f"V282 validation expected logits [B,5,D,H,W], got {tuple(logits.shape)}")
-        if instance.ndim == 5 and int(instance.shape[1]) == 1:
-            instance = instance[:, 0]
-        embedding = logits[:, 1:5].float().permute(0, 2, 3, 4, 1)
-        pred_correct = torch.zeros_like(instance, dtype=torch.bool)
-        support = (instance > 0) & (instance <= 150)
-        for batch_idx in range(int(instance.shape[0])):
-            ids = torch.unique(instance[batch_idx][support[batch_idx]])
-            ids = ids[(ids > 0) & (ids <= 150)]
-            if int(ids.numel()) == 0:
+            mask = mask.to(dev).bool()
+            if mask.shape[0] != B:  # DDP/grad accum 등으로 B 불일치 시 안전 폴백
+                mask = torch.ones(B, C, dtype=torch.bool, device=dev)
+        mask = mask.clone()
+        mask[:, 0] = True  # bg 항상 labeled
+
+        # bg-supergroup = {0} ∪ {미라벨 fg}
+        ch = torch.arange(C, device=dev)[None, :]              # [1, C]
+        fg_unlabeled = (~mask) & (ch != 0)                     # [B, C]
+        bg_group = fg_unlabeled.clone()
+        bg_group[:, 0] = True                                  # [B, C]
+
+        # ---- marginal CE ----
+        logp = torch.log_softmax(logits, dim=1)               # [B, C, ...]
+        lse_all = torch.logsumexp(logits, dim=1, keepdim=True) # [B, 1, ...]
+        neg_inf = torch.finfo(logits.dtype).min
+        bgmask = bg_group.view(B, C, *([1] * (logits.ndim - 2)))
+        masked = logits.masked_fill(~bgmask, neg_inf)
+        bg_lse = torch.logsumexp(masked, dim=1, keepdim=True)  # [B, 1, ...]
+        logq_bg = bg_lse - lse_all                             # [B, 1, ...] log marginal bg
+        gathered = torch.gather(logp, 1, tgt.clamp(0, C - 1))  # [B, 1, ...]
+        target_logq = torch.where(tgt == 0, logq_bg, gathered)
+        ce = -(target_logq).mean()
+
+        # ---- marginal Dice (do_bg=False, labeled fg only) ----
+        p = torch.exp(logp)
+        spatial = tuple(range(2, logits.ndim))
+        dice_vals = []
+        for c in range(1, C):
+            sel = mask[:, c]                                   # [B]
+            if not bool(sel.any()):
                 continue
-            means = []
-            valid_ids = []
-            for raw_id in ids:
-                frag_id = int(raw_id.detach().cpu())
-                mask = instance[batch_idx] == frag_id
-                if not bool(mask.any()):
-                    continue
-                means.append(embedding[batch_idx][mask].mean(dim=0))
-                valid_ids.append(frag_id)
-            if not means:
-                continue
-            mean_tensor = torch.stack(means, dim=0)
-            coords = torch.nonzero(support[batch_idx], as_tuple=False)
-            if int(coords.shape[0]) == 0:
-                continue
-            points = embedding[batch_idx][support[batch_idx]]
-            assigned = []
-            for start in range(0, int(points.shape[0]), 200000):
-                dist = torch.cdist(points[start:start + 200000], mean_tensor)
-                assigned.append(torch.argmin(dist, dim=1))
-            assigned_idx = torch.cat(assigned, dim=0)
-            valid_tensor = torch.tensor(valid_ids, device=instance.device, dtype=instance.dtype)
-            pred_ids = valid_tensor.index_select(0, assigned_idx)
-            true_ids = instance[batch_idx][support[batch_idx]]
-            pred_correct[batch_idx][support[batch_idx]] = pred_ids == true_ids
-        return pred_correct, support
-
-    def validation_step(self, batch: dict) -> dict:
-        data = batch["data"]
-        target = batch["target"]
-        data = self._move_boundary_fragment_data(data)
-        target_for_loss = self._move_boundary_fragment_target(target)
-        target_for_loss = self._prepare_boundary_fragment_target(target_for_loss)
-        if not isinstance(target_for_loss, dict) or "instance" not in target_for_loss:
-            raise ValueError("V282 validation requires instance target")
-        instance = target_for_loss["instance"]
-        if instance.ndim == 5 and int(instance.shape[1]) == 1:
-            instance = instance[:, 0].long()
+            pc = p[:, c]                                       # [B, ...]
+            gc = (tgt[:, 0] == c).to(pc.dtype)                 # [B, ...]
+            sdims = tuple(range(1, pc.ndim))
+            inter = (pc * gc).sum(sdims)
+            denom = pc.sum(sdims) + gc.sum(sdims)
+            dpc = (2 * inter + self.smooth) / (denom + self.smooth)  # [B]
+            dice_vals.append(dpc[sel])
+        if dice_vals:
+            mean_dice = torch.cat(dice_vals).mean()
         else:
-            instance = instance.long()
-
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target_for_loss)
-        logits = output[0] if isinstance(output, (list, tuple)) else output
-        if logits.ndim != 5 or int(logits.shape[1]) != int(BFV3_FREE_EMBEDDING_V282_OUTPUT_CHANNELS):
-            raise ValueError(f"V282 expected validation logits [B, 5, D, H, W], got {tuple(logits.shape)}")
-        support_t = (instance > 0) & (instance <= 150)
-        support_p = torch.sigmoid(logits[:, 0].float()) >= 0.5
-        assign_correct, assign_support = self._oracle_embedding_assignment_counts(logits, instance)
-        # [METRIC][Scope:v282_patch_validation]
-        # barrier/core slots represent oracle-prototype assignment accuracy over
-        # GT support. They are diagnostics only; fulltrain gate still requires
-        # full-volume Task1 proxy and visual audit.
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": self._binary_counts(support_p, support_t),
-            "barrier_counts": self._binary_counts(assign_correct, assign_support),
-            "core_counts": self._binary_counts(assign_correct, assign_support),
-            "shell_counts": self._binary_counts(support_p, support_t),
-            "pred_target_barrier": np.asarray([
-                float(assign_correct.sum().detach().cpu()),
-                float(assign_support.sum().detach().cpu()),
-            ], dtype=np.float64),
-        }
+            mean_dice = logits.sum() * 0.0
+        return self.weight_ce * ce - self.weight_dice * mean_dice
 
 
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordFreeEmbeddingV283(
-    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFreeEmbeddingV282
-):
-    """Dataset537 V283: no-contact free embedding with full-ROI coordinate input.
+# =============================================================================
+# [V0.x][WARN-FIX][2026-06-02] nnUNet 2.5.2 deprecated-API 경고 근본 수정 mixin
+# =============================================================================
+def _register_numpy_safe_globals():
+    """nnUNet 체크포인트(.pth) 의 numpy 메타데이터를 weights_only=True 로 안전 로드하기 위한
+    allowlist (임의코드 실행과 무관한 numpy 재구성 global 만)."""
+    try:
+        import numpy as _np
+        import torch.serialization as _ts
+        g = [_np.ndarray, _np.dtype, _np.core.multiarray.scalar, _np.core.multiarray._reconstruct]
+        try:
+            import numpy.dtypes as _nd
+            g += [getattr(_nd, _n) for _n in dir(_nd) if _n.endswith("DType")]
+        except Exception:
+            pass
+        _ts.add_safe_globals(g)
+    except Exception:
+        pass
 
-    [AUDIT][Risk:Blocker][Scope:v283_patch_to_full_volume_gap]
-    V282의 LeftHip patch validation은 높았지만 full-volume Task1 proxy는 실패했다.
-    원인 가설은 CoordConv wrapper가 sliding-window tile-local 좌표를 만들어 같은 voxel이
-    train crop과 inference tile에서 다른 coordinate context를 보는 것이다. V283은
-    contact를 계속 제거하고, 좌표를 dataloader/predictor에서 full ROI 기준으로 붙여
-    patch/full-volume 좌표계를 일치시킨다.
+
+class _PengwinPolyLR:
+    """torch `_LRScheduler` 를 상속하지 않는 PolyLR — nnUNet PolyLRScheduler 와 수식 동일하나
+    torch 의 step-순서/epoch-인자 deprecation 경고를 발생시키지 않는다.
+
+    nnUNet 의 lr_scheduler contract 는 (a) step(current_epoch) 호출(on_train_epoch_start),
+    (b) param_groups['lr'] 갱신, (c) checkpoint 에 저장 안 함(current_epoch 로 재계산) 뿐이라
+    plain 객체로 충분하다."""
+
+    def __init__(self, optimizer, initial_lr, max_steps, exponent=0.9):
+        self.optimizer = optimizer
+        self.initial_lr = float(initial_lr)
+        self.max_steps = int(max_steps)
+        self.exponent = float(exponent)
+        self.ctr = 0
+        self.step(0)
+
+    def step(self, current_step=None):
+        if current_step is None:
+            current_step = self.ctr
+            self.ctr += 1
+        frac = max(0.0, 1.0 - current_step / max(1, self.max_steps))
+        new_lr = self.initial_lr * (frac ** self.exponent)
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = new_lr
+
+
+class _StunetCleanTrainerMixin:
+    """STU-Net trainer 공용 mixin. nnUNet 2.5.2 의 deprecated API 사용으로 뜨는 경고를
+    modern API 로 **근본 수정**한다(억제 아님). 모든 STU-Net trainer 가 이 mixin 을 가장 먼저
+    상속하여 아래 오버라이드가 MRO 상 우선 적용된다.
+
+    수정 대상:
+      #4 torch.compile+batch1+deep-supervision → `_do_i_compile()=False` 로 compile 비활성.
+         validation 시 DS 토글에 compile 이 재컴파일 안 되어 예측이 손상되던 문제까지 근본 해결.
+      #3 torch.cuda.amp.GradScaler deprecated → `torch.amp.GradScaler('cuda')` 로 교체.
+      #1/#2/#5 lr_scheduler.step(epoch)/step-order deprecation → `_LRScheduler` 비상속
+         `_PengwinPolyLR` 로 교체(on_train_epoch_start 의 step 호출이 우리 객체로 감).
+      #6 torch.load(weights_only=False) FutureWarning → weights_only=True(+numpy allowlist) 안전 로드.
     """
 
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core025_strong_peak_no_contact_global_coord_free_embedding_v283_head"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3_sidecar_core_recall_high_edge"
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: list[str],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        # [QC][Invariant:channel_contract]
-        # V283 input is original preprocessed ROI channels + full-ROI z/y/x
-        # channels supplied by the dataloader/predictor. No CoordConv wrapper is
-        # used, because wrapper-local coordinates were the suspected V282
-        # patch/full-volume mismatch. Output order stays V282-compatible:
-        # support_logit + four free embedding channels.
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            int(num_input_channels) + 3,
-            BFV3_GLOBAL_COORD_FREE_EMBEDDING_V283_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V283_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V283_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V283_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V283_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V283_VAL_ITERS"])
-        batch_override = os.environ.get("PENGWIN_BFV3_V283_BATCH_SIZE", "").strip()
-        if batch_override:
-            batch_size = int(batch_override)
-            if batch_size < 1:
-                raise ValueError(f"PENGWIN_BFV3_V283_BATCH_SIZE must be >= 1, got {batch_size}")
-            self.configuration_manager.configuration["batch_size"] = int(batch_size)
-            self.batch_size = int(batch_size)
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordFreeEmbeddingV283] "
-            "output_channels=5 changed_variable=remove_coordconv_use_full_roi_global_coords_no_contact "
-            "decoder=task1_v282_oracle_prototype_embedding "
-            f"loss_profile={self._pengwin_loss_profile} "
-            f"channel_names={','.join(BFV3_GLOBAL_COORD_FREE_EMBEDDING_V283_CHANNEL_NAMES)} "
-            f"batch_size={self.batch_size} epochs={self.num_epochs} "
-            f"train_iters={self.num_iterations_per_epoch} val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        if len(patch_size) != 3:
-            raise RuntimeError("V283 global-coordinate sidecar training supports only 3D fullres training.")
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        instance_sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        target_sidecar_dir = Path(self.preprocessed_dataset_folder) / BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR
-        if not instance_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BICM V5 instance sidecar directory missing: {instance_sidecar_dir}")
-        if not target_sidecar_dir.is_dir():
-            raise FileNotFoundError(f"BoundaryFragment V3 target sidecar directory missing: {target_sidecar_dir}")
-        edge_prob = float(os.environ.get(
-            "PENGWIN_BFV3_SIDECAR_CONTACT_CENTER_PROB",
-            str(getattr(self, "EDGE_CENTER_PROBABILITY", 0.65)),
-        ))
-        support_prob = float(os.environ.get("PENGWIN_BFV3_SIDECAR_SUPPORT_CENTER_PROB", "0.15"))
-        tiny_prob = float(os.environ.get("PENGWIN_BFV3_SIDECAR_TINY_CENTER_PROB", "0.15"))
-        hard_prob = float(os.environ.get("PENGWIN_BFV3_SIDECAR_HARD_CENTER_PROB", "0.05"))
-        core_prob = float(os.environ.get(
-            "PENGWIN_BFV3_SIDECAR_CORE_CENTER_PROB",
-            str(getattr(self, "CORE_CENTER_PROBABILITY", 0.0)),
-        ))
-        seed_radius_vox = float(os.environ.get("PENGWIN_BFV3_SEED_RADIUS_VOX", "2.0"))
-        decoder_contact_center_prob = float(os.environ.get(
-            "PENGWIN_BFV3_DECODER_CONTACT_CENTER_PROB",
-            str(getattr(self, "DECODER_CONTACT_CENTER_PROBABILITY", 0.0)),
-        ))
-        decoder_contact_negative_center_prob = float(os.environ.get(
-            "PENGWIN_BFV3_DECODER_CONTACT_NEGATIVE_CENTER_PROB",
-            str(getattr(self, "DECODER_CONTACT_NEGATIVE_CENTER_PROBABILITY", 0.0)),
-        ))
-        decoder_contact_center_source = os.environ.get(
-            "PENGWIN_BFV3_DECODER_CONTACT_CENTER_SOURCE",
-            str(getattr(self, "DECODER_CONTACT_CENTER_SOURCE", "v5")),
-        ).strip().lower()
-        val_decoder_contact_center_prob = float(os.environ.get(
-            "PENGWIN_BFV3_VAL_DECODER_CONTACT_CENTER_PROB",
-            str(getattr(self, "VAL_DECODER_CONTACT_CENTER_PROBABILITY", decoder_contact_center_prob)),
-        ))
-        val_decoder_contact_negative_center_prob = float(os.environ.get(
-            "PENGWIN_BFV3_VAL_DECODER_CONTACT_NEGATIVE_CENTER_PROB",
-            str(getattr(self, "VAL_DECODER_CONTACT_NEGATIVE_CENTER_PROBABILITY", decoder_contact_negative_center_prob)),
-        ))
-        val_oversample_foreground_percent = float(os.environ.get(
-            "PENGWIN_BFV3_VAL_OVERSAMPLE_FOREGROUND_PERCENT",
-            str(getattr(self, "VAL_OVERSAMPLE_FOREGROUND_PERCENT", 0.33)),
-        ))
-        self.print_to_log_file(
-            "[BoundaryFragmentGlobalCoordFreeEmbeddingV283] sidecar dirs "
-            f"instance={instance_sidecar_dir} target={target_sidecar_dir} "
-            f"seed_radius_vox={seed_radius_vox} "
-            f"center_probs(core/contact/support/tiny/hard)=({core_prob},{edge_prob},{support_prob},{tiny_prob},{hard_prob}) "
-            f"global_coord_channels=3 contact_input_channels=0"
-        )
-        dl_tr = PengwinBoundaryFragmentGlobalCoordDataLoader3D(
-            dataset_tr,
-            self.batch_size,
-            patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=self.oversample_foreground_percent,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            seed_radius_vox=seed_radius_vox,
-            decoder_contact_center_probability=decoder_contact_center_prob,
-            decoder_contact_negative_center_probability=decoder_contact_negative_center_prob,
-            decoder_contact_center_source=decoder_contact_center_source,
-            edge_center_probability=edge_prob,
-            support_negative_center_probability=support_prob,
-            tiny_center_probability=tiny_prob,
-            hard_negative_center_probability=hard_prob,
-            core_center_probability=core_prob,
-        )
-        dl_val = PengwinBoundaryFragmentGlobalCoordDataLoader3D(
-            dataset_val,
-            self.batch_size,
-            self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=val_oversample_foreground_percent,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=None,
-            sidecar_dir=instance_sidecar_dir,
-            target_sidecar_dir=target_sidecar_dir,
-            seed_radius_vox=seed_radius_vox,
-            decoder_contact_center_probability=val_decoder_contact_center_prob,
-            decoder_contact_negative_center_probability=val_decoder_contact_negative_center_prob,
-            decoder_contact_center_source=decoder_contact_center_source,
-            edge_center_probability=0.40,
-            support_negative_center_probability=0.30,
-            tiny_center_probability=0.20,
-            hard_negative_center_probability=0.10,
-            core_center_probability=min(0.50, max(0.0, core_prob)),
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakCompactV221(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V221: V219/V220 midpoint for core-0.25 peak compactness."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_mid_peak_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V221_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V221_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V221_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V221_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V221_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakCompactV221] "
-            "output_channels=6 changed_variable=v219_v220_mid_core025_peak_compact_no_contact_tuning "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025ContactPreservePeakCompactV222(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V222: V220 compactness with stronger contact-preserve aux head."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_contact_preserve_peak_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V222_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V222_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V222_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V222_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V222_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025ContactPreservePeakCompactV222] "
-            "output_channels=6 changed_variable=v220_core025_peak_compact_with_contact_preserve_aux_tuning "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakCoverageCompactV223(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V223: V221 plus local per-fragment core island coverage."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_mid_peak_coverage_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V223_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V223_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V223_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V223_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V223_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakCoverageCompactV223] "
-            "output_channels=6 changed_variable=v221_core025_mid_peak_plus_core_island_coverage "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025OriginalContactMidPeakCompactV224(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V224: V221 with aux contact positives restricted to original class2."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_original_contact_mid_peak_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V224_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V224_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V224_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V224_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V224_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025OriginalContactMidPeakCompactV224] "
-            "output_channels=6 changed_variable=v221_core025_mid_peak_original_class2_contact_target "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakContactCapCompactV226(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V226: V221 plus weak one-sided contact over-mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_mid_peak_contact_cap_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V226_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V226_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V226_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V226_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V226_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakContactCapCompactV226] "
-            "output_channels=6 changed_variable=v221_core025_mid_peak_weak_one_sided_contact_mass_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakTightContactCapCompactV227(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V227: V226 paired bracket with tighter contact over-mass cap."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_mid_peak_tight_contact_cap_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V227_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V227_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V227_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V227_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V227_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakTightContactCapCompactV227] "
-            "output_channels=6 changed_variable=v221_core025_mid_peak_tight_one_sided_contact_mass_cap "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakSupportSeedCompactV230(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V230: V221 plus weak support-local seed presence."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_mid_peak_support_seed_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V230_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V230_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V230_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V230_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V230_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakSupportSeedCompactV230] "
-            "output_channels=6 changed_variable=v221_core025_mid_peak_weak_support_seed_presence_no_contact_tuning "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakConservativeCoreTailCompactV231(
-    _PengwinTrainerBoundaryFragmentInstanceCoreGuardBase
-):
-    """Dataset537 V231: V221 plus conservative class-4 core-tail floor."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core025_mid_peak_conservative_coretail_compact_barrier_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V231_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V231_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V231_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V231_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V231_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakConservativeCoreTailCompactV231] "
-            "output_channels=6 changed_variable=v221_core025_mid_peak_conservative_class4_core_tail_floor_no_contact_tuning "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateSeedHeadV201(
-    _PengwinTrainerBoundaryFragmentSeedHeadBase
-):
-    """Dataset537 V201: V197 dense barrier head plus fragment-scale seed head."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_seed_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V201_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V201_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V201_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V201_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V201_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateSeedHeadV201] "
-            "output_channels=7 changed_variable=v197_plus_fragment_seed_head "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactSeedHeadV202(
-    _PengwinTrainerBoundaryFragmentSeedHeadBase
-):
-    """Dataset537 V202: V199 compact semantic core plus fragment-scale seed head."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core_compact_seed_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V202_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V202_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V202_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V202_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V202_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactSeedHeadV202] "
-            "output_channels=7 changed_variable=v199_compact_core_plus_fragment_seed_head "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateSparseSeedHeadV203(
-    _PengwinTrainerBoundaryFragmentSeedHeadBase
-):
-    """Dataset537 V203: V201 seed head with explicit sparse-mass control."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_sparse_seed_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V203_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V203_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V203_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V203_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V203_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateSparseSeedHeadV203] "
-            "output_channels=7 changed_variable=v201_seed_head_sparse_mass_control "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactSparseSeedHeadV204(
-    _PengwinTrainerBoundaryFragmentSeedHeadBase
-):
-    """Dataset537 V204: V202 compact semantic core plus sparse seed loss."""
-
-    DEFAULT_LOSS_PROFILE = "boundary_fragment_v3_core_ridge_recall_dense_candidate_core_compact_sparse_seed_head"
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BFV3_V204_EPOCHS", self.num_epochs))
-        if os.environ.get("PENGWIN_BFV3_V204_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V204_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BFV3_V204_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BFV3_V204_VAL_ITERS"])
-        self._pengwin_loss_profile = os.environ.get(
-            "PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE
-        ).strip().lower()
-        self.print_to_log_file(
-            "[BoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactSparseSeedHeadV204] "
-            "output_channels=7 changed_variable=v202_compact_core_sparse_seed_mass_control "
-            f"edge_center_probability={self.EDGE_CENTER_PROBABILITY:.2f} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-
-class _PengwinTrainerContactSamplingBase(PengwinTrainer):
-    """Shared pelvic contact dataloader policy.
-
-    Contact-LegacyFuse predicts all pelvic contact/core cues in one model using
-    `[shell/body, core, contact_surface, contact_hard_negative]` after
-    background. The class is intentionally private so public nnU-Net runs use a
-    single active trainer name.
-    """
-
-    NUM_EPOCHS_DEFAULT = 40
-    WARMUP_EPOCHS = 10
-    ES_MIN_EPOCHS = 40
-    CLASS_WEIGHT_CLIP = (0.25, 6.0)
-    DEFAULT_CE_CLASS_WEIGHTS = "auto"
-    DEFAULT_LOSS_PROFILE = "abbc_contact_energy_v1"
-    DEFAULT_OVERSAMPLE_PROFILE = "abbc_contact_energy_v1"
-    DISABLE_X_MIRROR_DATASETS = PengwinTrainer.DISABLE_X_MIRROR_DATASETS
-    BORDER_POSITIVE_CASE_WEIGHT = 6.0
-    BORDER_CENTER_PROBABILITY = 0.8
-
-    def _border_boost_sampling_probabilities(self, dataset) -> np.ndarray | None:
-        keys = list(dataset.keys())
-        if not keys:
-            return None
-        weights = np.ones(len(keys), dtype=np.float64)
-        n_border_cases = 0
-        n_hard_negative_cases = 0
-        for idx, key in enumerate(keys):
-            properties = dataset[key]["properties"]
-            locations = properties.get("class_locations", {})
-            has_border = any(
-                int(label) == ABBC_BORDER_LABEL and len(coords) > 0
-                for label, coords in locations.items()
-                if not isinstance(label, tuple)
-            )
-            has_hard_negative = any(
-                int(label) == getattr(self, "HARD_NEGATIVE_LABEL", -1) and len(coords) > 0
-                for label, coords in locations.items()
-                if not isinstance(label, tuple)
-            )
-            if has_border or has_hard_negative:
-                weights[idx] = self.BORDER_POSITIVE_CASE_WEIGHT
-            if has_border:
-                n_border_cases += 1
-            if has_hard_negative:
-                n_hard_negative_cases += 1
-        if n_border_cases == 0 and n_hard_negative_cases == 0:
-            self.print_to_log_file("[PengwinTrainer] contact sampling: no class-3/class-4 priority cases found")
-            return None
-        probs = weights / weights.sum()
-        self.print_to_log_file(
-            "[PengwinTrainer] contact sampling: "
-            f"{n_border_cases}/{len(keys)} cases contain class-3 contact, "
-            f"{n_hard_negative_cases}/{len(keys)} contain class-4 hard negatives, "
-            f"case_weight={self.BORDER_POSITIVE_CASE_WEIGHT}, "
-            f"center_probability={self.BORDER_CENTER_PROBABILITY}"
-        )
-        return probs
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        dim = len(patch_size)
-        deep_supervision_scales = self._get_deep_supervision_scales()
-        rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes = \
-            self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
-        tr_transforms = self.get_training_transforms(
-            patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes,
-            do_dummy_2d_data_aug,
-            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
-            is_cascaded=self.is_cascaded,
-            foreground_labels=self.label_manager.foreground_labels,
-            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label,
-        )
-        val_transforms = self.get_validation_transforms(
-            deep_supervision_scales,
-            is_cascaded=self.is_cascaded,
-            foreground_labels=self.label_manager.foreground_labels,
-            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label,
-        )
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        sampling_probabilities = (
-            self._border_boost_sampling_probabilities(dataset_tr)
-            if self._pengwin_oversample_profile in {
-                "abbc_contact_energy_v1",
-                "contact_fuse_v1",
-            }
-            else None
-        )
-        if dim == 2:
-            dl_tr = nnUNetDataLoader2D(
-                dataset_tr, self.batch_size, initial_patch_size,
-                self.configuration_manager.patch_size, self.label_manager,
-                oversample_foreground_percent=self.oversample_foreground_percent,
-                sampling_probabilities=sampling_probabilities,
-                pad_sides=None, transforms=tr_transforms,
-            )
-            dl_val = nnUNetDataLoader2D(
-                dataset_val, self.batch_size,
-                self.configuration_manager.patch_size,
-                self.configuration_manager.patch_size,
-                self.label_manager,
-                oversample_foreground_percent=self.oversample_foreground_percent,
-                sampling_probabilities=None, pad_sides=None,
-                transforms=val_transforms,
-            )
-        else:
-            dl_tr = PengwinBorderBoostDataLoader3D(
-                dataset_tr, self.batch_size, initial_patch_size,
-                self.configuration_manager.patch_size, self.label_manager,
-                oversample_foreground_percent=self.oversample_foreground_percent,
-                sampling_probabilities=sampling_probabilities,
-                pad_sides=None, transforms=tr_transforms,
-                border_label=ABBC_BORDER_LABEL,
-                border_center_probability=self.BORDER_CENTER_PROBABILITY,
-                hard_negative_label=getattr(self, "HARD_NEGATIVE_LABEL", None),
-                hard_negative_center_probability=getattr(self, "HARD_NEGATIVE_CENTER_PROBABILITY", 0.0),
-            )
-            dl_val = nnUNetDataLoader3D(
-                dataset_val, self.batch_size,
-                self.configuration_manager.patch_size,
-                self.configuration_manager.patch_size,
-                self.label_manager,
-                oversample_foreground_percent=self.oversample_foreground_percent,
-                sampling_probabilities=None, pad_sides=None,
-                transforms=val_transforms,
-            )
-
-        allowed_num_processes = min(get_allowed_n_proc_DA(), int(getattr(self, "MAX_DA_PROCESSES", 999)))
-        pin_memory = self.device.type == "cuda" and bool(getattr(self, "PIN_MEMORY_DA", True))
-        train_cached = int(getattr(self, "TRAIN_DA_CACHED", max(6, allowed_num_processes // 2)))
-        val_cached = int(getattr(self, "VAL_DA_CACHED", max(3, allowed_num_processes // 4)))
-        if allowed_num_processes == 0:
-            mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-            mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        else:
-            mt_gen_train = NonDetMultiThreadedAugmenter(
-                data_loader=dl_tr, transform=None,
-                num_processes=allowed_num_processes,
-                num_cached=train_cached,
-                seeds=None, pin_memory=pin_memory,
-                wait_time=0.002,
-            )
-            mt_gen_val = NonDetMultiThreadedAugmenter(
-                data_loader=dl_val, transform=None,
-                num_processes=max(1, allowed_num_processes // 2),
-                num_cached=val_cached,
-                seeds=None, pin_memory=pin_memory,
-                wait_time=0.002,
-            )
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-
-class _PengwinTrainerContactEnergyBase(_PengwinTrainerContactSamplingBase):
-    """Contact-energy validation and checkpointing base.
-
-    Class 3 is trained as a precise contact/fracture surface rather than a broad
-    border recall mask. The decoder consumes probabilities as watershed energy,
-    so precision and seed stability are the primary checkpoint goals.
-    """
-
-    NUM_EPOCHS_DEFAULT = 40
-    WARMUP_EPOCHS = 10
-    ES_MIN_EPOCHS = 40
-    CLASS_WEIGHT_CLIP = (0.20, 5.0)
-    DEFAULT_CE_CLASS_WEIGHTS = "auto"
-    DEFAULT_LOSS_PROFILE = "abbc_contact_energy_v1"
-    DEFAULT_OVERSAMPLE_PROFILE = "abbc_contact_energy_v1"
-    USE_CONTACT_ENERGY_OBJECTIVE = True
-    CONTACT_LOSS_WEIGHT = 2.0
-    CONTACT_FP_WEIGHT = 3.0
-    CONTACT_POS_WEIGHT = 1.0
-    CORE_LOSS_WEIGHT = 0.75
-    CORE_FP_WEIGHT = 1.0
-    CORE_POS_WEIGHT = 1.25
-    CONTACT_VAL_WEIGHT = 0.60
-    CORE_VAL_WEIGHT = 0.30
-    SHELL_VAL_WEIGHT = 0.10
-    CONTACT_VAL_BETA = 0.5
-    BORDER_POSITIVE_CASE_WEIGHT = 4.0
-    BORDER_CENTER_PROBABILITY = 0.65
-    # Five-channel ResEnc-L patches are large enough that pinning several
-    # prefetched batches can stall in mlock/lock_page before the GPU does useful
-    # work. Keep Contact V1 conservative; throughput is secondary to getting a
-    # reliable smoke signal.
-    MAX_DA_PROCESSES = 2
-    TRAIN_DA_CACHED = 2
-    VAL_DA_CACHED = 1
-    PIN_MEMORY_DA = False
-
-    @staticmethod
-    def _safe_div(num: np.ndarray | float, den: np.ndarray | float, eps: float = 1e-8):
-        return np.asarray(num, dtype=np.float64) / np.maximum(np.asarray(den, dtype=np.float64), eps)
-
-    def _contact_energy_score(self, tp: np.ndarray, fp: np.ndarray, fn: np.ndarray) -> tuple[float, dict]:
-        """Validation score used for checkpointing Contact-Energy ABBC.
-
-        The score is deliberately not Dice. It combines contact F0.5
-        (precision-weighted, because false contact ridges break the energy
-        decoder) with geometric mean precision/recall for core seed stability
-        and a small shell support term.
-        """
-        eps = 1e-8
-        precision = self._safe_div(tp, tp + fp + eps)
-        recall = self._safe_div(tp, tp + fn + eps)
-        beta2 = float(self.CONTACT_VAL_BETA) ** 2
-        contact_p = float(precision[2]) if len(precision) > 2 else 0.0
-        contact_r = float(recall[2]) if len(recall) > 2 else 0.0
-        contact_f = (1.0 + beta2) * contact_p * contact_r / max(beta2 * contact_p + contact_r, eps)
-        core_seed = float(np.sqrt(max(0.0, float(precision[1] * recall[1])))) if len(precision) > 1 else 0.0
-        shell_support = float(np.sqrt(max(0.0, float(precision[0] * recall[0])))) if len(precision) > 0 else 0.0
-        score = (
-            float(self.CONTACT_VAL_WEIGHT) * contact_f
-            + float(self.CORE_VAL_WEIGHT) * core_seed
-            + float(self.SHELL_VAL_WEIGHT) * shell_support
-        )
-        metrics = {
-            "score": float(score),
-            "contact_precision": contact_p,
-            "contact_recall": contact_r,
-            "contact_f0_5": float(contact_f),
-            "core_precision": float(precision[1]) if len(precision) > 1 else 0.0,
-            "core_recall": float(recall[1]) if len(recall) > 1 else 0.0,
-            "core_seed_score": core_seed,
-            "shell_precision": float(precision[0]) if len(precision) > 0 else 0.0,
-            "shell_recall": float(recall[0]) if len(recall) > 0 else 0.0,
-            "shell_support_score": shell_support,
-        }
-        return float(score), metrics
-
-    def on_validation_epoch_end(self, val_outputs):
-        outputs_collated = collate_outputs(val_outputs)
-        tp = np.sum(outputs_collated["tp_hard"], 0)
-        fp = np.sum(outputs_collated["fp_hard"], 0)
-        fn = np.sum(outputs_collated["fn_hard"], 0)
-
-        if self.is_ddp:
-            world_size = dist.get_world_size()
-            tps = [None for _ in range(world_size)]
-            dist.all_gather_object(tps, tp)
-            tp = np.vstack([i[None] for i in tps]).sum(0)
-
-            fps = [None for _ in range(world_size)]
-            dist.all_gather_object(fps, fp)
-            fp = np.vstack([i[None] for i in fps]).sum(0)
-
-            fns = [None for _ in range(world_size)]
-            dist.all_gather_object(fns, fn)
-            fn = np.vstack([i[None] for i in fns]).sum(0)
-
-            losses_val = [None for _ in range(world_size)]
-            dist.all_gather_object(losses_val, outputs_collated["loss"])
-            loss_here = np.vstack(losses_val).mean()
-        else:
-            loss_here = np.mean(outputs_collated["loss"])
-
-        diagnostic_dice = [
-            i for i in [2 * i / max(2 * i + j + k, 1e-8) for i, j, k in zip(tp, fp, fn)]
-        ]
-        score, metrics = self._contact_energy_score(tp, fp, fn)
-        self._last_contact_energy_metrics = metrics
-
-        # Reuse nnU-Net logger keys so checkpoint serialization and progress
-        # plotting keep working. For this trainer, `mean_fg_dice` semantically
-        # means the Contact-Energy validation score.
-        self.logger.log("mean_fg_dice", score, self.current_epoch)
-        self.logger.log("dice_per_class_or_region", diagnostic_dice, self.current_epoch)
-        self.logger.log("val_losses", loss_here, self.current_epoch)
-
-        completed = self.current_epoch + 1
-        if completed < self.ES_MIN_EPOCHS:
-            return
-        ema = float(self.logger.my_fantastic_logging["ema_fg_dice"][-1])
-        if ema > self._es_best_dice + self.ES_MIN_DELTA:
-            self._es_best_dice = ema
-            self._es_no_improve = 0
-        else:
-            self._es_no_improve += 1
-            if self._es_no_improve >= self.ES_PATIENCE and not self._es_triggered:
-                self._es_triggered = True
-                self.print_to_log_file(
-                    f"Early stopping: no EMA contact-energy score improvement for "
-                    f"{self.ES_PATIENCE} epochs. Best EMA score = {self._es_best_dice:.4f}. "
-                    f"Stopping at epoch {completed}."
+    def _do_i_compile(self):  # #4
+        return False
+
+    def initialize(self):
+        super().initialize()  # #3 GradScaler 는 모듈 레벨 patch 가 생성 시점에 신 API 로 처리
+        _maybe_apply_stunet_warmstart(self)  # DDP-safe warm-start (env PENGWIN_STUNET_PRETRAINED)
+        # [V0.x][FIX:DDP_BADB][2026-06-04] V300 BADB 는 output=base+delta·refinement 를
+        # delta 초기값 0 으로 시작한다(V291 byte-identical). delta=0 이면 refinement conv
+        # 파라미터가 첫 iteration 에 grad 0 → DDP 의 unused-parameter 검사가 실패한다
+        # ("parameters that were not used in producing loss"). delta 가 움직이기 시작하면
+        # 이후 grad 가 흐르므로, find_unused_parameters=True 로 re-wrap 해 학습을 허용한다.
+        # 같은 .module 을 재포장하므로 파라미터 텐서 동일성이 유지되어 optimizer 는 무영향.
+        if getattr(self, "is_ddp", False):
+            from torch.nn.parallel import DistributedDataParallel as _DDP
+            if isinstance(self.network, _DDP):
+                self.network = _DDP(
+                    self.network.module,
+                    device_ids=[self.local_rank],
+                    find_unused_parameters=True,
                 )
-                self.num_epochs = completed
 
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
+    def configure_optimizers(self):  # #1/#2/#5
+        optimizer, _orig_sched = super().configure_optimizers()
+        self.lr_scheduler = _PengwinPolyLR(optimizer, self.initial_lr, self.num_epochs)
+        return optimizer, self.lr_scheduler
 
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        self.print_to_log_file(
-            "Diagnostic pseudo dice",
-            [np.round(i, decimals=4) for i in self.logger.my_fantastic_logging["dice_per_class_or_region"][-1]],
-        )
-        metrics = getattr(self, "_last_contact_energy_metrics", {})
-        self.print_to_log_file(
-            "Contact-energy val",
-            {
-                k: round(float(v), 4)
-                for k, v in metrics.items()
-                if k in {
-                    "score", "contact_precision", "contact_recall", "contact_f0_5",
-                    "core_precision", "core_recall", "core_seed_score",
-                    "hard_negative_precision", "hard_negative_recall", "hard_negative_score",
-                    "shell_precision", "shell_recall", "shell_support_score",
-                }
-            },
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
+    def load_checkpoint(self, filename_or_checkpoint):  # #6
+        if isinstance(filename_or_checkpoint, str):
+            _register_numpy_safe_globals()
+            _orig_load = torch.load
 
-        current_epoch = self.current_epoch
-        if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_latest.pth"))
+            def _safe_load(f, *a, **k):
+                k.setdefault("weights_only", True)
+                return _orig_load(f, *a, **k)
 
-        ema_score = self.logger.my_fantastic_logging["ema_fg_dice"][-1]
-        if self._best_ema is None or ema_score > self._best_ema:
-            self._best_ema = ema_score
-            self.print_to_log_file(f"Yayy! New best EMA contact-energy score: {np.round(self._best_ema, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-
-        self.current_epoch += 1
+            torch.load = _safe_load
+            try:
+                return super().load_checkpoint(filename_or_checkpoint)
+            finally:
+                torch.load = _orig_load
+        return super().load_checkpoint(filename_or_checkpoint)
 
 
-class PengwinTrainerContactLegacyFuseV1(_PengwinTrainerContactEnergyBase):
-    """Dataset537 Contact-LegacyFuse trainer.
+class PengwinTrainerSTUNetBaseAnatomyV301(_StunetCleanTrainerMixin, PengwinTrainer):
+    """[V0.x][BACKBONE] Ds539 anatomy 5-class 용 STU-Net-B 백본 trainer.
 
-    This trainer keeps nnU-Net's ResEnc topology but swaps the network class for
-    `ContactLegacyFuseUNet`, which inserts small axial-attention adapters at the
-    bottleneck/high skip. It also uses a 5-class Contact-Fuse loss and internal
-    partial warm-start from Dataset532 so new attention/head/class-4 parameters
-    are initialized normally instead of forcing nnU-Net's strict pretrained
-    loader to accept incompatible keys.
+    ResEnc-L → STU-Net-B(58.26M) 교체. TotalSegmentator(59개 뼈: sacrum/hip/femur 포함)
+    사전학습 warm-start 전제. do_split(grouped split)·loss(DC+CE)·env profile 등
+    PengwinTrainer 동작은 그대로 유지하고 네트워크만 STU-Net 으로 바꾼다.
+    fine-tune 레시피: lr 1e-3 (STU-Net _ft 권장), epochs 1000.
     """
-
-    NUM_EPOCHS_DEFAULT = 40
-    WARMUP_EPOCHS = 10
-    ES_MIN_EPOCHS = 40
-    CLASS_WEIGHT_CLIP = (0.15, 6.0)
-    DEFAULT_CE_CLASS_WEIGHTS = "auto"
-    DEFAULT_LOSS_PROFILE = "contact_fuse_v1"
-    DEFAULT_OVERSAMPLE_PROFILE = "contact_fuse_v1"
-    USE_CONTACT_ENERGY_OBJECTIVE = False
-    USE_CONTACT_FUSE_OBJECTIVE = True
-    CONTACT_LOSS_WEIGHT = 2.5
-    CONTACT_FP_WEIGHT = 5.0
-    CONTACT_POS_WEIGHT = 0.75
-    CORE_LOSS_WEIGHT = 0.80
-    CORE_FP_WEIGHT = 1.0
-    CORE_POS_WEIGHT = 1.35
-    HARD_NEGATIVE_LOSS_WEIGHT = 1.25
-    HARD_NEGATIVE_CONTACT_PENALTY = 2.5
-    TOPK_FALSE_CONTACT_WEIGHT = 1.5
-    TOPK_FALSE_CONTACT_FRACTION = 0.02
-    CONTACT_VAL_WEIGHT = 0.45
-    CORE_VAL_WEIGHT = 0.25
-    HARD_NEGATIVE_VAL_WEIGHT = 0.20
-    SHELL_VAL_WEIGHT = 0.10
-    CONTACT_VAL_BETA = 0.5
-    BORDER_POSITIVE_CASE_WEIGHT = 4.0
-    BORDER_CENTER_PROBABILITY = 0.50
-    HARD_NEGATIVE_LABEL = ABBC_HARD_NEGATIVE_LABEL
-    HARD_NEGATIVE_CENTER_PROBABILITY = 0.35
-    # Dataset537 carries LeftHip/RightHip anatomy probability channels. A plain
-    # spatial L/R mirror would move the left-channel content to the right side
-    # without swapping channels, so it corrupts the conditioning signal.
-    DISABLE_X_MIRROR_DATASETS = (
-        PengwinTrainer.DISABLE_X_MIRROR_DATASETS
-        | {"Dataset537_PelvicBoundaryFragmentV3"}
-    )
-    # The planned fullres patch is deliberately large for the ResEnc baseline,
-    # but six full-volume channels plus attention makes the first smoke
-    # experiment I/O-bound before we learn anything about contact behavior. Keep
-    # v1 as a bounded smoke unless PENGWIN_FUSEFORMER_FULL_PATCH=1 is exported.
-    SMOKE_PATCH_SIZE = (128, 128, 160)
-    SMOKE_BATCH_SIZE = 1
-    SMOKE_TRAIN_ITERS = 40
-    SMOKE_VAL_ITERS = 10
-    # Multiprocess augmentation kept workers in lock_page_killable on the
-    # 377GB six-channel preprocessed memmaps. Single-threaded loading is slower
-    # per batch but removes the page-lock deadlock mode and gives reliable smoke
-    # metrics on one GPU.
-    MAX_DA_PROCESSES = 0
-    TRAIN_DA_CACHED = 1
-    VAL_DA_CACHED = 1
-    PIN_MEMORY_DA = False
 
     def __init__(self, plans: dict, configuration: str, fold: int,
                  dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device("cuda")):
         super().__init__(plans, configuration, fold, dataset_json,
                          unpack_dataset=unpack_dataset, device=device)
-        if os.environ.get("PENGWIN_FUSEFORMER_FULL_PATCH", "0").strip().lower() not in {"1", "true", "yes"}:
-            self.configuration_manager.configuration["patch_size"] = list(self.SMOKE_PATCH_SIZE)
-            self.configuration_manager.configuration["batch_size"] = int(self.SMOKE_BATCH_SIZE)
-            self.batch_size = int(self.SMOKE_BATCH_SIZE)
-            self.num_iterations_per_epoch = int(
-                os.environ.get("PENGWIN_FUSEFORMER_TRAIN_ITERS", self.SMOKE_TRAIN_ITERS)
-            )
-            self.num_val_iterations_per_epoch = int(
-                os.environ.get("PENGWIN_FUSEFORMER_VAL_ITERS", self.SMOKE_VAL_ITERS)
-            )
+        self.initial_lr = 1e-3
+        self.num_epochs = 1000
+        # [V0.x][ES][2026-06-01] warm-start 용 early-stop 재튜닝.
+        # 상속 기본값(PengwinTrainer: MIN_EPOCHS=100, PATIENCE=50)은 from-scratch 기준이다.
+        # STU-Net 뼈 사전학습 warm-start 는 수십 epoch 안에 수렴하므로, 수렴 후 낭비 학습을
+        # 막도록 ES 를 낮춘다(MIN_EPOCHS=30 부터 EMA-dice 정체 PATIENCE=25 epoch 시 종료).
+        # 상속된 while-loop run_training + on_validation_epoch_end 의 ES 로직이 그대로 적용되며,
+        # checkpoint_best 는 상시 저장되므로 종료 시점 최적 가중치가 보존된다. env 로 튜닝 가능.
+        import os as _os_es
+        self.ES_MIN_EPOCHS = int(_os_es.environ.get("PENGWIN_ES_MIN_EPOCHS", "30"))
+        self.ES_PATIENCE = int(_os_es.environ.get("PENGWIN_ES_PATIENCE", "25"))
+        self.ES_MIN_DELTA = float(_os_es.environ.get("PENGWIN_ES_MIN_DELTA", "5e-3"))
+        # [V0.x][PARTIAL-LABEL][2026-06-02] marginal loss용 case→labeled-class 맵 로드.
+        self._marginal_loss = None
+        self._case_labeled_map = {}
+        self._load_case_labeled_map()
+
+    def _load_case_labeled_map(self):
+        """case_id → 라벨된 fg 클래스 리스트. pelvic 케이스={1,2,3}, femur 케이스={4} (disjoint).
+        GT 존재 클래스로 사전 산출된 json(result/reports/ds539_case_labeled_classes.json) 로드."""
+        import json as _json
+        path = os.environ.get("PENGWIN_CASE_LABELED_MAP",
+                              str(RESULT_REPORT / "ds539_case_labeled_classes.json"))
+        try:
+            raw = _json.load(open(path))
+            self._case_labeled_map = {str(k): [int(x) for x in v] for k, v in raw.items()}
             self.print_to_log_file(
-                "[LegacyFuse] smoke patch override: "
-                f"patch_size={list(self.SMOKE_PATCH_SIZE)} batch_size={self.batch_size} "
-                f"train_iters={self.num_iterations_per_epoch} "
-                f"val_iters={self.num_val_iterations_per_epoch}"
-            )
+                f"[marginal] case→labeled 맵 로드: {len(self._case_labeled_map)} cases ({path})")
+        except Exception as e:  # pragma: no cover
+            self._case_labeled_map = {}
+            self.print_to_log_file(f"[marginal] 맵 로드 실패({e}) → 전부 labeled 폴백(표준 동작)")
 
-    def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
-        rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes = (
-            super().configure_rotation_dummyDA_mirroring_and_inital_patch_size()
-        )
-        if os.environ.get("PENGWIN_FUSEFORMER_FULL_PATCH", "0").strip().lower() not in {"1", "true", "yes"}:
-            rotation_for_DA = (0.0, 0.0)
-            do_dummy_2d_data_aug = False
-            initial_patch_size = np.asarray(self.configuration_manager.patch_size, dtype=int)
-            self.print_to_log_file(
-                "[LegacyFuse] smoke augmentation override: "
-                f"rotation={rotation_for_DA} initial_patch_size={initial_patch_size.tolist()}"
-            )
-        return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import,
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        if not _FUSEFORMER_AVAILABLE:
-            raise ImportError("ContactLegacyFuseUNet import failed; cannot build PengwinTrainerContactLegacyFuseV1")
-        import pydoc
-
-        architecture_kwargs = dict(**arch_init_kwargs)
-        for key in arch_init_kwargs_req_import:
-            if architecture_kwargs.get(key) is not None:
-                architecture_kwargs[key] = pydoc.locate(architecture_kwargs[key])
-        architecture_kwargs["deep_supervision"] = enable_deep_supervision
-        network = ContactLegacyFuseUNet(
-            input_channels=num_input_channels,
-            num_classes=num_output_channels,
-            context_channels=max(1, int(num_input_channels) - 1),
-            **architecture_kwargs,
-        )
-        if hasattr(network, "initialize"):
-            network.apply(network.initialize)
-        return network
-
-    def _network_for_state_dict(self):
-        net = self.network
-        if hasattr(net, "module"):
-            net = net.module
-        if hasattr(net, "_orig_mod"):
-            net = net._orig_mod
-        return net
-
-    def _default_fuseformer_warmstart_path(self) -> Path:
-        return (
-            NN_RES / "Dataset532_PelvicAnatomyV2"
-            / "PengwinTrainer__nnUNetResEncUNetLPlans__3d_fullres"
-            / "fold_0" / "checkpoint_best.pth"
-        )
-
-    def _maybe_load_fuseformer_warmstart(self) -> None:
-        if getattr(self, "_fuseformer_warmstarted", False):
+    def _set_marginal_mask(self, keys):
+        """batch['keys'](case 식별자) → per-sample labeled_mask[B,C] 를 marginal loss 에 설정."""
+        if self._marginal_loss is None or keys is None:
             return
-        if int(getattr(self, "current_epoch", 0)) != 0:
-            return
-        path = Path(os.environ.get("PENGWIN_FUSEFORMER_WARMSTART", str(self._default_fuseformer_warmstart_path())))
-        if not path.exists():
-            self.print_to_log_file(f"[LegacyFuse] warm-start skipped; checkpoint missing: {path}")
-            self._fuseformer_warmstarted = True
-            return
-        checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
-        source = checkpoint.get("network_weights", checkpoint)
-        net = self._network_for_state_dict()
-        target = net.state_dict()
-        loadable = {}
-        expanded = []
-        matched = []
-        skipped_shape = []
-        skipped_absent = 0
-        for raw_key, tensor in source.items():
-            key = raw_key[7:] if raw_key.startswith("module.") else raw_key
-            if key not in target:
-                skipped_absent += 1
-                continue
-            dst = target[key]
-            if tuple(dst.shape) == tuple(tensor.shape):
-                loadable[key] = tensor
-                matched.append(key)
-                continue
-            if (
-                getattr(tensor, "ndim", 0) == 5
-                and getattr(dst, "ndim", 0) == 5
-                and int(tensor.shape[1]) == 1
-                and int(dst.shape[1]) == int(getattr(self, "num_input_channels", dst.shape[1]))
-                and tuple(tensor.shape[2:]) == tuple(dst.shape[2:])
-                and int(tensor.shape[0]) == int(dst.shape[0])
-            ):
-                widened = tensor.new_zeros(tuple(dst.shape))
-                widened[:, 0:1] = tensor
-                widened[:, 1:] = tensor.mean(dim=1, keepdim=True) * 0.05
-                loadable[key] = widened
-                expanded.append(key)
-                continue
-            skipped_shape.append(key)
-        missing, unexpected = net.load_state_dict(loadable, strict=False)
-        self._fuseformer_warmstarted = True
-        self.print_to_log_file(
-            "[LegacyFuse] partial warm-start from Dataset532 "
-            f"path={path} matched={len(matched)} expanded_input={len(expanded)} "
-            f"skipped_shape={len(skipped_shape)} skipped_absent={skipped_absent} "
-            f"missing_new={len(missing)} unexpected={len(unexpected)}"
-        )
-
-    def on_train_start(self):
-        super().on_train_start()
-        self._maybe_load_fuseformer_warmstart()
-
-    def _contact_energy_score(self, tp: np.ndarray, fp: np.ndarray, fn: np.ndarray) -> tuple[float, dict]:
-        eps = 1e-8
-        precision = self._safe_div(tp, tp + fp + eps)
-        recall = self._safe_div(tp, tp + fn + eps)
-        beta2 = float(self.CONTACT_VAL_BETA) ** 2
-
-        def f_beta(index: int) -> float:
-            p = float(precision[index]) if len(precision) > index else 0.0
-            r = float(recall[index]) if len(recall) > index else 0.0
-            return float((1.0 + beta2) * p * r / max(beta2 * p + r, eps))
-
-        contact_p = float(precision[2]) if len(precision) > 2 else 0.0
-        contact_r = float(recall[2]) if len(recall) > 2 else 0.0
-        contact_f = f_beta(2)
-        core_seed = float(np.sqrt(max(0.0, float(precision[1] * recall[1])))) if len(precision) > 1 else 0.0
-        shell_support = float(np.sqrt(max(0.0, float(precision[0] * recall[0])))) if len(precision) > 0 else 0.0
-        hard_negative_score = (
-            float(np.sqrt(max(0.0, float(precision[3] * recall[3]))))
-            if len(precision) > 3 else 0.0
-        )
-        score = (
-            float(self.CONTACT_VAL_WEIGHT) * contact_f
-            + float(self.CORE_VAL_WEIGHT) * core_seed
-            + float(self.HARD_NEGATIVE_VAL_WEIGHT) * hard_negative_score
-            + float(self.SHELL_VAL_WEIGHT) * shell_support
-        )
-        metrics = {
-            "score": float(score),
-            "contact_precision": contact_p,
-            "contact_recall": contact_r,
-            "contact_f0_5": float(contact_f),
-            "core_precision": float(precision[1]) if len(precision) > 1 else 0.0,
-            "core_recall": float(recall[1]) if len(recall) > 1 else 0.0,
-            "core_seed_score": core_seed,
-            "hard_negative_precision": float(precision[3]) if len(precision) > 3 else 0.0,
-            "hard_negative_recall": float(recall[3]) if len(recall) > 3 else 0.0,
-            "hard_negative_score": hard_negative_score,
-            "shell_precision": float(precision[0]) if len(precision) > 0 else 0.0,
-            "shell_recall": float(recall[0]) if len(recall) > 0 else 0.0,
-            "shell_support_score": shell_support,
-        }
-        return float(score), metrics
-
-
-class PengwinTrainerLegacyTopologyV1(PengwinTrainer):
-    """Dataset537 native nnU-Net Contact-Instance trainer.
-
-    Dataset537 raw labels are instance IDs, not semantic classes. This trainer
-    keeps nnU-Net planning/checkpoint/discovery but replaces train and
-    validation steps with a fixed multi-head instance objective:
-    support/core/contact-energy/hard-negative/offset/embedding.
-    """
-
-    NUM_EPOCHS_DEFAULT = 60
-    WARMUP_EPOCHS = 10
-    ES_MIN_EPOCHS = 20
-    ES_PATIENCE = 30
-    ES_MIN_DELTA = 2e-3
-    DEFAULT_LOSS_PROFILE = "contact_instance_exclusive_v1"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "contact_instance_v1"
-    DISABLE_X_MIRROR_DATASETS = PengwinTrainer.DISABLE_X_MIRROR_DATASETS | {"Dataset537_PelvicBoundaryFragmentV3"}
-    SMOKE_PATCH_SIZE = (128, 128, 160)
-    SMOKE_BATCH_SIZE = 1
-    SMOKE_TRAIN_ITERS = 40
-    SMOKE_VAL_ITERS = 10
-    EDGE_CENTER_PROBABILITY = 0.55
-    SUPPORT_NEGATIVE_CENTER_PROBABILITY = 0.20
-    TINY_CENTER_PROBABILITY = 0.15
-    HARD_NEGATIVE_CENTER_PROBABILITY = 0.10
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        super().__init__(plans, configuration, fold, dataset_json,
-                         unpack_dataset=unpack_dataset, device=device)
-        self.enable_deep_supervision = False
-        self.num_epochs = int(os.environ.get("PENGWIN_INSTANCE_EPOCHS", self.NUM_EPOCHS_DEFAULT))
-        if os.environ.get("PENGWIN_INSTANCE_FULL_PATCH", "0").strip().lower() not in {"1", "true", "yes"}:
-            self.configuration_manager.configuration["patch_size"] = list(self.SMOKE_PATCH_SIZE)
-            self.configuration_manager.configuration["batch_size"] = int(self.SMOKE_BATCH_SIZE)
-            self.batch_size = int(self.SMOKE_BATCH_SIZE)
-            self.num_iterations_per_epoch = int(
-                os.environ.get("PENGWIN_INSTANCE_TRAIN_ITERS", self.SMOKE_TRAIN_ITERS)
-            )
-            self.num_val_iterations_per_epoch = int(
-                os.environ.get("PENGWIN_INSTANCE_VAL_ITERS", self.SMOKE_VAL_ITERS)
-            )
-        self.oversample_foreground_percent = 1.0
-        self.print_to_log_file(
-            "[LegacyTopology] patch_size="
-            f"{list(self.configuration_manager.patch_size)} batch_size={self.batch_size} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import,
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        if not _FUSEFORMER_AVAILABLE:
-            raise ImportError("ContactLegacyFuseUNet import failed; cannot build PengwinTrainerLegacyTopologyV1")
-        import pydoc
-
-        architecture_kwargs = dict(**arch_init_kwargs)
-        for key in arch_init_kwargs_req_import:
-            if architecture_kwargs.get(key) is not None:
-                architecture_kwargs[key] = pydoc.locate(architecture_kwargs[key])
-        architecture_kwargs["deep_supervision"] = False
-        network = ContactLegacyFuseUNet(
-            input_channels=num_input_channels,
-            num_classes=CONTACT_INSTANCE_OUTPUT_CHANNELS,
-            context_channels=max(1, int(num_input_channels) - 1),
-            **architecture_kwargs,
-        )
-        if hasattr(network, "initialize"):
-            network.apply(network.initialize)
-        return network
-
-    def _network_for_state_dict(self):
-        net = self.network
-        if hasattr(net, "module"):
-            net = net.module
-        if hasattr(net, "_orig_mod"):
-            net = net._orig_mod
-        return net
-
-    def _default_instance_warmstart_path(self) -> Path:
-        return (
-            NN_RES / "Dataset532_PelvicAnatomyV2"
-            / "PengwinTrainer__nnUNetResEncUNetLPlans__3d_fullres"
-            / "fold_0" / "checkpoint_best.pth"
-        )
-
-    def _maybe_load_instance_warmstart(self) -> None:
-        if getattr(self, "_contact_instance_warmstarted", False):
-            return
-        if int(getattr(self, "current_epoch", 0)) != 0:
-            return
-        path_raw = os.environ.get("PENGWIN_INSTANCE_WARMSTART", str(self._default_instance_warmstart_path()))
-        if str(path_raw).strip().lower() in {"", "0", "false", "none", "off", "/dev/null"}:
-            self.print_to_log_file("[LegacyTopology] warm-start skipped by PENGWIN_INSTANCE_WARMSTART")
-            self._contact_instance_warmstarted = True
-            return
-        path = Path(path_raw)
-        if not path.exists():
-            self.print_to_log_file(f"[LegacyTopology] warm-start skipped; checkpoint missing: {path}")
-            self._contact_instance_warmstarted = True
-            return
-        checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
-        source = checkpoint.get("network_weights", checkpoint)
-        net = self._network_for_state_dict()
-        target = net.state_dict()
-        loadable = {}
-        expanded = 0
-        matched = 0
-        for raw_key, tensor in source.items():
-            key = raw_key[7:] if raw_key.startswith("module.") else raw_key
-            if key not in target:
-                continue
-            dst = target[key]
-            if tuple(dst.shape) == tuple(tensor.shape):
-                loadable[key] = tensor
-                matched += 1
-            elif (
-                getattr(tensor, "ndim", 0) == 5
-                and getattr(dst, "ndim", 0) == 5
-                and int(tensor.shape[1]) == 1
-                and int(dst.shape[1]) == int(getattr(self, "num_input_channels", dst.shape[1]))
-                and tuple(tensor.shape[2:]) == tuple(dst.shape[2:])
-                and int(tensor.shape[0]) == int(dst.shape[0])
-            ):
-                widened = tensor.new_zeros(tuple(dst.shape))
-                widened[:, 0:1] = tensor
-                widened[:, 1:] = tensor.mean(dim=1, keepdim=True) * 0.05
-                loadable[key] = widened
-                expanded += 1
-        missing, unexpected = net.load_state_dict(loadable, strict=False)
-        self._contact_instance_warmstarted = True
-        self.print_to_log_file(
-            "[LegacyTopology] partial warm-start from Dataset532 "
-            f"path={path} matched={matched} expanded_input={expanded} "
-            f"missing_new={len(missing)} unexpected={len(unexpected)}"
-        )
+        ncls = self.label_manager.num_segmentation_heads
+        B = len(keys)
+        mask = torch.zeros(B, ncls, dtype=torch.bool, device=self.device)
+        mask[:, 0] = True  # bg 항상 labeled
+        for b, key in enumerate(keys):
+            cid = str(key).replace("PENGWIN_", "").split("_")[0].zfill(3)
+            labeled = self._case_labeled_map.get(cid)
+            if not labeled:
+                mask[b, :] = True  # 미상 → 전부 labeled(안전 폴백)
+            else:
+                for c in labeled:
+                    if 0 <= int(c) < ncls:
+                        mask[b, int(c)] = True
+        self._marginal_loss.labeled_mask = mask
 
     def _build_loss(self):
-        self.print_to_log_file(
-            "[LegacyTopology] Loss = exclusive morphology softmax "
-            "+ contact margin/top-k false-contact + core/offset/embedding"
-        )
-        profile = os.environ.get("PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE).strip().lower()
-        if profile in {"contact_instance_sigmoid_v1", "contact_instance_v1_legacy"}:
-            self.print_to_log_file("[LegacyTopology] using legacy sigmoid loss by explicit request")
-            return LegacyTopologyLoss3D()
-        return LegacyTopologyExclusiveLoss3D()
-
-    def _overfit_case_ids(self) -> list[str] | None:
-        """Optional fixed subset for representation overfit sanity checks."""
-        raw_path = os.environ.get("PENGWIN_INSTANCE_CASES_JSON", "").strip()
-        raw_cases = os.environ.get("PENGWIN_INSTANCE_CASES", "").strip()
-        payload = None
-        if raw_path:
-            path = Path(raw_path)
-            if not path.exists():
-                raise FileNotFoundError(f"PENGWIN_INSTANCE_CASES_JSON missing: {path}")
-            payload = json.loads(path.read_text())
-        elif raw_cases:
-            payload = [v.strip() for v in raw_cases.replace(",", " ").split() if v.strip()]
-        if payload is None:
-            return None
-        if isinstance(payload, dict):
-            cases = payload.get("cases") or payload.get("train_cases") or payload.get("case_ids")
-        else:
-            cases = payload
-        if not cases:
-            raise ValueError("PENGWIN_INSTANCE overfit case list is empty")
-        normalized = []
-        for case in cases:
-            text = str(case)
-            if text.startswith("PENGWIN_"):
-                normalized.append(text)
+        """표준 DC+CE 대신 Marginal Dice+CE(부분 라벨 충돌 근본 해결). DS wrapper 는
+        nnUNet 관례 그대로(가중치 1/2^i, 최저 scale 0, DDP+no-compile 시 1e-6)."""
+        import numpy as _np
+        ncls = self.label_manager.num_segmentation_heads
+        marg = MarginalDiceCELoss(
+            num_classes=ncls,
+            batch_dice=self.configuration_manager.batch_dice,
+            smooth=1e-5, weight_ce=1.0, weight_dice=1.0)
+        self._marginal_loss = marg
+        if self.enable_deep_supervision:
+            scales = self._get_deep_supervision_scales()
+            weights = _np.array([1 / (2 ** i) for i in range(len(scales))])
+            if self.is_ddp and not self._do_i_compile():
+                weights[-1] = 1e-6
             else:
-                normalized.append(f"PENGWIN_{int(text):03d}")
-        return sorted(set(normalized))
-
-    def get_tr_and_val_datasets(self):
-        overfit_cases = self._overfit_case_ids()
-        if overfit_cases is None:
-            return super().get_tr_and_val_datasets()
-        from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
-
-        available = set(nnUNetDataset(self.preprocessed_dataset_folder).dataset.keys())
-        missing = [case for case in overfit_cases if case not in available]
-        if missing:
-            raise RuntimeError(f"overfit cases missing from preprocessed Dataset537: {missing}")
-        self.print_to_log_file(
-            "[LegacyTopology] overfit subset active: "
-            f"n_cases={len(overfit_cases)} cases={overfit_cases}"
-        )
-        dataset_tr = nnUNetDataset(
-            self.preprocessed_dataset_folder,
-            overfit_cases,
-            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-            num_images_properties_loading_threshold=0,
-        )
-        dataset_val = nnUNetDataset(
-            self.preprocessed_dataset_folder,
-            overfit_cases,
-            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-            num_images_properties_loading_threshold=0,
-        )
-        return dataset_tr, dataset_val
-
-    def _update_contact_loss_curriculum(self) -> None:
-        """Keep the sparse contact head from collapsing to all-negative early.
-
-        Dataset537 contact voxels are only about 0.34% of pelvic support. The
-        first edge-affinity overfit run showed the opposite failure: contact and
-        edge heads stayed alive but spread across support and background. The
-        curriculum therefore keeps enough positive pressure to avoid collapse
-        while making support-internal non-contact and top-k false edge/contact
-        negatives visible from epoch 0.
-        """
-        loss = getattr(self, "loss", None)
-        if isinstance(loss, LegacyTopologyExclusiveLoss3D):
-            epoch = int(getattr(self, "current_epoch", 0))
-            forced = os.environ.get("PENGWIN_EDGE_CURRICULUM_FORCE", "").strip().lower()
-            if forced in {"warmup", "edge_recall_warmup"}:
-                phase = "warmup"
-            elif forced in {"balance", "edge_balance"}:
-                phase = "balance"
-            elif forced in {"precision", "edge_precision"}:
-                phase = "precision"
-            elif epoch < 8:
-                phase = "warmup"
-            elif epoch < 24:
-                phase = "balance"
-            else:
-                phase = "precision"
-            if phase == "warmup":
-                profile = (
-                    "edge_pair_warmup",
-                    3.5, 8.0, 4.0, 1.00,
-                    5.0, 8.0, 2.0, 6.0, 4.0, 1.0, 1.00,
-                )
-            elif phase == "balance":
-                profile = (
-                    "edge_pair_balance",
-                    2.5, 5.0, 8.0, 2.00,
-                    5.0, 5.0, 3.0, 12.0, 8.0, 2.0, 3.00,
-                )
-            else:
-                profile = (
-                    "edge_pair_precision",
-                    1.5, 3.5, 12.0, 3.00,
-                    6.0, 3.5, 4.0, 18.0, 12.0, 3.0, 5.00,
-                )
-            (
-                name,
-                contact_weight,
-                contact_pos,
-                support_fp,
-                topk_contact,
-                edge_weight,
-                edge_pos,
-                edge_neg,
-                edge_near_neg,
-                edge_support_neg,
-                edge_bg_neg,
-                topk_fraction_pct,
-            ) = profile
-            loss.contact_focal_weight = float(contact_weight)
-            loss.contact_positive_weight = float(contact_pos)
-            loss.support_false_contact_weight = float(support_fp)
-            loss.topk_false_contact_weight = float(topk_contact)
-            loss.edge_weight = float(edge_weight)
-            loss.edge_pos_weight = float(edge_pos)
-            loss.edge_neg_weight = float(edge_neg)
-            loss.edge_near_neg_weight = float(edge_near_neg)
-            loss.edge_support_neg_weight = float(edge_support_neg)
-            loss.edge_bg_neg_weight = float(edge_bg_neg)
-            loss.topk_fraction = float(topk_fraction_pct) / 100.0
-            if getattr(self, "_last_edge_loss_curriculum", None) != name:
-                self._last_edge_loss_curriculum = name
-                self.print_to_log_file(
-                    "[LegacyTopology] edge/contact loss curriculum "
-                    f"{name}: contact_weight={contact_weight} contact_pos={contact_pos} "
-                    f"support_fp={support_fp} edge_weight={edge_weight} "
-                    f"edge_pos={edge_pos} edge_neg={edge_neg} "
-                    f"edge_near_neg={edge_near_neg} edge_support_neg={edge_support_neg} "
-                    f"edge_bg_neg={edge_bg_neg} topk_fraction={loss.topk_fraction}"
-                )
-            return
-        if not isinstance(loss, LegacyTopologyLoss3D):
-            return
-        epoch = int(getattr(self, "current_epoch", 0))
-        forced = os.environ.get("PENGWIN_CONTACT_CURRICULUM_FORCE", "").strip().lower()
-        if forced in {"warmup", "contact_recall_warmup"}:
-            phase = "warmup"
-        elif forced in {"balance", "contact_balance"}:
-            phase = "balance"
-        elif forced in {"precision", "contact_precision"}:
-            phase = "precision"
-        elif epoch < 6:
-            phase = "warmup"
-        elif epoch < 24:
-            phase = "balance"
-        else:
-            phase = "precision"
-        if phase == "warmup":
-            profile = ("contact_recall_warmup", 8.0, 32.0, 0.75, 0.25, 0.25, 0.75)
-        elif phase == "balance":
-            profile = ("contact_balance", 6.0, 16.0, 2.0, 1.0, 1.0, 1.0)
-        else:
-            profile = ("contact_precision", 4.0, 8.0, 6.0, 3.0, 2.0, 1.5)
-        name, contact_weight, pos_weight, fp_weight, hard_penalty, topk_weight, hard_weight = profile
-        loss.contact_weight = float(contact_weight)
-        loss.contact_pos_weight = float(pos_weight)
-        loss.contact_fp_weight = float(fp_weight)
-        loss.hard_negative_contact_penalty = float(hard_penalty)
-        loss.topk_false_contact_weight = float(topk_weight)
-        loss.hard_negative_weight = float(hard_weight)
-        if getattr(self, "_last_contact_loss_curriculum", None) != name:
-            self._last_contact_loss_curriculum = name
-            self.print_to_log_file(
-                "[LegacyTopology] contact loss curriculum "
-                f"{name}: contact_weight={contact_weight} pos={pos_weight} "
-                f"fp={fp_weight} hard_penalty={hard_penalty} topk={topk_weight}"
-            )
-
-    def on_train_start(self):
-        super().on_train_start()
-        self._maybe_load_instance_warmstart()
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        sidecar_dir = Path(self.preprocessed_dataset_folder) / "contact_instance_targets"
-        if not sidecar_dir.is_dir():
-            raise FileNotFoundError(
-                f"Contact-Instance sidecar directory missing: {sidecar_dir}. "
-                "Run `python code_task1/preprocessing.py build-instance-sidecars --dataset 537` after preprocessing."
-            )
-        dl_tr = PengwinLegacyTopologyDataLoader3D(
-            dataset_tr, self.batch_size, patch_size, self.configuration_manager.patch_size,
-            self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent,
-            sampling_probabilities=None, pad_sides=None, transforms=None,
-            sidecar_dir=sidecar_dir,
-            edge_center_probability=float(os.environ.get("PENGWIN_EDGE_CENTER_PROB", self.EDGE_CENTER_PROBABILITY)),
-            support_negative_center_probability=float(os.environ.get("PENGWIN_SUPPORT_NEG_CENTER_PROB", self.SUPPORT_NEGATIVE_CENTER_PROBABILITY)),
-            tiny_center_probability=float(os.environ.get("PENGWIN_TINY_CENTER_PROB", self.TINY_CENTER_PROBABILITY)),
-            hard_negative_center_probability=float(os.environ.get("PENGWIN_HARD_NEG_CENTER_PROB", self.HARD_NEGATIVE_CENTER_PROBABILITY)),
-        )
-        dl_val = PengwinLegacyTopologyDataLoader3D(
-            dataset_val, self.batch_size, self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size, self.label_manager,
-            oversample_foreground_percent=0.33, sampling_probabilities=None,
-            pad_sides=None, transforms=None, sidecar_dir=sidecar_dir,
-            edge_center_probability=0.20, support_negative_center_probability=0.40,
-            tiny_center_probability=0.10,
-            hard_negative_center_probability=0.10,
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-    def _move_batch(self, batch: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        data = torch.as_tensor(batch["data"], dtype=torch.float32, device=self.device)
-        target = {
-            key: torch.as_tensor(value, device=self.device)
-            for key, value in batch["target"].items()
-        }
-        target["support"] = target["support"].float()
-        target["core"] = target["core"].float()
-        target["contact"] = target["contact"].float()
-        target["hard_negative"] = target["hard_negative"].float()
-        target["morphology"] = target["morphology"].long()
-        target["offset"] = target["offset"].float()
-        target["edge_break"] = target["edge_break"].float()
-        target["edge_valid"] = target["edge_valid"].float()
-        target["instance"] = target["instance"].long()
-        return data, target
+                weights[-1] = 0
+            weights = weights / weights.sum()
+            return DeepSupervisionWrapper(marg, weights)
+        return marg
 
     def train_step(self, batch: dict) -> dict:
-        self._update_contact_loss_curriculum()
-        data, target = self._move_batch(batch)
-        self.optimizer.zero_grad(set_to_none=True)
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-        return {"loss": loss.detach().cpu().numpy()}
-
-    @staticmethod
-    def _binary_counts(pred: torch.Tensor, target: torch.Tensor) -> tuple[float, float, float, float]:
-        pred = pred.bool()
-        target = target.bool()
-        tp = float((pred & target).sum().item())
-        fp = float((pred & ~target).sum().item())
-        fn = float((~pred & target).sum().item())
-        tn = float((~pred & ~target).sum().item())
-        return tp, fp, fn, tn
+        self._set_marginal_mask(batch.get("keys"))
+        return super().train_step(batch)
 
     def validation_step(self, batch: dict) -> dict:
-        self._update_contact_loss_curriculum()
-        data, target = self._move_batch(batch)
+        # marginal mask 설정(val loss 일관) + 미라벨 예측을 bg 로 접어 메트릭을 marginal-aware 로.
+        self._set_marginal_mask(batch.get("keys"))
+        data = batch["data"]
+        target = batch["target"]
+        data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            target = [i.to(self.device, non_blocking=True) for i in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
         with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
             output = self.network(data)
-            loss = self.loss(output, target)
-        out = output.float()
-        support_t = target["support"][:, 0] > 0.5
-        core_t = target["core"][:, 0] > 0.5
-        contact_t = target["contact"][:, 0] > 0.5
-        hard_t = target["hard_negative"][:, 0] > 0.5
-        edge_t = target["edge_break"] > 0.5
-        edge_valid = target["edge_valid"] > 0.5
-        if out.shape[1] >= 16 and isinstance(self.loss, LegacyTopologyExclusiveLoss3D):
-            morph_prob = torch.softmax(out[:, 0:4], dim=1)
-            morph_pred = torch.argmax(morph_prob, dim=1)
-            support_p = (morph_pred == CONTACT_INSTANCE_MORPH_SUPPORT_CH) | (
-                morph_pred == CONTACT_INSTANCE_MORPH_CONTACT_CH
-            )
-            core_p = torch.sigmoid(out[:, CONTACT_INSTANCE_CORE_CH]) > 0.5
-            contact_p = morph_pred == CONTACT_INSTANCE_MORPH_CONTACT_CH
-            hard_p = morph_pred == CONTACT_INSTANCE_MORPH_HARD_NEGATIVE_CH
-            offset_pred = out[:, list(CONTACT_INSTANCE_OFFSET_CHS)]
-            edge_p = torch.sigmoid(out[:, list(CONTACT_INSTANCE_EDGE_BREAK_CHS)]) > 0.5
-        else:
-            support_p = torch.sigmoid(out[:, 0]) > 0.5
-            core_p = torch.sigmoid(out[:, 1]) > 0.5
-            contact_threshold = float(os.environ.get("PENGWIN_CONTACT_VAL_THRESHOLD", "0.35"))
-            contact_p = torch.sigmoid(out[:, 2]) > contact_threshold
-            hard_p = torch.sigmoid(out[:, 3]) > 0.5
-            offset_pred = out[:, 4:7]
-            edge_p = torch.zeros_like(edge_t)
-        support_counts = self._binary_counts(support_p, support_t)
-        core_counts = self._binary_counts(core_p, core_t)
-        contact_counts = self._binary_counts(contact_p, contact_t)
-        hard_counts = self._binary_counts(hard_p, hard_t)
-        if edge_valid.any():
-            edge_counts = self._binary_counts(edge_p[edge_valid], edge_t[edge_valid])
-        else:
-            edge_counts = (0.0, 0.0, 0.0, 0.0)
-        hard_contact_fp = float((contact_p & hard_t).sum().item())
-        hard_voxels = float(hard_t.sum().item())
-        support_noncontact_contact_fp = float((contact_p & support_t & ~contact_t).sum().item())
-        pred_contact_voxels = float(contact_p.sum().item())
-        target_contact_voxels = float(contact_t.sum().item())
-        support = support_t[:, None]
-        if support.any():
-            offset_mae = float(torch.abs(offset_pred[support.expand_as(offset_pred)] - target["offset"][support.expand_as(target["offset"])]).mean().detach().cpu())
-        else:
-            offset_mae = 0.0
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": np.asarray(support_counts, dtype=np.float64),
-            "core_counts": np.asarray(core_counts, dtype=np.float64),
-            "contact_counts": np.asarray(contact_counts, dtype=np.float64),
-            "hard_counts": np.asarray(hard_counts, dtype=np.float64),
-            "edge_counts": np.asarray(edge_counts, dtype=np.float64),
-            "hard_contact_fp": np.asarray([hard_contact_fp, hard_voxels], dtype=np.float64),
-            "support_noncontact_contact_fp": np.asarray([support_noncontact_contact_fp, pred_contact_voxels, target_contact_voxels], dtype=np.float64),
-            "offset_mae": np.asarray([offset_mae, 1.0], dtype=np.float64),
-        }
+            del data
+            l = self.loss(output, target)
+        if self.enable_deep_supervision:
+            output = output[0]
+            target = target[0]
+        axes = [0] + list(range(2, output.ndim))
+        output_seg = output.argmax(1)[:, None]
+        predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
+        predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+        del output_seg
+        # [MARGINAL] 미라벨 클래스 예측을 bg(0) 로 이동 → 그 클래스는 라벨된 케이스에서만 평가됨
+        lm = getattr(self._marginal_loss, "labeled_mask", None)
+        if lm is not None:
+            lm = lm.to(predicted_segmentation_onehot.device)
+            B, C = predicted_segmentation_onehot.shape[:2]
+            for c in range(1, C):
+                unl = ~lm[:, c]
+                if bool(unl.any()):
+                    sl = predicted_segmentation_onehot[:, c]
+                    moved = sl * unl.view(B, *([1] * (sl.ndim - 1))).to(sl.dtype)
+                    predicted_segmentation_onehot[:, 0] += moved
+                    predicted_segmentation_onehot[:, c] -= moved
+        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=None)
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
+        if not self.label_manager.has_regions:
+            tp_hard = tp_hard[1:]
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
+        return {"loss": l.detach().cpu().numpy(), "tp_hard": tp_hard,
+                "fp_hard": fp_hard, "fn_hard": fn_hard}
 
     @staticmethod
-    def _precision_recall_f(tp: float, fp: float, fn: float, beta: float = 1.0) -> tuple[float, float, float]:
-        eps = 1e-8
-        p = tp / max(tp + fp, eps)
-        r = tp / max(tp + fn, eps)
-        beta2 = float(beta) ** 2
-        f = (1.0 + beta2) * p * r / max(beta2 * p + r, eps)
-        return float(p), float(r), float(f)
-
-    def on_validation_epoch_end(self, val_outputs):
-        outputs = collate_outputs(val_outputs)
-        loss_here = float(np.mean(outputs["loss"]))
-        support_counts = np.sum(outputs["support_counts"], axis=0)
-        core_counts = np.sum(outputs["core_counts"], axis=0)
-        contact_counts = np.sum(outputs["contact_counts"], axis=0)
-        hard_counts = np.sum(outputs["hard_counts"], axis=0)
-        edge_counts = np.sum(outputs["edge_counts"], axis=0)
-        hard_contact = np.sum(outputs["hard_contact_fp"], axis=0)
-        support_noncontact_contact = np.sum(outputs["support_noncontact_contact_fp"], axis=0)
-        offset_sum = np.sum(outputs["offset_mae"], axis=0)
-        if self.is_ddp:
-            raise RuntimeError("PengwinTrainerLegacyTopologyV1 DDP validation is not implemented for v1")
-
-        support_p, support_r, support_f1 = self._precision_recall_f(*support_counts[:3], beta=1.0)
-        core_p, core_r, core_f1 = self._precision_recall_f(*core_counts[:3], beta=1.0)
-        contact_p, contact_r, contact_f05 = self._precision_recall_f(*contact_counts[:3], beta=0.5)
-        hard_p, hard_r, hard_f1 = self._precision_recall_f(*hard_counts[:3], beta=1.0)
-        edge_p, edge_r, edge_f05 = self._precision_recall_f(*edge_counts[:3], beta=0.5)
-        hard_specificity = 1.0 - (float(hard_contact[0]) / max(float(hard_contact[1]), 1.0))
-        support_false_contact_fraction = float(support_noncontact_contact[0]) / max(float(support_noncontact_contact[1]), 1.0)
-        pred_target_contact_ratio = float(support_noncontact_contact[1]) / max(float(support_noncontact_contact[2]), 1.0)
-        ratio_score = float(np.exp(-abs(np.log(max(pred_target_contact_ratio, 1e-6)))))
-        offset_mae = float(offset_sum[0] / max(offset_sum[1], 1.0))
-        offset_score = float(np.exp(-max(0.0, offset_mae)))
-        topology_score = max(contact_f05, edge_f05)
-        score = (
-            0.55 * topology_score
-            + 0.15 * float(np.sqrt(max(0.0, core_p * core_r)))
-            + 0.10 * max(0.0, hard_specificity)
-            + 0.05 * support_f1
-            + 0.10 * ratio_score
-            + 0.05 * offset_score
-        )
-        contact_viable = contact_p >= 0.02 and contact_r >= 0.10
-        edge_viable = edge_p >= 0.02 and edge_r >= 0.10
-        topology_viable = bool(contact_viable or edge_viable)
-        if not topology_viable:
-            # A checkpoint that only learns support/core/offset can look good
-            # numerically but cannot split fragments. Penalize it before EMA
-            # checkpoint selection so best.pth does not drift to a no-contact
-            # or all-background edge solution.
-            score *= 0.05
-        if pred_target_contact_ratio <= 0.0 or pred_target_contact_ratio > 50.0:
-            score *= 0.25
-        metrics = {
-            "score": float(score),
-            "contact_precision": contact_p,
-            "contact_recall": contact_r,
-            "contact_f0_5": contact_f05,
-            "pred_target_contact_ratio": pred_target_contact_ratio,
-            "support_noncontact_contact_fp_fraction": support_false_contact_fraction,
-            "edge_break_precision": edge_p,
-            "edge_break_recall": edge_r,
-            "edge_break_f0_5": edge_f05,
-            "core_precision": core_p,
-            "core_recall": core_r,
-            "core_f1": core_f1,
-            "support_precision": support_p,
-            "support_recall": support_r,
-            "support_f1": support_f1,
-            "hard_negative_precision": hard_p,
-            "hard_negative_recall": hard_r,
-            "hard_negative_f1": hard_f1,
-            "hard_negative_contact_specificity": float(hard_specificity),
-            "contact_ratio_score": ratio_score,
-            "topology_score": topology_score,
-            "topology_viable": topology_viable,
-            "offset_mae": offset_mae,
-            "offset_score": offset_score,
-        }
-        self._last_contact_instance_metrics = metrics
-        self.logger.log("mean_fg_dice", score, self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_f1, core_f1, contact_f05, edge_f05, max(0.0, hard_specificity), offset_score],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss_here, self.current_epoch)
-
-        completed = self.current_epoch + 1
-        if completed >= self.ES_MIN_EPOCHS:
-            ema = float(self.logger.my_fantastic_logging["ema_fg_dice"][-1])
-            if ema > self._es_best_dice + self.ES_MIN_DELTA:
-                self._es_best_dice = ema
-                self._es_no_improve = 0
-            else:
-                self._es_no_improve += 1
-                if self._es_no_improve >= self.ES_PATIENCE and not self._es_triggered:
-                    self._es_triggered = True
-                    self.print_to_log_file(
-                        f"Early stopping: no Contact-Instance score improvement for {self.ES_PATIENCE} epochs. "
-                        f"Best EMA score = {self._es_best_dice:.4f}."
-                    )
-                    self.num_epochs = completed
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_contact_instance_metrics", {})
-        self.print_to_log_file("Contact-instance val", {k: round(float(v), 4) for k, v in metrics.items()})
-        self.print_to_log_file(
-            "Diagnostic heads",
-            [np.round(i, decimals=4) for i in self.logger.my_fantastic_logging["dice_per_class_or_region"][-1]],
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        current_epoch = self.current_epoch
-        if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_latest.pth"))
-        ema_score = self.logger.my_fantastic_logging["ema_fg_dice"][-1]
-        if self._best_ema is None or ema_score > self._best_ema:
-            self._best_ema = ema_score
-            self.print_to_log_file(f"New best EMA Contact-Instance score: {np.round(self._best_ema, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        """Skip nnU-Net's semantic validation exporter for custom heads.
-
-        Dataset537 raw labels have 151 fragment IDs, but this trainer emits a
-        16-channel instance representation. nnU-Net's default validation path
-        allocates logits from the label manager and therefore expects 151
-        channels. Full-volume validation for Dataset537 must go through the
-        Contact-Instance evaluator, which understands the custom head layout.
-        """
-        self.print_to_log_file(
-            "[LegacyTopology] skipped native nnU-Net final validation; "
-            "run contact-instance-eval for full-volume IoU-F."
-        )
-        return None
+    def build_network_architecture(architecture_class_name, arch_init_kwargs,
+                                   arch_init_kwargs_req_import, num_input_channels,
+                                   num_output_channels, enable_deep_supervision: bool = True):
+        return _build_stunet_from_plan("base", arch_init_kwargs, num_input_channels,
+                                       num_output_channels,
+                                       enable_deep_supervision=enable_deep_supervision)
 
 
-class PengwinTrainerFactorizedInstanceV4(PengwinTrainerLegacyTopologyV1):
-    """Dataset537 V4 trainer with factorized instance heads.
+class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSTUNetBV301(
+    _StunetCleanTrainerMixin,
+    PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV300
+):
+    """[V0.x][BACKBONE] Ds538 ABBC fracture 용 STU-Net-B 백본 + BADB(V300) trainer.
 
-    Raw nnU-Net labels stay as pelvic instance IDs, but checkpoint selection is
-    based on the fixed V4 representation: binary support, contact energy, core
-    seed, hard-negative suppressor, offsets, and optional embeddings. This keeps
-    the failed V3.1 softmax ridge out of the active path.
+    V300(ResEnc base + BADB boundary refinement)의 백본만 STU-Net-B 로 교체한다.
+    ABBC 4-class loss/decode/BFv3 sidecar dataloader/validation/BADB(boundary ch2 refine)
+    는 V300 에서 그대로 상속. 입력 3ch(ct_lut+anatprob+sdf) → warm-start 시 stem inflate.
+    fine-tune 레시피: lr 1e-3, epochs 1000.
     """
-
-    NUM_EPOCHS_DEFAULT = 60
-    WARMUP_EPOCHS = 10
-    ES_MIN_EPOCHS = 20
-    ES_PATIENCE = 30
-    ES_MIN_DELTA = 2e-3
-    DEFAULT_LOSS_PROFILE = "factorized_instance_v4"
-    DEFAULT_CE_CLASS_WEIGHTS = "off"
-    DEFAULT_OVERSAMPLE_PROFILE = "factorized_instance_v4"
-    DISABLE_X_MIRROR_DATASETS = PengwinTrainer.DISABLE_X_MIRROR_DATASETS | {"Dataset537_PelvicFactorizedInstanceV4"}
-    SMOKE_PATCH_SIZE = (128, 128, 160)
-    SMOKE_BATCH_SIZE = 1
-    SMOKE_TRAIN_ITERS = 40
-    SMOKE_VAL_ITERS = 10
-    EDGE_CENTER_PROBABILITY = 0.45
-    SUPPORT_NEGATIVE_CENTER_PROBABILITY = 0.25
-    TINY_CENTER_PROBABILITY = 0.20
-    HARD_NEGATIVE_CENTER_PROBABILITY = 0.10
-
-    def __init__(self, plans: dict, configuration: str, fold: int,
-                 dataset_json: dict, unpack_dataset: bool = True,
-                 device: torch.device = torch.device("cuda")):
-        PengwinTrainer.__init__(
-            self, plans, configuration, fold, dataset_json,
-            unpack_dataset=unpack_dataset, device=device,
-        )
-        self.enable_deep_supervision = False
-        self.num_epochs = int(os.environ.get(
-            "PENGWIN_FACTOR_INSTANCE_EPOCHS",
-            os.environ.get("PENGWIN_INSTANCE_EPOCHS", self.NUM_EPOCHS_DEFAULT),
-        ))
-        full_patch = os.environ.get("PENGWIN_FACTOR_INSTANCE_FULL_PATCH",
-                                    os.environ.get("PENGWIN_INSTANCE_FULL_PATCH", "0"))
-        if full_patch.strip().lower() not in {"1", "true", "yes"}:
-            self.configuration_manager.configuration["patch_size"] = list(self.SMOKE_PATCH_SIZE)
-            self.configuration_manager.configuration["batch_size"] = int(self.SMOKE_BATCH_SIZE)
-            self.batch_size = int(self.SMOKE_BATCH_SIZE)
-            self.num_iterations_per_epoch = int(os.environ.get(
-                "PENGWIN_FACTOR_INSTANCE_TRAIN_ITERS",
-                os.environ.get("PENGWIN_INSTANCE_TRAIN_ITERS", self.SMOKE_TRAIN_ITERS),
-            ))
-            self.num_val_iterations_per_epoch = int(os.environ.get(
-                "PENGWIN_FACTOR_INSTANCE_VAL_ITERS",
-                os.environ.get("PENGWIN_INSTANCE_VAL_ITERS", self.SMOKE_VAL_ITERS),
-            ))
-        oversample_profile = os.environ.get(
-            "PENGWIN_OVERSAMPLE_PROFILE",
-            self.DEFAULT_OVERSAMPLE_PROFILE,
-        ).strip().lower()
-        if oversample_profile in {
-            "factorized_instance_v4_supportfocus",
-            "factorized_instance_v4_v44",
-            "factorized_instance_v4_mined",
-            "factorized_instance_v4_v46",
-        }:
-            # [DATA][Risk:Major][Scope:full_volume_support]
-            # V4.3 used foreground-only training patches. Patch validation looked
-            # healthy, but full-volume case003 had distant support FP islands and
-            # HD95 57.28 mm. V4.4 deliberately restores random/background patches
-            # so the support head sees ordinary outside-pelvis negatives.
-            self.oversample_foreground_percent = (
-                0.90 if oversample_profile in {"factorized_instance_v4_mined", "factorized_instance_v4_v46"} else 0.65
-            )
-        else:
-            self.oversample_foreground_percent = 1.0
-        self.print_to_log_file(
-            "[FactorizedInstanceV4] patch_size="
-            f"{list(self.configuration_manager.patch_size)} batch_size={self.batch_size} "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch} "
-            f"oversample_profile={oversample_profile} "
-            f"oversample_fg={self.oversample_foreground_percent:.2f}"
-        )
-
-    @staticmethod
-    def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import,
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True):
-        return nnUNetTrainer.build_network_architecture(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            FACTOR_INSTANCE_OUTPUT_CHANNELS,
-            enable_deep_supervision=False,
-        )
-
-    def _build_loss(self):
-        profile = os.environ.get("PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE).strip().lower()
-        if profile in {"factorized_instance_v4_seedfit", "factorized_instance_v4_support_seedfit"}:
-            self.print_to_log_file(
-                "[FactorizedInstanceV4.1] Loss = compact core seed + support top-k FP "
-                "+ support hard-negative suppression + contact energy; embedding disabled."
-            )
-            return FactorizedInstanceV4SeedFitLoss()
-        if profile in {"factorized_instance_v4_staged", "factorized_instance_v4_v42"}:
-            self.print_to_log_file(
-                "[FactorizedInstanceV4.2] Loss = staged compact core + delayed "
-                "support/hard-negative penalties + contact curriculum; embedding disabled."
-            )
-            return FactorizedInstanceV4StagedLoss()
-        if profile in {
-            "factorized_instance_v4_heatseed",
-            "factorized_instance_v4_v43",
-            "factorized_instance_v4_mined",
-            "factorized_instance_v4_v46",
-        }:
-            self.print_to_log_file(
-                "[FactorizedInstanceV4.3/V4.6] Loss = V4 heatmap core training; "
-                "V4.6 changes sampling via mined support centers, not this loss."
-            )
-            return FactorizedInstanceV4Loss()
-        if profile in {"factorized_instance_v4_supportfocus", "factorized_instance_v4_v44"}:
-            self.print_to_log_file(
-                "[FactorizedInstanceV4.4] Loss = support-focused V4 heatseed; "
-                "full-volume support Dice/HD95 gate decides whether 40e is allowed."
-            )
-            return FactorizedInstanceV4SupportFocusLoss()
-        self.print_to_log_file(
-            "[FactorizedInstanceV4] Loss = support Dice/Focal + contact energy "
-            "F0.5/top-k negatives + core seed + hard-negative + offset; "
-            "embedding disabled by default until overfit gates pass."
-        )
-        return FactorizedInstanceV4Loss()
-
-    def _overfit_case_ids(self) -> list[str] | None:
-        raw_path = os.environ.get("PENGWIN_FACTOR_INSTANCE_CASES_JSON", "").strip()
-        raw_cases = os.environ.get("PENGWIN_FACTOR_INSTANCE_CASES", "").strip()
-        if raw_path or raw_cases:
-            old_json = os.environ.get("PENGWIN_INSTANCE_CASES_JSON")
-            old_cases = os.environ.get("PENGWIN_INSTANCE_CASES")
-            try:
-                if raw_path:
-                    os.environ["PENGWIN_INSTANCE_CASES_JSON"] = raw_path
-                    os.environ.pop("PENGWIN_INSTANCE_CASES", None)
-                else:
-                    os.environ["PENGWIN_INSTANCE_CASES"] = raw_cases
-                    os.environ.pop("PENGWIN_INSTANCE_CASES_JSON", None)
-                return super()._overfit_case_ids()
-            finally:
-                if old_json is None:
-                    os.environ.pop("PENGWIN_INSTANCE_CASES_JSON", None)
-                else:
-                    os.environ["PENGWIN_INSTANCE_CASES_JSON"] = old_json
-                if old_cases is None:
-                    os.environ.pop("PENGWIN_INSTANCE_CASES", None)
-                else:
-                    os.environ["PENGWIN_INSTANCE_CASES"] = old_cases
-        return super()._overfit_case_ids()
-
-    def _update_contact_loss_curriculum(self) -> None:
-        loss = getattr(self, "loss", None)
-        if not isinstance(loss, FactorizedInstanceV4Loss):
-            return
-        if isinstance(loss, FactorizedInstanceV4SeedFitLoss):
-            return
-        epoch = int(getattr(self, "current_epoch", 0))
-        if isinstance(loss, FactorizedInstanceV4StagedLoss):
-            # [QA][Test:003_overfit][Status:Planned]
-            # V4.2 tests whether the representation can learn full-volume case003
-            # without the V4.1 early hard-negative/core collapse. The schedule is
-            # deterministic by epoch and is logged through validation metrics.
-            if epoch < 8:
-                loss.contact_pos_weight = 8.0
-                loss.contact_fp_weight = 2.0
-                loss.topk_false_contact_weight = 1.0
-                loss.core_weight = 4.0
-                loss.core_pos_weight = 12.0
-                loss.core_neg_weight = 0.5
-                loss.core_topk_false_weight = 0.0
-                loss.hard_negative_weight = 0.5
-                loss.support_topk_false_weight = 0.0
-                loss.support_hard_penalty_weight = 0.0
-            elif epoch < 24:
-                loss.contact_pos_weight = 4.0
-                loss.contact_fp_weight = 5.0
-                loss.topk_false_contact_weight = 2.0
-                loss.core_weight = 3.0
-                loss.core_pos_weight = 10.0
-                loss.core_neg_weight = 0.75
-                loss.core_topk_false_weight = 0.25
-                loss.hard_negative_weight = 1.0
-                loss.support_topk_false_weight = 0.35
-                loss.support_hard_penalty_weight = 0.35
-            else:
-                loss.contact_pos_weight = 2.5
-                loss.contact_fp_weight = 7.0
-                loss.topk_false_contact_weight = 2.5
-                loss.core_weight = 2.5
-                loss.core_pos_weight = 8.0
-                loss.core_neg_weight = 1.0
-                loss.core_topk_false_weight = 0.75
-                loss.hard_negative_weight = 1.5
-                loss.support_topk_false_weight = 0.75
-                loss.support_hard_penalty_weight = 0.75
-            return
-        if epoch < 8:
-            loss.contact_pos_weight = 8.0
-            loss.contact_fp_weight = 2.0
-            loss.topk_false_contact_weight = 1.0
-        elif epoch < 24:
-            loss.contact_pos_weight = 4.0
-            loss.contact_fp_weight = 5.0
-            loss.topk_false_contact_weight = 2.0
-        else:
-            loss.contact_pos_weight = 2.0
-            loss.contact_fp_weight = 8.0
-            loss.topk_false_contact_weight = 3.0
-
-    def get_dataloaders(self):
-        patch_size = self.configuration_manager.patch_size
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
-        sidecar_dir = Path(self.preprocessed_dataset_folder) / FACTOR_INSTANCE_SIDECAR_DIR
-        bicm_v5_sidecar_dir = Path(self.preprocessed_dataset_folder) / "bicm_v5_instance_targets"
-        if not sidecar_dir.is_dir():
-            if bicm_v5_sidecar_dir.is_dir():
-                # [DATA][Risk:High][Scope:sidecar_contract]
-                # The active Dataset537 preprocessing already stores dense
-                # fragment instances in `bicm_v5_instance_targets`. Reusing it
-                # keeps V163 focused on the embedding loss/decoder hypothesis and
-                # avoids rebuilding equivalent sidecars under a legacy directory.
-                sidecar_dir = bicm_v5_sidecar_dir
-                self.print_to_log_file(
-                    "[FactorizedInstanceV4] using BICM V5 dense instance sidecars "
-                    f"from {sidecar_dir}"
-                )
-            else:
-                raise FileNotFoundError(
-                    f"FactorizedInstance V4 sidecar directory missing: {sidecar_dir}. "
-                    f"BICM V5 fallback also missing: {bicm_v5_sidecar_dir}."
-                )
-        loss_profile = os.environ.get("PENGWIN_LOSS_PROFILE", self.DEFAULT_LOSS_PROFILE).strip().lower()
-        if loss_profile in {
-            "factorized_instance_v4_seedfit",
-            "factorized_instance_v4_support_seedfit",
-            "factorized_instance_v4_staged",
-            "factorized_instance_v4_v42",
-        }:
-            # [REPRO][Risk:Major][Scope:runtime_target]
-            # Dense core targets are generated per crop, so the target profile is
-            # stored in the launch environment and forced here before any batch is
-            # sampled. This prevents silent drift between V4 baseline and V4.2.
-            os.environ.setdefault("PENGWIN_FACTOR_CORE_TARGET", "compact_marker")
-            os.environ.setdefault("PENGWIN_FACTOR_CORE_RADIUS_VOX", "2")
-        elif loss_profile in {
-            "factorized_instance_v4_heatseed",
-            "factorized_instance_v4_v43",
-            "factorized_instance_v4_supportfocus",
-            "factorized_instance_v4_v44",
-            "factorized_instance_v4_mined",
-            "factorized_instance_v4_v46",
-            "factorized_instance_v4_embedding_v163",
-        }:
-            os.environ["PENGWIN_FACTOR_CORE_TARGET"] = "center_gaussian"
-            os.environ.setdefault("PENGWIN_FACTOR_CORE_SIGMA_VOX", "6.0")
-        oversample_profile = os.environ.get("PENGWIN_OVERSAMPLE_PROFILE", self.DEFAULT_OVERSAMPLE_PROFILE).strip().lower()
-        if oversample_profile in {
-            "factorized_instance_v4_seedfit",
-            "factorized_instance_v4_support_seedfit",
-            "factorized_instance_v4_staged",
-            "factorized_instance_v4_v42",
-        }:
-            # [DATA][Risk:Major][Scope:patch_sampling]
-            # V4 case003 full-volume audit showed two large outside-support FP
-            # components plus true-support suppression by the hard-negative head.
-            # This sampling profile raises hard-negative and ordinary support
-            # crops while keeping enough contact crops to preserve the already
-            # passing contact precision/recall.
-            edge_prob, support_prob, tiny_prob, hard_prob = 0.20, 0.35, 0.10, 0.35
-        elif oversample_profile in {"factorized_instance_v4_supportfocus", "factorized_instance_v4_v44"}:
-            # [DATA][Risk:Major][Scope:patch_full_volume_mismatch]
-            # Within forced patches, V4.4 spends most samples on support-negative
-            # and hard-negative contexts. Combined with oversample_fg=0.65, this
-            # leaves 35% truly random patches to expose full-volume background
-            # that foreground-only overfit did not see.
-            edge_prob, support_prob, tiny_prob, hard_prob = 0.20, 0.45, 0.10, 0.25
-        elif oversample_profile in {"factorized_instance_v4_mined", "factorized_instance_v4_v46"}:
-            # [DATA][Risk:High][Scope:mined_support_negative_loop]
-            # V4.4/V4.5 showed that generic background sampling is insufficient.
-            # V4.6 keeps V4.3's loss and dedicates half of forced crops to actual
-            # full-volume support FP/FN component centers mined from the previous
-            # failed checkpoint. This tests the mining loop itself, not a new
-            # representation.
-            edge_prob, support_prob, tiny_prob, hard_prob = 0.25, 0.20, 0.05, 0.10
-        else:
-            edge_prob = float(os.environ.get("PENGWIN_FACTOR_CONTACT_CENTER_PROB", self.EDGE_CENTER_PROBABILITY))
-            support_prob = float(os.environ.get("PENGWIN_FACTOR_SUPPORT_NEG_CENTER_PROB", self.SUPPORT_NEGATIVE_CENTER_PROBABILITY))
-            tiny_prob = float(os.environ.get("PENGWIN_FACTOR_TINY_CENTER_PROB", self.TINY_CENTER_PROBABILITY))
-            hard_prob = float(os.environ.get("PENGWIN_FACTOR_HARD_NEG_CENTER_PROB", self.HARD_NEGATIVE_CENTER_PROBABILITY))
-        mined_json_raw = os.environ.get("PENGWIN_FACTOR_MINED_CENTERS_JSON", "").strip()
-        mined_prob = (
-            float(os.environ.get("PENGWIN_FACTOR_MINED_CENTER_PROB", "0.50"))
-            if oversample_profile in {"factorized_instance_v4_mined", "factorized_instance_v4_v46"}
-            else float(os.environ.get("PENGWIN_FACTOR_MINED_CENTER_PROB", "0.0"))
-        )
-        dl_tr = PengwinLegacyTopologyDataLoader3D(
-            dataset_tr, self.batch_size, patch_size, self.configuration_manager.patch_size,
-            self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent,
-            sampling_probabilities=None, pad_sides=None, transforms=None,
-            sidecar_dir=sidecar_dir,
-            edge_center_probability=edge_prob,
-            support_negative_center_probability=support_prob,
-            tiny_center_probability=tiny_prob,
-            hard_negative_center_probability=hard_prob,
-            mined_center_probability=mined_prob,
-            mined_centers_json=Path(mined_json_raw) if mined_json_raw else None,
-        )
-        dl_val = PengwinLegacyTopologyDataLoader3D(
-            dataset_val, self.batch_size, self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size, self.label_manager,
-            oversample_foreground_percent=0.33, sampling_probabilities=None,
-            pad_sides=None, transforms=None, sidecar_dir=sidecar_dir,
-            edge_center_probability=0.20, support_negative_center_probability=0.40,
-            tiny_center_probability=0.10, hard_negative_center_probability=0.10,
-        )
-        mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-        mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
-
-    def validation_step(self, batch: dict) -> dict:
-        self._update_contact_loss_curriculum()
-        data, target = self._move_batch(batch)
-        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            output = self.network(data)
-            loss = self.loss(output, target)
-        out = output.float()
-        support_t = target["support"][:, 0] > 0.5
-        core_t = target["core"][:, 0] > 0.5
-        contact_t = target["contact"][:, 0] > 0.5
-        hard_t = target["hard_negative"][:, 0] > 0.5
-        support_p = torch.sigmoid(out[:, FACTOR_SUPPORT_CH]) > 0.5
-        contact_p = torch.sigmoid(out[:, FACTOR_CONTACT_CH]) > 0.5
-        core_p = torch.sigmoid(out[:, FACTOR_CORE_CH]) > 0.5
-        hard_p = torch.sigmoid(out[:, FACTOR_HARD_NEGATIVE_CH]) > 0.5
-        offset_pred = out[:, list(FACTOR_OFFSET_CHS)]
-        support_counts = self._binary_counts(support_p, support_t)
-        core_counts = self._binary_counts(core_p, core_t)
-        contact_counts = self._binary_counts(contact_p, contact_t)
-        hard_counts = self._binary_counts(hard_p, hard_t)
-        hard_contact_fp = float((contact_p & hard_t).sum().item())
-        hard_voxels = float(hard_t.sum().item())
-        support_noncontact_contact_fp = float((contact_p & support_t & ~contact_t).sum().item())
-        pred_contact_voxels = float(contact_p.sum().item())
-        target_contact_voxels = float(contact_t.sum().item())
-        support = support_t[:, None]
-        if support.any():
-            offset_mae = float(torch.abs(
-                offset_pred[support.expand_as(offset_pred)]
-                - target["offset"][support.expand_as(target["offset"])]
-            ).mean().detach().cpu())
-        else:
-            offset_mae = 0.0
-        return {
-            "loss": loss.detach().cpu().numpy(),
-            "support_counts": np.asarray(support_counts, dtype=np.float64),
-            "core_counts": np.asarray(core_counts, dtype=np.float64),
-            "contact_counts": np.asarray(contact_counts, dtype=np.float64),
-            "hard_counts": np.asarray(hard_counts, dtype=np.float64),
-            "edge_counts": np.asarray((0.0, 0.0, 0.0, 0.0), dtype=np.float64),
-            "hard_contact_fp": np.asarray([hard_contact_fp, hard_voxels], dtype=np.float64),
-            "support_noncontact_contact_fp": np.asarray([support_noncontact_contact_fp, pred_contact_voxels, target_contact_voxels], dtype=np.float64),
-            "offset_mae": np.asarray([offset_mae, 1.0], dtype=np.float64),
-        }
-
-    def on_validation_epoch_end(self, val_outputs):
-        outputs = collate_outputs(val_outputs)
-        loss_here = float(np.mean(outputs["loss"]))
-        support_counts = np.sum(outputs["support_counts"], axis=0)
-        core_counts = np.sum(outputs["core_counts"], axis=0)
-        contact_counts = np.sum(outputs["contact_counts"], axis=0)
-        hard_counts = np.sum(outputs["hard_counts"], axis=0)
-        hard_contact = np.sum(outputs["hard_contact_fp"], axis=0)
-        support_noncontact_contact = np.sum(outputs["support_noncontact_contact_fp"], axis=0)
-        offset_sum = np.sum(outputs["offset_mae"], axis=0)
-        if self.is_ddp:
-            raise RuntimeError("PengwinTrainerFactorizedInstanceV4 DDP validation is not implemented")
-        support_p, support_r, support_f1 = self._precision_recall_f(*support_counts[:3], beta=1.0)
-        core_p, core_r, core_f1 = self._precision_recall_f(*core_counts[:3], beta=1.0)
-        contact_p, contact_r, contact_f05 = self._precision_recall_f(*contact_counts[:3], beta=0.5)
-        hard_p, hard_r, hard_f1 = self._precision_recall_f(*hard_counts[:3], beta=1.0)
-        hard_specificity = 1.0 - (float(hard_contact[0]) / max(float(hard_contact[1]), 1.0))
-        support_false_contact_fraction = float(support_noncontact_contact[0]) / max(float(support_noncontact_contact[1]), 1.0)
-        pred_target_contact_ratio = float(support_noncontact_contact[1]) / max(float(support_noncontact_contact[2]), 1.0)
-        ratio_score = float(np.exp(-abs(np.log(max(pred_target_contact_ratio, 1e-6)))))
-        offset_mae = float(offset_sum[0] / max(offset_sum[1], 1.0))
-        offset_score = float(np.exp(-max(0.0, offset_mae)))
-        support_stable = support_f1 >= 0.75
-        contact_viable = contact_p >= 0.02 and contact_r >= 0.10
-        if os.environ.get("PENGWIN_LOSS_PROFILE", "").strip().lower() in {
-            "factorized_instance_v4_seedfit", "factorized_instance_v4_support_seedfit",
-            "factorized_instance_v4_staged", "factorized_instance_v4_v42",
-        }:
-            # [METRIC][Risk:Major][Scope:checkpoint_selection]
-            # The failed V4 run selected checkpoints from contact-heavy patch
-            # metrics while full-volume support HD95 and seed specificity failed.
-            # This score still cannot replace full-volume eval, but it makes
-            # `checkpoint_best.pth` less likely to favor a broad core seed.
-            score = (
-                0.30 * support_f1
-                + 0.25 * contact_f05
-                + 0.20 * core_p
-                + 0.10 * core_r
-                + 0.10 * max(0.0, hard_specificity)
-                + 0.05 * offset_score
-            )
-        elif os.environ.get("PENGWIN_LOSS_PROFILE", "").strip().lower() in {
-            "factorized_instance_v4_supportfocus", "factorized_instance_v4_v44",
-        }:
-            # [METRIC][Risk:Major][Scope:checkpoint_selection]
-            # V4.4 is a support-geometry diagnostic. Patch validation still
-            # cannot prove promotion, but checkpoint selection must not prefer a
-            # contact-heavy epoch if support F1 has already regressed.
-            score = (
-                0.45 * support_f1
-                + 0.20 * contact_f05
-                + 0.10 * contact_r
-                + 0.15 * float(np.sqrt(max(0.0, core_p * core_r)))
-                + 0.05 * max(0.0, hard_specificity)
-                + 0.05 * offset_score
-            )
-        else:
-            score = (
-                0.20 * support_f1
-                + 0.35 * contact_f05
-                + 0.15 * contact_r
-                + 0.15 * float(np.sqrt(max(0.0, core_p * core_r)))
-                + 0.10 * max(0.0, hard_specificity)
-                + 0.05 * offset_score
-            )
-        if not (support_stable and contact_viable):
-            score *= 0.10
-        if pred_target_contact_ratio <= 0.0 or pred_target_contact_ratio > 20.0:
-            score *= 0.25
-        metrics = {
-            "score": float(score),
-            "support_precision": support_p,
-            "support_recall": support_r,
-            "support_f1": support_f1,
-            "contact_precision": contact_p,
-            "contact_recall": contact_r,
-            "contact_f0_5": contact_f05,
-            "pred_target_contact_ratio": pred_target_contact_ratio,
-            "support_noncontact_contact_fp_fraction": support_false_contact_fraction,
-            "core_precision": core_p,
-            "core_recall": core_r,
-            "core_f1": core_f1,
-            "hard_negative_precision": hard_p,
-            "hard_negative_recall": hard_r,
-            "hard_negative_f1": hard_f1,
-            "hard_negative_contact_specificity": float(hard_specificity),
-            "contact_ratio_score": ratio_score,
-            "topology_viable": bool(support_stable and contact_viable),
-            "offset_mae": offset_mae,
-            "offset_score": offset_score,
-        }
-        self._last_contact_instance_metrics = metrics
-        self.logger.log("mean_fg_dice", score, self.current_epoch)
-        self.logger.log(
-            "dice_per_class_or_region",
-            [support_f1, contact_f05, contact_r, core_f1, max(0.0, hard_specificity), offset_score],
-            self.current_epoch,
-        )
-        self.logger.log("val_losses", loss_here, self.current_epoch)
-        completed = self.current_epoch + 1
-        if completed >= self.ES_MIN_EPOCHS:
-            ema = float(self.logger.my_fantastic_logging["ema_fg_dice"][-1])
-            if ema > self._es_best_dice + self.ES_MIN_DELTA:
-                self._es_best_dice = ema
-                self._es_no_improve = 0
-            else:
-                self._es_no_improve += 1
-                if self._es_no_improve >= self.ES_PATIENCE and not self._es_triggered:
-                    self._es_triggered = True
-                    self.print_to_log_file(
-                        f"Early stopping: no FactorizedInstance score improvement for {self.ES_PATIENCE} epochs. "
-                        f"Best EMA score = {self._es_best_dice:.4f}."
-                    )
-                    self.num_epochs = completed
-
-    def on_epoch_end(self):
-        self.logger.log("epoch_end_timestamps", time.time(), self.current_epoch)
-        self.print_to_log_file("train_loss", np.round(self.logger.my_fantastic_logging["train_losses"][-1], decimals=4))
-        self.print_to_log_file("val_loss", np.round(self.logger.my_fantastic_logging["val_losses"][-1], decimals=4))
-        metrics = getattr(self, "_last_contact_instance_metrics", {})
-        self.print_to_log_file("Factorized-instance val", {k: round(float(v), 4) for k, v in metrics.items()})
-        self.print_to_log_file(
-            "Diagnostic heads",
-            [np.round(i, decimals=4) for i in self.logger.my_fantastic_logging["dice_per_class_or_region"][-1]],
-        )
-        self.print_to_log_file(
-            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s"
-        )
-        current_epoch = self.current_epoch
-        if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_latest.pth"))
-        ema_score = self.logger.my_fantastic_logging["ema_fg_dice"][-1]
-        if self._best_ema is None or ema_score > self._best_ema:
-            self._best_ema = ema_score
-            self.print_to_log_file(f"New best EMA FactorizedInstance score: {np.round(self._best_ema, decimals=4)}")
-            self.save_checkpoint(str(Path(self.output_folder) / "checkpoint_best.pth"))
-        if self.local_rank == 0:
-            self.logger.plot_progress_png(self.output_folder)
-        self.current_epoch += 1
-
-    def perform_actual_validation(self, save_probabilities: bool = False):
-        self.print_to_log_file(
-            "[FactorizedInstanceV4] skipped native nnU-Net final validation; "
-            "run factorized-instance-eval for full-volume IoU-F."
-        )
-        return None
-
-
-class PengwinTrainerFactorizedInstanceEmbeddingV163(PengwinTrainerFactorizedInstanceV4):
-    """Dataset537 V163 compact embedding probe using existing dense sidecars."""
-
-    NUM_EPOCHS_DEFAULT = 2
-    DEFAULT_LOSS_PROFILE = "factorized_instance_v4_embedding_v163"
-    DEFAULT_OVERSAMPLE_PROFILE = "factorized_instance_v4_v163"
 
     def __init__(self, plans: dict, configuration: str, fold: int,
                  dataset_json: dict, unpack_dataset: bool = True,
                  device: torch.device = torch.device("cuda")):
         super().__init__(plans, configuration, fold, dataset_json,
                          unpack_dataset=unpack_dataset, device=device)
-        self.num_epochs = int(os.environ.get("PENGWIN_BICM_V163_EPOCHS", self.NUM_EPOCHS_DEFAULT))
-        if os.environ.get("PENGWIN_BICM_V163_TRAIN_ITERS"):
-            self.num_iterations_per_epoch = int(os.environ["PENGWIN_BICM_V163_TRAIN_ITERS"])
-        if os.environ.get("PENGWIN_BICM_V163_VAL_ITERS"):
-            self.num_val_iterations_per_epoch = int(os.environ["PENGWIN_BICM_V163_VAL_ITERS"])
-        self.print_to_log_file(
-            "[FactorizedInstanceEmbeddingV163] changed_variable=compact_embedding_loss "
-            f"epochs={self.num_epochs} train_iters={self.num_iterations_per_epoch} "
-            f"val_iters={self.num_val_iterations_per_epoch}"
-        )
+        self.initial_lr = 1e-3
+        self.num_epochs = 1000
+        # [V0.x][ES][2026-06-01] warm-start 용 early-stop 재튜닝.
+        # 상속 기본값(PengwinTrainer: MIN_EPOCHS=100, PATIENCE=50)은 from-scratch 기준이다.
+        # STU-Net 뼈 사전학습 warm-start 는 수십 epoch 안에 수렴하므로, 수렴 후 낭비 학습을
+        # 막도록 ES 를 낮춘다(MIN_EPOCHS=30 부터 EMA-dice 정체 PATIENCE=25 epoch 시 종료).
+        # 상속된 while-loop run_training + on_validation_epoch_end 의 ES 로직이 그대로 적용되며,
+        # checkpoint_best 는 상시 저장되므로 종료 시점 최적 가중치가 보존된다. env 로 튜닝 가능.
+        import os as _os_es
+        self.ES_MIN_EPOCHS = int(_os_es.environ.get("PENGWIN_ES_MIN_EPOCHS", "30"))
+        self.ES_PATIENCE = int(_os_es.environ.get("PENGWIN_ES_PATIENCE", "25"))
+        self.ES_MIN_DELTA = float(_os_es.environ.get("PENGWIN_ES_MIN_DELTA", "5e-3"))
 
-    def _build_loss(self):
-        embedding_weight = float(os.environ.get("PENGWIN_BICM_V163_EMBEDDING_WEIGHT", "0.10"))
-        # [AUDIT][Risk:Major][Scope:representation_ablation]
-        # V163 keeps support/contact/core/hard-negative/offset heads identical to
-        # FactorizedInstanceV4 and only enables the compact embedding term. This
-        # isolates whether instance-level grouping supervision helps after the
-        # V160/V161 raw-offset hypothesis failed.
-        self.print_to_log_file(
-            "[FactorizedInstanceEmbeddingV163] Loss = FactorizedInstanceV4 "
-            f"with embedding_weight={embedding_weight:.4f}"
+    @staticmethod
+    def build_network_architecture(architecture_class_name, arch_init_kwargs,
+                                   arch_init_kwargs_req_import, num_input_channels,
+                                   num_output_channels, enable_deep_supervision: bool = True):
+        # 1) STU-Net-B base (4-class ABBC logits, V291 와 동일하게 DS off)
+        base = _build_stunet_from_plan(
+            "base", arch_init_kwargs, num_input_channels,
+            BFV3_ABBC_BWEIGHT_V291_OUTPUT_CHANNELS, enable_deep_supervision=False)
+        # 2) BADB 래퍼 (boundary channel=2 refine, zero-init → 초기 base byte-identical)
+        wrapped = _V300BoundaryAttentionRefinementNetwork(
+            base_network=base,
+            num_output_channels=BFV3_ABBC_BWEIGHT_V291_OUTPUT_CHANNELS,
+            boundary_channel_index=2,  # ABBC: 0=background, 1=border, 2=boundary, 3=core
         )
-        return FactorizedInstanceV4Loss(embedding_weight=embedding_weight)
+        return wrapped
+
+

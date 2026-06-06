@@ -32,6 +32,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy import ndimage as ndi
 
+# Single source of truth for the anatomy<->instance-ID encoding. Instance IDs in
+# this module are torch tensors, so we use the registry's scalar bound rather than
+# its numpy mask helpers: every "(x > 0) & (x <= 150)" support mask and "x > 150"
+# guard becomes "<= MAX_INSTANCE_ID", which spans Femur (151-200). This is a safe
+# superset — pelvic ROIs hold no 151-200 voxels, femur ROIs are no longer dropped.
+# NOTE: "150" inside class names (BICMV150...) is a version tag, NOT an instance id.
+from anatomy_registry import MAX_INSTANCE_ID
+
 
 class BoundaryFragmentV3Loss(nn.Module):
     """BoundaryFragment V3 semantic-specialist objective.
@@ -2137,7 +2145,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateInstanceCoreGuardBarrierHea
             prob = core_prob[batch_idx]
             for frag_id in torch.unique(inst):
                 fid = int(frag_id.detach().cpu())
-                if fid <= 0 or fid > 150:
+                if fid <= 0 or fid > MAX_INSTANCE_ID:
                     continue
                 core_mask = (inst == fid) & (lbl == 4)
                 if not core_mask.any():
@@ -2160,7 +2168,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateInstanceCoreGuardBarrierHea
             prob = core_prob[batch_idx].float()
             for frag_id in torch.unique(inst):
                 fid = int(frag_id.detach().cpu())
-                if fid <= 0 or fid > 150:
+                if fid <= 0 or fid > MAX_INSTANCE_ID:
                     continue
                 fragment = inst == fid
                 support = fragment & ((lbl == 2) | (lbl == 3) | (lbl == 4))
@@ -2182,7 +2190,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateInstanceCoreGuardBarrierHea
         return torch.stack(losses).mean()
 
     def _bridge_core_false_loss(self, core_prob: torch.Tensor, labels: torch.Tensor, instance: torch.Tensor) -> torch.Tensor:
-        bridge = (instance > 0) & (instance <= 150) & ((labels == 2) | (labels == 3))
+        bridge = (instance > 0) & (instance <= MAX_INSTANCE_ID) & ((labels == 2) | (labels == 3))
         if not bridge.any():
             return core_prob.new_zeros(())
         vals = core_prob[bridge].float()
@@ -2190,7 +2198,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateInstanceCoreGuardBarrierHea
         return torch.topk(vals, k=min(k, vals.numel()), largest=True).values.mean()
 
     def _bridge_core_margin_loss(self, logits: torch.Tensor, labels: torch.Tensor, instance: torch.Tensor) -> torch.Tensor:
-        bridge = (instance > 0) & (instance <= 150) & ((labels == 2) | (labels == 3))
+        bridge = (instance > 0) & (instance <= MAX_INSTANCE_ID) & ((labels == 2) | (labels == 3))
         if not bridge.any():
             return logits.new_zeros(())
         logits_f = logits.float()
@@ -2420,7 +2428,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateFragmentPeakCoreBarrierHead
             prob = core_prob[batch_idx].float()
             for frag_id in torch.unique(inst):
                 fid = int(frag_id.detach().cpu())
-                if fid <= 0 or fid > 150:
+                if fid <= 0 or fid > MAX_INSTANCE_ID:
                     continue
                 fragment = inst == fid
                 core_mask = fragment & (lbl == 4)
@@ -2702,7 +2710,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateCore025StrongPeakSoftContac
             prob = core_prob[batch_idx].float()
             for frag_id in torch.unique(inst):
                 fid = int(frag_id.detach().cpu())
-                if fid <= 0 or fid > 150:
+                if fid <= 0 or fid > MAX_INSTANCE_ID:
                     continue
                 fragment = inst == fid
                 core_mask = fragment & (lbl == 4)
@@ -2856,7 +2864,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateCore025StrongPeakContactShe
             prob = core_prob[batch_idx].float()
             for frag_id in torch.unique(inst):
                 fid = int(frag_id.detach().cpu())
-                if fid <= 0 or fid > 150:
+                if fid <= 0 or fid > MAX_INSTANCE_ID:
                     continue
                 fragment = inst == fid
                 core_mask = fragment & (lbl == 4)
@@ -3647,11 +3655,11 @@ class BoundaryFragmentV3Core025StrongPeakXYZAffinityHeadLoss(
         inst = instance.long()
         target = torch.zeros((int(inst.shape[0]), 3, *inst.shape[1:]), dtype=torch.float32, device=inst.device)
         valid = torch.zeros_like(target, dtype=torch.bool)
-        invalid = (inst < 0) | (inst > 150)
+        invalid = (inst < 0) | (inst > MAX_INSTANCE_ID)
         if invalid.any():
             bad_min = int(inst.min().detach().cpu())
             bad_max = int(inst.max().detach().cpu())
-            raise ValueError(f"V248 instance IDs must be in [0, 150], got min={bad_min} max={bad_max}")
+            raise ValueError(f"V248 instance IDs must be in [0, {MAX_INSTANCE_ID}], got min={bad_min} max={bad_max}")
         for axis in range(3):
             a_sl = [slice(None)] * 4
             b_sl = [slice(None)] * 4
@@ -3659,8 +3667,8 @@ class BoundaryFragmentV3Core025StrongPeakXYZAffinityHeadLoss(
             b_sl[axis + 1] = slice(1, None)
             a = inst[tuple(a_sl)]
             b = inst[tuple(b_sl)]
-            a_fg = (a > 0) & (a <= 150)
-            b_fg = (b > 0) & (b <= 150)
+            a_fg = (a > 0) & (a <= MAX_INSTANCE_ID)
+            b_fg = (b > 0) & (b <= MAX_INSTANCE_ID)
             same_anatomy = a_fg & b_fg & (((a - 1) // 50) == ((b - 1) // 50))
             same_fragment = same_anatomy & (a == b)
             target_axis = target[:, axis]
@@ -3979,11 +3987,11 @@ class BoundaryFragmentV3Core025StrongPeakAffinity13SeedHealedHeadLoss(
                 f"or [B, 1, Z, Y, X], got {tuple(instance.shape)}"
             )
         inst = instance.long()
-        invalid = (inst < 0) | (inst > 150)
+        invalid = (inst < 0) | (inst > MAX_INSTANCE_ID)
         if invalid.any():
             bad_min = int(inst.min().detach().cpu())
             bad_max = int(inst.max().detach().cpu())
-            raise ValueError(f"V253 instance IDs must be in [0, 150], got min={bad_min} max={bad_max}")
+            raise ValueError(f"V253 instance IDs must be in [0, {MAX_INSTANCE_ID}], got min={bad_min} max={bad_max}")
         target = torch.zeros(
             (int(inst.shape[0]), len(cls.AFFINITY13_OFFSETS_ZYX), *inst.shape[1:]),
             dtype=torch.float32,
@@ -3996,8 +4004,8 @@ class BoundaryFragmentV3Core025StrongPeakAffinity13SeedHealedHeadLoss(
             dst_sl = (slice(None), *dst_sl_zyx)
             a = inst[src_sl]
             b = inst[dst_sl]
-            a_fg = (a > 0) & (a <= 150)
-            b_fg = (b > 0) & (b <= 150)
+            a_fg = (a > 0) & (a <= MAX_INSTANCE_ID)
+            b_fg = (b > 0) & (b <= MAX_INSTANCE_ID)
             same_anatomy = a_fg & b_fg & (((a - 1) // 50) == ((b - 1) // 50))
             same_fragment = same_anatomy & (a == b)
             target_i = target[:, i]
@@ -4062,7 +4070,7 @@ class BoundaryFragmentV3Core025StrongPeakAffinity13SeedHealedHeadLoss(
                 f"seed_body={tuple(seed_body.shape)} labels={tuple(labels.shape)}"
             )
 
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         exterior_target = (labels == 1).float()
         fracture_target = (labels == 2).float()
         affinity_target, affinity_valid = self._same_fragment_affinity13_targets(instance)
@@ -4190,11 +4198,11 @@ class BoundaryFragmentV3Core025StrongPeakAffinity13ContactHardNegativeSeedHealed
                 f"or [B,1,Z,Y,X], got {tuple(instance.shape)}"
             )
         inst = instance.long()
-        invalid = (inst < 0) | (inst > 150)
+        invalid = (inst < 0) | (inst > MAX_INSTANCE_ID)
         if invalid.any():
             bad_min = int(inst.min().detach().cpu())
             bad_max = int(inst.max().detach().cpu())
-            raise ValueError(f"V254 instance IDs must be in [0, 150], got min={bad_min} max={bad_max}")
+            raise ValueError(f"V254 instance IDs must be in [0, {MAX_INSTANCE_ID}], got min={bad_min} max={bad_max}")
         shape = tuple(int(v) for v in inst.shape[1:])
         edge_shape = (int(inst.shape[0]), len(cls.AFFINITY13_OFFSETS_ZYX), *shape)
         same_edge = torch.zeros(edge_shape, dtype=torch.bool, device=inst.device)
@@ -4206,8 +4214,8 @@ class BoundaryFragmentV3Core025StrongPeakAffinity13ContactHardNegativeSeedHealed
             dst_sl = (slice(None), *dst_sl_zyx)
             a = inst[src_sl]
             b = inst[dst_sl]
-            a_fg = (a > 0) & (a <= 150)
-            b_fg = (b > 0) & (b <= 150)
+            a_fg = (a > 0) & (a <= MAX_INSTANCE_ID)
+            b_fg = (b > 0) & (b <= MAX_INSTANCE_ID)
             same_anatomy = a_fg & b_fg & (((a - 1) // 50) == ((b - 1) // 50))
             same_fragment = same_anatomy & (a == b)
             different_fragment = same_anatomy & (a != b)
@@ -4316,7 +4324,7 @@ class BoundaryFragmentV3Core025StrongPeakAffinity13ContactHardNegativeSeedHealed
                 f"V254 seed shape mismatch: seed_center={tuple(seed_center.shape)} "
                 f"seed_body={tuple(seed_body.shape)} labels={tuple(labels.shape)}"
             )
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         exterior_target = (labels == 1).float()
         fracture_target = (labels == 2).float()
         same_edge, hard_negative_edge, valid_edge = self._same_and_contact_hard_negative_edges(instance)
@@ -4575,7 +4583,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SeedHealedHeadLoss(
         base_logits = pred_logits[:, :5].float()
         attractive_logit = pred_logits[:, self.ATTRACTIVE_START:self.REPULSIVE_START].float()
         repulsive_logit = pred_logits[:, self.REPULSIVE_START:].float()
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         exterior_target = (labels == 1).float()
         fracture_target = (labels == 2).float()
 
@@ -4712,11 +4720,11 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SupportLeakGuardSeedHealedHeadLo
                 f"got {tuple(instance.shape)}"
             )
         inst = instance.long()
-        invalid = (inst < 0) | (inst > 150)
+        invalid = (inst < 0) | (inst > MAX_INSTANCE_ID)
         if invalid.any():
             bad_min = int(inst.min().detach().cpu())
             bad_max = int(inst.max().detach().cpu())
-            raise ValueError(f"V256 instance IDs must be in [0, 150], got min={bad_min} max={bad_max}")
+            raise ValueError(f"V256 instance IDs must be in [0, {MAX_INSTANCE_ID}], got min={bad_min} max={bad_max}")
         shape = tuple(int(v) for v in inst.shape[1:])
         edge_shape = (int(inst.shape[0]), len(cls.AFFINITY13_OFFSETS_ZYX), *shape)
         same_edge = torch.zeros(edge_shape, dtype=torch.bool, device=inst.device)
@@ -4729,8 +4737,8 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SupportLeakGuardSeedHealedHeadLo
             dst_sl = (slice(None), *dst_sl_zyx)
             a = inst[src_sl]
             b = inst[dst_sl]
-            a_fg = (a > 0) & (a <= 150)
-            b_fg = (b > 0) & (b <= 150)
+            a_fg = (a > 0) & (a <= MAX_INSTANCE_ID)
+            b_fg = (b > 0) & (b <= MAX_INSTANCE_ID)
             same_anatomy = a_fg & b_fg & (((a - 1) // 50) == ((b - 1) // 50))
             same_fragment = same_anatomy & (a == b)
             different_fragment = same_anatomy & (a != b)
@@ -4857,7 +4865,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SupportLeakGuardSeedHealedHeadLo
         base_logits = pred_logits[:, :5].float()
         attractive_logit = pred_logits[:, self.ATTRACTIVE_START:self.REPULSIVE_START].float()
         repulsive_logit = pred_logits[:, self.REPULSIVE_START:].float()
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         exterior_target = (labels == 1).float()
         fracture_target = (labels == 2).float()
         reference_edges = int((same_edge | contact_edge).sum().detach().cpu())
@@ -5003,7 +5011,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SeedStableSupportLeakGuardSeedHe
         floor = self._probability_to_logit(self.seed_presence_floor_probability)
         for batch_idx in range(int(seed_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag_mask = instance[batch_idx] == int(frag_id)
                 if not frag_mask.any():
@@ -5116,7 +5124,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SeedStableSupportLeakGuardSeedHe
                 f"seed_body={tuple(seed_body.shape)} logits={tuple(pred_logits.shape)}"
             )
 
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         seed_positive = torch.maximum((seed_center > 0.5).float(), seed_body.float())
         seed_logit = pred_logits[:, 4].float()
         total = total + self.seed_presence_lambda * self._seed_presence_loss(seed_logit, instance)
@@ -5256,7 +5264,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SeedPeakSupportLeakGuardSeedHeal
         losses: list[torch.Tensor] = []
         for batch_idx in range(int(seed_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 center = frag & (seed_center[batch_idx] > 0.5)
@@ -5328,7 +5336,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SeedPeakSupportLeakGuardSeedHeal
                 f"logits={tuple(pred_logits.shape)}"
             )
 
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         seed_logit = pred_logits[:, 3].float()
         total = total + self.seed_peak_presence_lambda * self._seed_peak_presence_loss(seed_logit, seed_center)
         total = total + self.seed_peak_false_tail_lambda * self._seed_peak_false_tail_loss(seed_logit, seed_center)
@@ -5520,7 +5528,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13SeedPeakBodySupportLeakGuardSeed
                 f"V259 seed shape mismatch: seed_center={tuple(seed_center.shape)} "
                 f"seed_body={tuple(seed_body.shape)} logits={tuple(pred_logits.shape)}"
             )
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         seed_logit = pred_logits[:, 3].float()
         total = total + self.seed_peak_body_bce_lambda * self._seed_peak_body_bce_loss(seed_logit, seed_body)
         total = total + self.seed_peak_center_floor_lambda * self._seed_peak_body_floor_loss(
@@ -5732,7 +5740,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13FractureSeedCalibratedSupportLea
         floor = self._probability_to_logit(self.seed_fragment_floor_probability)
         for batch_idx in range(int(seed_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 body = frag & (seed_body[batch_idx] > 0.5)
@@ -5758,7 +5766,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13FractureSeedCalibratedSupportLea
         losses: list[torch.Tensor] = []
         for batch_idx in range(int(seed_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 body = frag & (seed_body[batch_idx] > 0.5)
@@ -5801,7 +5809,7 @@ class BoundaryFragmentV3Core025StrongPeakMutex13FractureSeedCalibratedSupportLea
                 f"instance={tuple(instance.shape)} seed_body={tuple(seed_body.shape)} "
                 f"logits={tuple(pred_logits.shape)}"
             )
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         fracture_target = (labels == 2).float()
         fracture_logit = pred_logits[:, 2].float()
         seed_logit = pred_logits[:, 3].float()
@@ -6014,7 +6022,7 @@ class BoundaryFragmentV3Core025StrongPeakPairwiseSoftmaxMutex13SeedHealedHeadLos
         if instance.ndim != 4:
             raise ValueError(f"V266 support-adjacent edge mask expects [B,Z,Y,X], got {tuple(instance.shape)}")
         inst = instance.long()
-        support = (inst > 0) & (inst <= 150)
+        support = (inst > 0) & (inst <= MAX_INSTANCE_ID)
         shape = tuple(int(v) for v in inst.shape[1:])
         edge_shape = (int(inst.shape[0]), len(cls.AFFINITY13_OFFSETS_ZYX), *shape)
         edge_mask = torch.zeros(edge_shape, dtype=torch.bool, device=inst.device)
@@ -6068,7 +6076,7 @@ class BoundaryFragmentV3Core025StrongPeakPairwiseSoftmaxMutex13SeedHealedHeadLos
             leak_edge & edge_universe & support_adjacent_edge,
             reference_count=reference_edges,
         )
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         exterior_target = (labels == 1).float()
         fracture_target = self._edge_mask_to_voxel_mask(contact_edge).float()
 
@@ -6228,7 +6236,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactPairwiseSoftmaxMutex13SeedHeal
         join_logit = pred_logits[:, self.ATTRACTIVE_START:self.REPULSIVE_START].float()
         cut_logit = pred_logits[:, self.REPULSIVE_START:].float()
         edge_diff_logit = join_logit - cut_logit
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         support_adjacent_edge = self._support_adjacent_edge_mask(instance)
         reference_edges = int((same_edge | different_fragment_edge).sum().detach().cpu())
         selected_leak_edge = self._select_leak_hard_negatives(
@@ -6362,7 +6370,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactPairwiseSoftmaxSeedHealedV273H
         join_logit = pred_logits[:, self.ATTRACTIVE_START:self.REPULSIVE_START].float()
         cut_logit = pred_logits[:, self.REPULSIVE_START:].float()
         edge_diff_logit = join_logit - cut_logit
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         support_adjacent_edge = self._support_adjacent_edge_mask(instance)
         reference_edges = int((same_edge | different_fragment_edge).sum().detach().cpu())
         selected_leak_edge = self._select_leak_hard_negatives(
@@ -6564,7 +6572,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactPairwiseSoftmaxSeedCalibratedV
                 f"V274 seed calibration target shape mismatch: instance={tuple(instance.shape)} "
                 f"seed_body={tuple(seed_body.shape)} logits={tuple(pred_logits.shape)}"
             )
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         seed_logit = pred_logits[:, 1].float()
         total = total + self.seed_support_false_tail_lambda * self._seed_support_false_tail_loss(
             seed_logit,
@@ -6796,7 +6804,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactSeparatorGapV277HeadLoss(nn.Mo
     """
 
     OUTPUT_CHANNELS = 2
-    INSTANCE_ID_MAX = 150
+    INSTANCE_ID_MAX = MAX_INSTANCE_ID
 
     def __init__(
         self,
@@ -7523,7 +7531,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactABBCSDFV289HeadLoss(
         valid_np = np.zeros(inst_np.shape, dtype=bool)
         for b in range(int(inst_np.shape[0])):
             inst_b = inst_np[b]
-            support_b = (inst_b > 0) & (inst_b <= 150)
+            support_b = (inst_b > 0) & (inst_b <= MAX_INSTANCE_ID)
             valid_np[b] = support_b
             if not support_b.any():
                 continue
@@ -7969,10 +7977,10 @@ class BoundaryFragmentV3Core025StrongPeakCenterFlowHeadLoss(
             dtype=torch.float32,
             device=device,
         )
-        support_mask = (instance > 0) & (instance <= 150)
+        support_mask = (instance > 0) & (instance <= MAX_INSTANCE_ID)
         for batch_idx in range(int(instance.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 coords = torch.nonzero(frag, as_tuple=False)
@@ -8014,7 +8022,7 @@ class BoundaryFragmentV3Core025StrongPeakCenterFlowHeadLoss(
         floor = self._probability_to_logit(self.center_floor_probability)
         for batch_idx in range(int(center_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 center = frag & (seed_center[batch_idx] > 0.5)
@@ -8092,7 +8100,7 @@ class BoundaryFragmentV3Core025StrongPeakCenterFlowHeadLoss(
                 f"instance={instance.device} seed_center={seed_center.device}"
             )
 
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         exterior_target = (labels == 1).float()
         fracture_target = (labels == 2).float()
         center_target = (seed_center > 0.5).float()
@@ -8315,7 +8323,7 @@ class BoundaryFragmentV3Core025StrongPeakCenterPeakFlowHeadLoss(
         losses: list[torch.Tensor] = []
         for batch_idx in range(int(center_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 exact = frag & (seed_center[batch_idx] > 0.5)
@@ -8394,7 +8402,7 @@ class BoundaryFragmentV3Core025StrongPeakCenterPeakFlowHeadLoss(
                 f"instance={instance.device} seed_center={seed_center.device}"
             )
 
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         exterior_target = (labels == 1).float()
         fracture_target = (labels == 2).float()
         offset_target, offset_mask = self._center_offset_targets(
@@ -8681,7 +8689,7 @@ class BoundaryFragmentV3Core025StrongPeakCenterPeakFlowCalibratedHeadLoss(
                 f"V263 target shape mismatch: labels={tuple(labels.shape)} "
                 f"instance={tuple(instance.shape)} logits={tuple(pred_logits.shape)}"
             )
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         support_pos = support_target > 0.5
         support_neg = ~support_pos
         fracture_target = labels == 2
@@ -8847,7 +8855,7 @@ class BoundaryFragmentV3Core025StrongPeakDenseCenterHeatmapFlowCalibratedHeadLos
         sigma2 = float(self.center_heatmap_sigma_vox) ** 2
         for batch_idx in range(int(instance.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 coords = torch.nonzero(frag, as_tuple=False)
@@ -8925,7 +8933,7 @@ class BoundaryFragmentV3Core025StrongPeakDenseCenterHeatmapFlowCalibratedHeadLos
         losses: list[torch.Tensor] = []
         for batch_idx in range(int(center_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 if not frag.any():
@@ -8970,7 +8978,7 @@ class BoundaryFragmentV3Core025StrongPeakDenseCenterHeatmapFlowCalibratedHeadLos
         losses: list[torch.Tensor] = []
         for batch_idx in range(int(center_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 pos = frag & (center_heatmap[batch_idx] >= float(self.center_heatmap_positive_threshold))
@@ -9033,7 +9041,7 @@ class BoundaryFragmentV3Core025StrongPeakDenseCenterHeatmapFlowCalibratedHeadLos
                 f"logits={tuple(pred_logits.shape)}"
             )
 
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         exterior_target = (labels == 1).float()
         fracture_target = labels == 2
         fracture_neg = (support_target > 0.5) & ~fracture_target
@@ -9246,7 +9254,7 @@ class BoundaryFragmentV3Core025StrongPeakTopologyConstrainedCenterHeatmapFlowCal
         losses: list[torch.Tensor] = []
         for batch_idx in range(int(center_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 exact = frag & (seed_center[batch_idx] > 0.5)
@@ -9271,7 +9279,7 @@ class BoundaryFragmentV3Core025StrongPeakTopologyConstrainedCenterHeatmapFlowCal
         losses: list[torch.Tensor] = []
         for batch_idx in range(int(center_logit.shape[0])):
             ids = torch.unique(instance[batch_idx])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids.tolist():
                 frag = instance[batch_idx] == int(frag_id)
                 pos = frag & (center_heatmap[batch_idx] >= float(self.center_heatmap_positive_threshold))
@@ -9387,7 +9395,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactCenterHeatmapFlowHeadLoss(
                 f"logits={pred_logits.device} instance={instance.device} seed_center={seed_center.device}"
             )
 
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         center_heatmap = self._dense_center_heatmap_target(instance, seed_center)
         offset_target, offset_mask = self._center_offset_targets(
             instance,
@@ -9544,7 +9552,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactSpatialEmbeddingHeadLoss(
             )
         bsz, depth, height, width = (int(v) for v in instance.shape)
         target = torch.zeros((bsz, 3, depth, height, width), dtype=dtype, device=device)
-        support = (instance > 0) & (instance <= 150)
+        support = (instance > 0) & (instance <= MAX_INSTANCE_ID)
         denom = torch.tensor(
             [max(depth - 1, 1), max(height - 1, 1), max(width - 1, 1)],
             dtype=torch.float32,
@@ -9554,7 +9562,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactSpatialEmbeddingHeadLoss(
             ids = torch.unique(instance[b][support[b]])
             for raw_id in ids:
                 frag_id = int(raw_id.detach().cpu())
-                if frag_id <= 0 or frag_id > 150:
+                if frag_id <= 0 or frag_id > MAX_INSTANCE_ID:
                     continue
                 frag = instance[b] == frag_id
                 seed = (seed_center[b] > 0.5) & frag
@@ -9622,8 +9630,8 @@ class BoundaryFragmentV3Core025StrongPeakNoContactSpatialEmbeddingHeadLoss(
                 f"logits={pred_logits.device} instance={instance.device} seed_center={seed_center.device}"
             )
 
-        support_target = ((instance > 0) & (instance <= 150)).float()
-        support_mask = (instance > 0) & (instance <= 150)
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
+        support_mask = (instance > 0) & (instance <= MAX_INSTANCE_ID)
         if isinstance(target, dict) and "spatial_embedding" in target:
             embedding_target = target["spatial_embedding"].to(device=pred_logits.device, dtype=pred_logits.dtype)
             if embedding_target.ndim == 6 and int(embedding_target.shape[1]) == 1:
@@ -9805,12 +9813,12 @@ class BoundaryFragmentV3Core025StrongPeakNoContactSpatialEmbeddingContrastiveHea
         pull_terms: list[torch.Tensor] = []
         push_terms: list[torch.Tensor] = []
         for batch_idx in range(bsz):
-            ids = torch.unique(instance[batch_idx][(instance[batch_idx] > 0) & (instance[batch_idx] <= 150)])
+            ids = torch.unique(instance[batch_idx][(instance[batch_idx] > 0) & (instance[batch_idx] <= MAX_INSTANCE_ID)])
             fragment_means: list[torch.Tensor] = []
             target_centers: list[torch.Tensor] = []
             for raw_id in ids:
                 fragment_id = int(raw_id.detach().cpu())
-                if fragment_id <= 0 or fragment_id > 150:
+                if fragment_id <= 0 or fragment_id > MAX_INSTANCE_ID:
                     continue
                 mask = instance[batch_idx] == fragment_id
                 if not bool(mask.any()):
@@ -10026,11 +10034,11 @@ class BoundaryFragmentV3Core025StrongPeakNoContactFreeEmbeddingV282HeadLoss(
         distance_terms: list[torch.Tensor] = []
         regularization_terms: list[torch.Tensor] = []
         for batch_idx in range(int(instance.shape[0])):
-            ids = torch.unique(instance[batch_idx][(instance[batch_idx] > 0) & (instance[batch_idx] <= 150)])
+            ids = torch.unique(instance[batch_idx][(instance[batch_idx] > 0) & (instance[batch_idx] <= MAX_INSTANCE_ID)])
             means: list[torch.Tensor] = []
             for raw_id in ids:
                 fragment_id = int(raw_id.detach().cpu())
-                if fragment_id <= 0 or fragment_id > 150:
+                if fragment_id <= 0 or fragment_id > MAX_INSTANCE_ID:
                     continue
                 mask = instance[batch_idx] == fragment_id
                 if not bool(mask.any()):
@@ -10072,7 +10080,7 @@ class BoundaryFragmentV3Core025StrongPeakNoContactFreeEmbeddingV282HeadLoss(
         expected_voxel = tuple(int(v) for v in pred_logits.shape[0:1] + pred_logits.shape[2:])
         if tuple(instance.shape) != expected_voxel:
             raise ValueError(f"V282 instance shape mismatch: instance={tuple(instance.shape)} logits={tuple(pred_logits.shape)}")
-        support_target = ((instance > 0) & (instance <= 150)).float()
+        support_target = ((instance > 0) & (instance <= MAX_INSTANCE_ID)).float()
         support_positive = support_target > 0.5
         support_negative = ~support_positive
         support_logit = pred_logits[:, 0].float()
@@ -10311,7 +10319,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateCore025MidPeakCoverageCompa
             prob = core_prob[batch_idx].float()
             for frag_id in torch.unique(inst):
                 fid = int(frag_id.detach().cpu())
-                if fid <= 0 or fid > 150:
+                if fid <= 0 or fid > MAX_INSTANCE_ID:
                     continue
                 core_mask = (inst == fid) & (lbl == 4)
                 if not core_mask.any():
@@ -10477,7 +10485,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateCore025MidPeakSupportSeedCo
             prob = core_prob[batch_idx].float()
             for frag_id in torch.unique(inst):
                 fid = int(frag_id.detach().cpu())
-                if fid <= 0 or fid > 150:
+                if fid <= 0 or fid > MAX_INSTANCE_ID:
                     continue
                 support_mask = (inst == fid) & ((lbl == 2) | (lbl == 3) | (lbl == 4))
                 if not support_mask.any():
@@ -10662,7 +10670,7 @@ class BoundaryFragmentV3CoreRecallRidgeDenseCandidateSeedHeadLoss(nn.Module):
             inst = instance[batch_idx]
             for frag_id in torch.unique(inst):
                 fid = int(frag_id.detach().cpu())
-                if fid <= 0 or fid > 150:
+                if fid <= 0 or fid > MAX_INSTANCE_ID:
                     continue
                 frag_mask = inst == fid
                 if not (seed_target[batch_idx][frag_mask] > 0.5).any():
@@ -15210,8 +15218,8 @@ class BICMV38EdgeAffinityLoss(nn.Module):
             b_sl[axis + 1] = slice(1, None)
             a = inst[tuple(a_sl)]
             b = inst[tuple(b_sl)]
-            a_fg = (a > 0) & (a <= 150)
-            b_fg = (b > 0) & (b <= 150)
+            a_fg = (a > 0) & (a <= MAX_INSTANCE_ID)
+            b_fg = (b > 0) & (b <= MAX_INSTANCE_ID)
             same_anatomy = a_fg & b_fg & (((a - 1) // 50) == ((b - 1) // 50))
             same_axis = same_fragment_edge[:, axis]
             touch_axis = support_touch[:, axis]
@@ -15724,7 +15732,7 @@ class BICMV73InstanceTopologyLoss(BICMV70TopologyConsistencyLoss):
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 mask = instance[b] == frag_id
                 vals = core_prob[b][mask]
@@ -15754,7 +15762,7 @@ class BICMV73InstanceTopologyLoss(BICMV70TopologyConsistencyLoss):
         if instance.dim() == 5 and instance.shape[1] == 1:
             instance = instance[:, 0]
         instance = instance.long()
-        neg = (instance > 0) & (instance <= 150) & (contact <= 0.5)
+        neg = (instance > 0) & (instance <= MAX_INSTANCE_ID) & (contact <= 0.5)
         vals = contact_logit[neg]
         if vals.numel() == 0:
             return contact_logit.new_zeros(())
@@ -15842,7 +15850,7 @@ class BICMV74AdaptiveInstanceTopologyLoss(BICMV70TopologyConsistencyLoss):
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 target_mask = (instance[b] == frag_id) & core[b]
                 vals = core_prob[b][target_mask]
@@ -15866,7 +15874,7 @@ class BICMV74AdaptiveInstanceTopologyLoss(BICMV70TopologyConsistencyLoss):
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 support_mask = instance[b] == frag_id
                 target_mask = support_mask & core[b]
@@ -15900,7 +15908,7 @@ class BICMV74AdaptiveInstanceTopologyLoss(BICMV70TopologyConsistencyLoss):
         contact = contact > 0.5
         contact_prob = torch.sigmoid(contact_logit).clamp(self.eps, 1.0 - self.eps)
         pos = contact
-        neg = (instance > 0) & (instance <= 150) & ~contact
+        neg = (instance > 0) & (instance <= MAX_INSTANCE_ID) & ~contact
 
         pos_loss = contact_logit.new_zeros(())
         if pos.any():
@@ -16115,7 +16123,7 @@ class BICMV75EdgePrecisionSeedTopologyLoss(BICMV73InstanceTopologyLoss):
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 support_mask = instance[b] == frag_id
                 target_mask = support_mask & core[b]
@@ -16136,7 +16144,7 @@ class BICMV75EdgePrecisionSeedTopologyLoss(BICMV73InstanceTopologyLoss):
     ) -> torch.Tensor:
         instance = self._instance_labels(instance)
         core = core > 0.5
-        neg = (instance > 0) & (instance <= 150) & ~core
+        neg = (instance > 0) & (instance <= MAX_INSTANCE_ID) & ~core
         return self._topk_logits_softplus(core_logit, neg, self.fragment_core_false_fraction)
 
     def _edge_primary_loss(
@@ -16550,7 +16558,7 @@ class BICMV78CoreAnchoredEdgeCurriculumLoss(BICMV77EdgeRecallPrecisionCurriculum
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 target_mask = (instance[b] == frag_id) & core[b]
                 vals = core_prob[b][target_mask]
@@ -16584,7 +16592,7 @@ class BICMV78CoreAnchoredEdgeCurriculumLoss(BICMV77EdgeRecallPrecisionCurriculum
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 support_mask = instance[b] == frag_id
                 target_mask = support_mask & core[b]
@@ -16607,7 +16615,7 @@ class BICMV78CoreAnchoredEdgeCurriculumLoss(BICMV77EdgeRecallPrecisionCurriculum
         core: torch.Tensor,
     ) -> torch.Tensor:
         instance = self._instance_labels(instance)
-        neg = (instance > 0) & (instance <= 150) & (core <= 0.5)
+        neg = (instance > 0) & (instance <= MAX_INSTANCE_ID) & (core <= 0.5)
         vals = core_logit[neg]
         if vals.numel() == 0:
             return core_logit.new_zeros(())
@@ -16794,7 +16802,7 @@ class BICMV79DuplicateSeedSuppressedEdgeLoss(BICMV77EdgeRecallPrecisionCurriculu
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 target_mask = (instance[b] == frag_id) & core[b]
                 vals = core_prob[b][target_mask]
@@ -16839,7 +16847,7 @@ class BICMV79DuplicateSeedSuppressedEdgeLoss(BICMV77EdgeRecallPrecisionCurriculu
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core_mask[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 support_mask = instance[b] == frag_id
                 target_mask = support_mask & core_mask[b]
@@ -17041,7 +17049,7 @@ class BICMV80TopologyStateAdaptiveLoss(BICMV77EdgeRecallPrecisionCurriculumLoss)
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 vals = core_prob[b][(instance[b] == frag_id) & core[b]]
                 if vals.numel() == 0:
@@ -17092,7 +17100,7 @@ class BICMV80TopologyStateAdaptiveLoss(BICMV77EdgeRecallPrecisionCurriculumLoss)
         count = 0
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core_mask[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 support_mask = instance[b] == frag_id
                 target_vals = core_prob[b][support_mask & core_mask[b]]
@@ -17374,7 +17382,7 @@ class BICMV84DualHeadContactCalibrationLoss(BICMV81CoreStableEdgePrecisionLoss):
         losses: list[torch.Tensor] = []
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core_mask[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             peaks: list[torch.Tensor] = []
             for frag_id in ids:
                 vals = core_prob[b][(instance[b] == frag_id) & core_mask[b]]
@@ -18178,7 +18186,7 @@ class BICMV91TopologyAwareEdgeBalanceLoss(BICMV89BandFalseOnlyEdgePrecisionLoss)
         losses: list[torch.Tensor] = []
         for b in range(int(core_prob.shape[0])):
             ids = torch.unique(instance[b][core_mask[b]])
-            ids = ids[(ids > 0) & (ids <= 150)]
+            ids = ids[(ids > 0) & (ids <= MAX_INSTANCE_ID)]
             for frag_id in ids:
                 target = (instance[b] == frag_id) & core_mask[b]
                 extra = (instance[b] == frag_id) & ~core_mask[b]
@@ -26595,7 +26603,7 @@ class LegacyTopologyLoss3D(nn.Module):
         for b in range(emb.shape[0]):
             ids = instance[b].long()
             fg_ids = torch.unique(ids[support[b] > 0.5])
-            fg_ids = fg_ids[(fg_ids > 0) & (fg_ids <= 150)]
+            fg_ids = fg_ids[(fg_ids > 0) & (fg_ids <= MAX_INSTANCE_ID)]
             if fg_ids.numel() == 0:
                 continue
             means = []
@@ -27137,8 +27145,8 @@ class LegacyTopologyExclusiveLoss3D(nn.Module):
             b_sl[axis + 1] = slice(1, None)
             a = inst[tuple(a_sl)]
             b = inst[tuple(b_sl)]
-            a_fg = (a > 0) & (a <= 150)
-            b_fg = (b > 0) & (b <= 150)
+            a_fg = (a > 0) & (a <= MAX_INSTANCE_ID)
+            b_fg = (b > 0) & (b <= MAX_INSTANCE_ID)
             same_anatomy = a_fg & b_fg & (((a - 1) // 50) == ((b - 1) // 50))
             near_axis = near_neg[:, axis]
             touch_axis = support_touch[:, axis]
@@ -27198,7 +27206,7 @@ class LegacyTopologyExclusiveLoss3D(nn.Module):
         for b in range(emb.shape[0]):
             ids = instance[b].long()
             fg_ids = torch.unique(ids[support[b] > 0.5])
-            fg_ids = fg_ids[(fg_ids > 0) & (fg_ids <= 150)]
+            fg_ids = fg_ids[(fg_ids > 0) & (fg_ids <= MAX_INSTANCE_ID)]
             if fg_ids.numel() == 0:
                 continue
             means = []

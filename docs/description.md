@@ -1,141 +1,116 @@
-% PENGWIN 2026 Task 1 — V0.3.4 Pipeline-Test Submission
+% PENGWIN 2026 Task 1 — V1 STU-Net Two-Stage Submission
 % Algorithm Description
-% 2026-05-31
+% 2026-06-06
 
 # 0. Submission intent
 
-This is a **V0.3.4 pipeline-test** submission for the PENGWIN 2026 Task 1
-preliminary phase. The objective is to validate the end-to-end Grand
-Challenge contract (Docker container build, model tarball, `/input` MHA
-read, `/output` MHA write under `--network none`) with the current
-best in-house two-stage pipeline. It is **not** a competitive
-scientific submission and should not be interpreted as our final
-leaderboard entry. The femur anatomy (label range 151–200) is
-**intentionally not modeled** in V0.3.4 — femur fragments are emitted
-as background (0). Femur modeling is the V0.5 milestone (in progress).
+This is the **V1** submission for PENGWIN 2026 Task 1: per-fragment instance
+segmentation of pelvic bone fractures (sacrum, left/right hip, femur) in CT.
+It supersedes the V0.3.x pipeline-test (a ResEnc, pelvic-only, femur-stub
+container). V1 ships a **STU-Net two-stage anatomy-conditioned pipeline with
+femur fully modeled**, trained on a leakage-free, case-grouped split.
 
 # 1. Method overview
 
-V0.3.4 is a **two-stage anatomy-conditioned pipeline** wrapped in a
-**4-layer robust pipeline** for Grand Challenge out-of-distribution
-defense.
+A two-stage, anatomy-conditioned cascade wrapped in a 4-layer robustness shell
+for Grand Challenge out-of-distribution defense.
 
-- **Stage 1** is a whole-CT anatomy classifier (nnU-Net v2 ResEnc-L on
-  `Dataset532_PelvicAnatomyV2`) that produces a 4-class softmax over
-  background / Sacrum / LeftHipbone / RightHipbone.
-- **Stage 2** is a per-anatomy V291 BICM nnU-Net (boundary-weighted
-  trainer) on `Dataset537_PelvicBICMFragmentV5` that takes a
-  **3-channel ROI** — bone-LUT CT, Stage 1 anatomy probability, and a
-  signed distance map clipped to ±40 mm — and produces a 5-class V5
-  BICM softmax (background / exterior_context / interior_shell / core /
-  contact_surface).
-- **Decoder** is the V288-style core-seed watershed: it lifts the V5
-  softmax to per-instance fragment IDs using the core class as seeds
-  and a 12× ridge cost on the contact class. Followed by a ~1 cm³
-  connected-component prune and a ≤27-voxel small-fragment merge.
-- **V0.3.4 4-layer robust pipeline**:
-  - L1) bone-skeleton anatomy decomposition (HU > 200 + 3D CC) —
-    distribution-independent fallback
-  - L2) Ds532 argmax masks — mutually-exclusive anatomy assignment
-  - L3) post-pad bbox sanity (≤ 50% of volume) — rejects out-of-distribution masks
-  - L4) 480-second time budget — guarantees the 10-minute GC limit
+- **Stage 1 — anatomy** (`Dataset539_PelvicFemurAnatomyV3`): a whole-CT 5-class
+  semantic model (`0=bg, 1=sacrum, 2=leftHip, 3=rightHip, 4=femur`).
+- **Per-anatomy ROI**: for each present bone, take the bbox of the Stage-1
+  probability `>= 0.5` (padded), and build a **3-channel ROI** — bone-LUT CT,
+  Stage-1 anatomy probability, and a signed distance map clipped to +/-40 mm.
+- **Stage 2 — fracture** (`Dataset538_PelvicFemurBICMFragmentV5`): a per-anatomy
+  ABBC model that emits a 4-class field (`background / border / boundary / core`).
+- **Decoder**: core-seed watershed — connected components of the core class are
+  watershed seeds; support is flooded from them; a >=1 cm^3 component prune and a
+  small-fragment merge follow.
+- **Assembly**: per-bone fragment IDs are offset into the official PENGWIN ranges
+  (sacrum 1-50, leftHip 51-100, rightHip 101-150, **femur 151-200**) and the
+  volume is reoriented to the input frame.
 
-# 2. Stage 1 — Ds532 anatomy classifier
+**Backbone.** Both stages use **STU-Net-B** (58 M params, Apache-2.0) warm-started
+from a TotalSegmentator bone pretrain — a license-clean transfer that initializes
+the encoder for pelvic/femoral bone. (This replaces the former ResEnc-L.)
 
-- **Architecture**: nnU-Net v2 ResEnc-L (`nnUNetResEncUNetLPlans`,
-  `3d_fullres`), 1-channel input, 4-class softmax.
-- **Training data**: `Dataset532_PelvicAnatomyV2` (170 pelvic-only
-  cases). Validation Dice 0.9684.
-- **Input normalization**: LPS canonicalize + bone HU window
-  [−1000, 2000] clip + bone-LUT normalize.
-- **Output**: full-CT 4-class softmax over
-  background / Sacrum / LeftHipbone / RightHipbone.
+# 2. Stage 1 — Ds539 anatomy
 
-# 3. Per-anatomy ROI extraction
+- STU-Net-B, `nnUNetResEncUNetLPlans` / `3d_fullres`, 1-channel CT input,
+  5-class softmax. Trainer `PengwinTrainerSTUNetBaseAnatomyV301`.
+- Input: LPS canonicalize + bone HU window + bone-LUT normalize.
+- Output: full-CT 5-class anatomy probability, resampled back to the CT grid.
 
-For each of {Sacrum, LeftHipbone, RightHipbone}:
+# 3. Pelvic-vs-femur routing
 
-1. Compute the bounding box of the Stage 1 `prob ≥ 0.5` mask, padded
-   by 24 voxels on each axis.
-2. Apply Layer 3 (bbox sanity): if `post_pad_bbox / volume > 0.5`,
-   fall back to the bone-skeleton mask from Layer 1.
-3. Build a 3-channel ROI:
-   - bone-LUT normalized CT crop
-   - Stage 1 anatomy probability crop
-   - signed distance to the `prob ≥ 0.5` surface, clipped to ±40 mm
+Pelvic cases (sacrum + both hips) and femur cases are disjoint patients. The case
+is routed **after** Stage-1 inference, by the femur-vs-pelvic argmax volume ratio
+of the Ds539 prediction (env-tunable threshold ~ 0.45). This replaces the
+spacing-only heuristic of V0.3.x (~50 % accurate, which would mis-route most
+femur cases now that femur is modeled).
 
-# 4. Stage 2 — V291 BICM nnU-Net
+# 4. Stage 2 — Ds538 ABBC fracture
 
-- **Architecture**: nnU-Net v2 ResEnc-L, 3-channel input, 5-class
-  softmax (V5 BICM: bg/exterior/shell/core/contact).
-- **Trainer**:
-  `PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV291`
-  — V288 ABBC base with 5× weight on the boundary class CE+Dice
-  terms.
-- **Training data**: `Dataset537_PelvicBICMFragmentV5` (12 of 174
-  cases, single fold, fold0). Phase 6 fulltrain (all 170 pelvic
-  cases) reached EMA 0.64 at epoch 71 before being stopped for the
-  V0.x restructure.
-- **Sidecars**: V5 instance + BFv3 target (V291 dataloader contract).
+- STU-Net-B, 3-channel input, 4-class ABBC head. Trainer
+  `...DenseCandidateCore025StrongPeakNoContactABBCSTUNetBV301` (a V300
+  boundary-attention refinement on the STU-Net backbone). Aligned with the
+  PENGWIN 2024 1st-place (MIC-DKFZ) ABBC formulation: explicit contact-voxel
+  classification is dropped in favour of a core-seed -> boundary watershed.
+- Training: unified **case-grouped** 5-fold split (seed 12345) shared with Stage 1,
+  so a held-out fold is held out across *both* stages (no patient leakage; the
+  held-out anatomy context is out-of-fold). Early-stopping on the boundary
+  fragment proxy.
 
-# 5. V288 core-seed watershed decoder
+# 5. Core-seed watershed decoder
 
-- Use V5 class-3 (core) as seeds for `scipy.ndimage.label`.
-- Use V5 class-4 (contact_surface) as a 12× ridge cost.
-- Run `skimage.segmentation.watershed` with `mask = support`
-  (`support = {2, 3, 4}`).
-- Per-fragment connected-component prune at ~1 cm³.
-- Small-fragment merge at ≤ 27 voxels (V0.3.4).
+Core class -> `scipy.ndimage.label` seeds; watershed flood over the support mask;
+>=1 cm^3 connected-component prune; small-fragment merge.
 
-# 6. Label assembly
+# 6. 4-layer robustness
 
-Per-anatomy fragment IDs are offset into the official PENGWIN label
-ranges and pasted into the full label volume:
+L1) bone-skeleton anatomy decomposition (HU>200 + 3D CC) — distribution-independent
+fallback. L2) Ds539 argmax masks — mutually-exclusive anatomy assignment.
+L3) post-pad bbox sanity (<= 50 % of volume) — rejects OOD masks. L4) 480 s time
+budget — guarantees the 10-minute GC limit. Largest-CC-keep per anatomy.
 
-```
-Sacrum   fragment k → label k          (1–50)
-LeftHip  fragment k → label k + 50     (51–100)
-RightHip fragment k → label k + 100    (101–150)
-Femur    fragment k → label k + 150    (151–200)  ← V0.x pending, V0.3.4 emits 0
-```
+# 7. Performance (held-out, dev proxy)
 
-The volume is reoriented from LPS back to the original input frame
-before writing the `.mha` output.
+Held-out grouped fold-0 val (n=132 per-anatomy ROIs), scored with our
+PENGWIN-2026 **official-aligned v2 proxy** (per-anatomy argmax IoU>=0.10;
+Fracture Dice / Instance-F1 / HD95 / ASSD):
 
-# 7. V0.3.x progression
+| metric | overall | Femur | RightHip | LeftHip | Sacrum |
+|---|---|---|---|---|---|
+| Fracture Dice | **0.799** | 0.845 | 0.854 | 0.759 | 0.732 |
+| Instance F1 | **0.919** | 0.953 | 0.950 | 0.876 | 0.892 |
+| HD95 (mm) | **18.9** | 7.4 | 25.7 | 25.7 | 18.3 |
 
-| Tag | Change | Held-out Frac Dice | Inst F1 |
-|---|---|---|---|
-| v0.2 | Two-stage anatomy-conditioned pipeline | 0.612 | 0.683 |
-| v0.3.1 | GC timeout fix (deterministic single-pass) | 0.621 | 0.805 |
-| v0.3.2 | False-femur suppression (internal) | 0.628 | 0.812 |
-| v0.3.3 | Mask cleanup + TTA z-flip + median merge | 0.634 | 0.819 |
-| **v0.3.4** | **Bone-skeleton-aware routing + ≤27-vox merge** | **0.641** | **0.826** |
+The decoder applies an **anatomy-specific** over-segmentation control: the sacrum
+(a single dominant bone whose predicted core can speckle into spurious islands)
+uses an aggressive size-ratio + min-component merge, while the multi-fragment
+hips/femur keep the defaults — lifting Sacrum Instance-F1 from 0.585 to 0.892 and
+overall F1 from 0.844 to 0.919 with no change to the other bones.
 
-Cumulative delta v0.2 → v0.3.4: Fracture Dice +0.029, Instance F1
-+0.143, HD95 −8.6 mm.
-
-All v0.3.x tags share the same V291 fold0 checkpoint — only
-post-processing / routing changes.
+The official Grand-Challenge evaluator is unpublished; this is an aligned proxy.
+End-to-end per-case runtime measured 45-205 s (RTX 3090), well within the
+T4 / 10-minute budget.
 
 # 8. Hardware + runtime
 
-- Inference GPU: NVIDIA T4 16 GiB (Grand Challenge default).
-- Per-case runtime: typically 3–6 min, capped at 480 s (8 min).
-- Container image: `pengwin/pytorch:2.0.1-cuda11.8-cudnn8-runtime` +
-  nnUNetv2 2.5.1 + SimpleITK 2.3.1.
+NVIDIA T4 16 GiB; STU-Net-B inference ~4 GiB/stage; per-case 45-205 s, capped
+at 480 s. Container: PyTorch 2.1.2 + CUDA 11.8 + nnUNetv2 2.5.1.
 
 # 9. Limitations
 
-- **Femur not modeled (V0.3.4).** Femur-only cases (50% of the
-  cohort) score zero on those instances. V0.5 adds femur via Dataset532
-  5-class re-training + 4-anatomy V291 retraining.
-- **Sub-fulltrain probe.** Only 12 of 174 training cases used for the
-  V291 fold0 checkpoint shipped in v0.3.4.
-- **Single fold, single seed.** No ensembling.
+- **Dev measurement only** — the official test set is unreleased; numbers are a
+  held-out dev proxy (Stage-1 anatomy context is in-fold for training cases), not
+  a leaderboard result.
+- Sacrum recall trades down slightly (0.835) from the anatomy-specific merge;
+  genuinely multi-fragment sacra are the harder remaining case.
+- Single fold, single seed; no ensembling.
 
 # 10. References
 
-- nnU-Net v2: Isensee, F. et al. *Nat Methods* 18, 203–211 (2021).
-- PENGWIN 2026 Task 1 baseline: <https://github.com/YzzLiu/PENGWIN2026_Task1_AutoSeg_Baseline>
-- PENGWIN 2024 1st place (ABBC reference): MIC-DKFZ, IoU-F 0.9296.
+- nnU-Net v2: Isensee, F. et al. *Nat Methods* 18, 203-211 (2021).
+- STU-Net (TotalSegmentator bone pretrain).
+- PENGWIN 2026 Task 1 baseline: github.com/YzzLiu/PENGWIN2026_Task1_AutoSeg_Baseline
+- PENGWIN 2024 1st place (ABBC reference): MIC-DKFZ.

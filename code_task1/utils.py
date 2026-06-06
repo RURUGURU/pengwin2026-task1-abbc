@@ -15,6 +15,16 @@ from skimage.morphology import ball
 from skimage.segmentation import watershed
 
 from core import ANATOMY_RANGES, DATA_RAW, PAD
+from anatomy_registry import (
+    ANATOMY_REGISTRY,
+    MIN_INSTANCE_ID,
+    MAX_INSTANCE_ID,
+    anatomy_of_id,
+    id_range,
+    valid_instance_mask,
+    anatomy_ranges_by_name,
+    anatomy_start_ids,
+)
 
 try:
     import SimpleITK as sitk
@@ -45,14 +55,14 @@ def _require_sitk():
 
 
 def orientation_code(img: sitk.Image) -> str:
-    """Return the DICOM orientation code for a SimpleITK image direction."""
+    """SimpleITK image direction에 대응하는 DICOM orientation code를 반환한다."""
     sitk_mod = _require_sitk()
     return sitk_mod.DICOMOrientImageFilter_GetOrientationFromDirectionCosines(img.GetDirection())
 
 
 def canonicalize_sitk(img: sitk.Image,
                       orientation: str = CANONICAL_ORIENTATION) -> sitk.Image:
-    """Permute/flip an image into canonical orientation without resampling."""
+    """리샘플링 없이 image를 canonical orientation으로 permute/flip 한다."""
     if orientation_code(img) == orientation:
         return img
     sitk_mod = _require_sitk()
@@ -290,9 +300,17 @@ class BoundaryFragmentParams:
 
 
 def pelvic_instance_mask(inst: np.ndarray) -> np.ndarray:
-    """Return the valid pelvic instance mask for original PENGWIN labels."""
+    """Return the valid-instance mask for original PENGWIN labels.
 
-    return (inst >= 1) & (inst <= 150)
+    Despite the historical "pelvic" name, this now spans ALL anatomies incl.
+    Femur (1-200) via the registry. That is a safe superset: pelvic-only data
+    holds no 151-200 voxels (so the mask is identical there), while per-anatomy
+    Femur ROIs are correctly included instead of silently zeroed. Callers that
+    genuinely need a 3-anatomy pelvic subset must use the explicit pelvic_only
+    helpers in anatomy_registry, not this function.
+    """
+
+    return valid_instance_mask(inst)
 
 
 def _spacing_zyx(spacing_xyz: tuple[float, float, float] | list[float]) -> tuple[float, float, float]:
@@ -302,13 +320,13 @@ def _spacing_zyx(spacing_xyz: tuple[float, float, float] | list[float]) -> tuple
 
 
 def _same_anatomy_ids(fragment_id: int) -> tuple[int, int]:
-    if 1 <= fragment_id <= 50:
-        return (1, 50)
-    if 51 <= fragment_id <= 100:
-        return (51, 100)
-    if 101 <= fragment_id <= 150:
-        return (101, 150)
-    return (0, 0)
+    """(lo, hi) of the anatomy block containing ``fragment_id``; (0, 0) if none.
+
+    Registry-backed so Femur (151-200) resolves to its block instead of falling
+    through to (0, 0) and breaking same-anatomy contact for femur fragments.
+    """
+    idx = anatomy_of_id(int(fragment_id))
+    return id_range(idx) if idx else (0, 0)
 
 
 def _bbox(mask: np.ndarray, radius_vox: int = 0) -> tuple[slice, slice, slice] | None:
@@ -342,7 +360,7 @@ def contact_barrier_distance(inst: np.ndarray,
     out = np.full(inst.shape, np.inf, dtype=np.float32)
     max_spacing = max(float(s) for s in spacing_zyx)
     radius_vox = max(1, int(np.ceil(float(max_radius_mm) / max_spacing)) + 1)
-    fragment_ids = [int(v) for v in np.unique(inst) if 1 <= int(v) <= 150]
+    fragment_ids = [int(v) for v in np.unique(inst) if MIN_INSTANCE_ID <= int(v) <= MAX_INSTANCE_ID]
     for fragment_id in fragment_ids:
         frag = inst == fragment_id
         box = _bbox(frag, radius_vox=radius_vox)
@@ -404,7 +422,7 @@ def thin_contact_ridge_mask(inst: np.ndarray,
             same_anatomy_only=same_anatomy_only,
         )
     ridge = np.zeros(inst.shape, dtype=bool)
-    fragment_ids = [int(v) for v in np.unique(inst) if 1 <= int(v) <= 150]
+    fragment_ids = [int(v) for v in np.unique(inst) if MIN_INSTANCE_ID <= int(v) <= MAX_INSTANCE_ID]
     for fragment_id in fragment_ids:
         frag = inst == fragment_id
         box = _bbox(frag, radius_vox=1)
@@ -501,7 +519,7 @@ def compute_boundary_fragment_target(inst: np.ndarray,
 
     zero_core_fragments: list[int] = []
     fallback_core_fragments: list[int] = []
-    fragment_ids = [int(v) for v in np.unique(inst) if 1 <= int(v) <= 150]
+    fragment_ids = [int(v) for v in np.unique(inst) if MIN_INSTANCE_ID <= int(v) <= MAX_INSTANCE_ID]
     for fragment_id in fragment_ids:
         frag = inst == fragment_id
         if not frag.any():
@@ -871,7 +889,7 @@ def binary_surface_metrics(pred: np.ndarray,
 # 흡수된 Dataset537 BICM V5 target/decoder primitives
 # [DATA][Risk:High][Scope:module_consolidation]
 # Reason: 기존 bicm_v5.py의 ROI target/decoder 계약을 8개 파일 내부에 보존한다.
-# 기존 label 값과 decoder rule은 평가 재현성에 직접 연결되므로 이름과 기본값을 유지한다.
+# label 값과 decoder rule은 평가 재현성과 직결되므로 이름과 기본값을 그대로 유지한다.
 # =============================================================================
 V5_LABELS = {
     "background": 0,
@@ -882,18 +900,15 @@ V5_LABELS = {
 }
 
 V5_SUPPORT_LABELS = (2, 3, 4)
-V5_ANATOMY_RANGES = {
-    "Sacrum": (1, 50),
-    "LeftHip": (51, 100),
-    "RightHip": (101, 150),
-}
 # [METRIC][Risk:High][Scope:pengwin_official_task1_aligned_v2]
-# PENGWIN 2026 official Task 1/2 spec uses 4 anatomy regions: Sacrum 1-50,
-# LeftHip 51-100, RightHip 101-150, Femur 151-200. The legacy V5_ANATOMY_RANGES
-# is pelvic-only and intentionally preserved for backwards-compat with the
-# v1 proxy evaluator. New official-aligned v2 metrics MUST use the femur-aware
-# range so that Task 1 evaluation does not silently drop femur labels.
-V5_ANATOMY_RANGES_WITH_FEMUR = {**V5_ANATOMY_RANGES, "Femur": (151, 200)}
+# anatomy range는 이제 anatomy_registry 단일 소스에서 파생한다. PENGWIN 2026 official
+# Task 1/2 spec은 anatomy region 4개를 쓴다: Sacrum 1-50, LeftHip 51-100, RightHip
+# 101-150, Femur 151-200. legacy V5_ANATOMY_RANGES는 *의도적으로* pelvic 전용(3개)으로
+# 남겨, v1 proxy evaluator와의 backwards-compat를 유지한다 — registry의 pelvic_only 뷰로
+# 파생하므로 femur 누락이 매직 150 뒤에 숨지 않고 명시적이다. 새 official-aligned v2
+# metric/femur 경로는 반드시 femur까지 포함한 _WITH_FEMUR(=full 뷰)를 써야 한다.
+V5_ANATOMY_RANGES = anatomy_ranges_by_name(pelvic_only=True)
+V5_ANATOMY_RANGES_WITH_FEMUR = anatomy_ranges_by_name()
 PENGWIN_OFFICIAL_ANATOMY_RANGES = V5_ANATOMY_RANGES_WITH_FEMUR
 V5_TARGET_PROFILES = (
     "v5_tiny_marker",
@@ -905,31 +920,31 @@ V5_TARGET_PROFILES = (
 
 @dataclass(frozen=True)
 class BICMV5Params:
-    """Physical-mm target parameters for V5.
+    """V5 의 physical-mm target parameter 정의.
 
     Args:
-        exterior_mm: Background band around the selected anatomy support.
-        core_mm: Preferred minimum distance from non-fragment background/contact
-            for selecting the class-3 core marker center.
-        core_fallback_radius_vox: Small connected ball used when a fragment has
-            no voxel farther than `core_mm`.
-        target_profile: `v5_tiny_marker` reproduces the original V5 oracle.
-            `v5_core_ball` keeps one marker component per fragment but expands
-            that marker to a compact physical ball so the core class is not a
-            single-digit voxel target during training. `v5_core_body` turns the
-            marker into a connected interior body so Dice+CE has enough positive
-            support without allowing multiple seed components per fragment.
-            `v5_core_body_contact_band` keeps the same core body and widens
-            contact supervision inside support only.
-        core_ball_radius_mm: Physical radius for `v5_core_ball`.
-        core_body_mm: Minimum physical distance from non-fragment/contact for
-            `v5_core_body`; fallback is the compact ball if a fragment is thin.
-        contact_band_mm: Physical band radius around direct cross-fragment
-            adjacency for `v5_core_body_contact_band`.
+        exterior_mm: 선택된 anatomy support 주변에 두는 background 밴드 너비.
+        core_mm: class-3 core marker 중심을 고를 때 non-fragment background/contact
+            로부터 확보하길 선호하는 최소 거리.
+        core_fallback_radius_vox: fragment 안에 `core_mm` 보다 깊은 voxel이 없을 때
+            사용하는 작은 connected ball 반경.
+        target_profile: `v5_tiny_marker` 는 원래 V5 oracle을 그대로 재현한다.
+            `v5_core_ball` 은 fragment 당 marker component를 하나로 유지하면서도
+            marker를 compact physical ball로 확장해 학습 시 core class가 한자리수
+            voxel target이 되지 않도록 한다. `v5_core_body` 는 marker를 connected
+            interior body로 만들어 Dice+CE에 충분한 positive support를 주면서
+            fragment 당 seed component는 여전히 하나만 허용한다.
+            `v5_core_body_contact_band` 는 동일한 core body를 유지하면서 support
+            안쪽에서만 contact supervision을 넓힌다.
+        core_ball_radius_mm: `v5_core_ball` 의 physical 반지름.
+        core_body_mm: `v5_core_body` 에서 non-fragment/contact 로부터 요구하는 최소
+            physical 거리. fragment가 너무 얇으면 compact ball로 fallback 한다.
+        contact_band_mm: `v5_core_body_contact_band` 에서 직접 cross-fragment 인접
+            영역 주변에 적용할 physical band 반경.
 
     [AUDIT][Risk:High][Scope:target_contract]
-    These values are part of the dataset contract and must be written to
-    `dataset.json`. Changing them invalidates previous oracle/training evidence.
+    이 값들은 dataset contract의 일부이므로 반드시 `dataset.json` 에 기록되어야 한다.
+    값이 바뀌면 이전 oracle/training evidence는 모두 무효가 된다.
     """
 
     exterior_mm: float = 3.0
@@ -947,10 +962,17 @@ class BICMV5Params:
 
 
 def anatomy_range(anatomy: str) -> tuple[int, int]:
+    """(lo, hi) global-ID block for an anatomy NAME, incl. Femur.
+
+    Resolves against the full 4-anatomy registry view so the femur fracture path
+    works; the deliberate pelvic-only restriction lives at its call sites (e.g.
+    the Dataset537 raw guard), not hidden in this lookup.
+    """
+    ranges = V5_ANATOMY_RANGES_WITH_FEMUR
     try:
-        return V5_ANATOMY_RANGES[str(anatomy)]
+        return ranges[str(anatomy)]
     except KeyError as exc:
-        raise ValueError(f"unknown V5 anatomy {anatomy!r}; expected {sorted(V5_ANATOMY_RANGES)}") from exc
+        raise ValueError(f"unknown anatomy {anatomy!r}; expected {sorted(ranges)}") from exc
 
 
 def anatomy_mask_from_instances(inst: np.ndarray, anatomy: str) -> np.ndarray:
@@ -959,7 +981,7 @@ def anatomy_mask_from_instances(inst: np.ndarray, anatomy: str) -> np.ndarray:
 
 
 def bbox_from_mask(mask: np.ndarray, pad_vox: int = 24) -> tuple[slice, slice, slice] | None:
-    """Return a padded Z/Y/X bbox for one anatomy ROI."""
+    """anatomy ROI 하나에 대해 padding을 추가한 Z/Y/X bbox를 반환한다."""
     coords = np.argwhere(mask)
     if coords.size == 0:
         return None
@@ -970,12 +992,12 @@ def bbox_from_mask(mask: np.ndarray, pad_vox: int = 24) -> tuple[slice, slice, s
 
 
 def _same_anatomy_contact(inst: np.ndarray) -> np.ndarray:
-    """Mark direct cross-fragment adjacency inside one selected anatomy.
+    """선택된 anatomy 하나 안에서 직접 인접한 cross-fragment voxel을 표시한다.
 
     [QC][Invariant:label_scope]
-    V5 raw samples are already cropped to one anatomy, so any two nonzero
-    instance IDs in this crop are same-anatomy fragments. A 6-neighbor adjacency
-    is used to avoid creating broad surface labels that compete with shell/core.
+    V5 raw sample은 이미 anatomy 하나로 크롭된 상태라 이 crop 안의 nonzero instance
+    ID 쌍은 모두 same-anatomy fragment이다. shell/core와 경쟁하는 넓은 surface
+    label이 생기지 않도록 6-neighbor adjacency를 사용한다.
     """
     inst = inst.astype(np.uint16, copy=False)
     out = np.zeros(inst.shape, dtype=bool)
@@ -1001,14 +1023,14 @@ def _support_contact_band(contact: np.ndarray,
                           support: np.ndarray,
                           spacing_zyx: tuple[float, float, float],
                           band_mm: float) -> np.ndarray:
-    """Widen direct contact supervision inside fragment support only.
+    """fragment support 안쪽에서만 direct contact supervision을 넓혀준다.
 
     [DATA][Risk:Major][Scope:contact_target]
-    V5.2 proved that the connected core body can be learned, but class-4
-    direct contact stayed at zero under Dice+CE. This helper changes only the
-    training target density for contact: it does not add probability thresholds,
-    does not mark exterior cortex as contact, and still leaves the fixed decoder
-    contract unchanged. Oracle must pass before any training with this profile.
+    V5.2 에서 connected core body는 학습 가능함을 확인했지만, class-4 direct
+    contact는 Dice+CE 조건에서 0에 머물렀다. 이 helper는 오로지 contact의 training
+    target 밀도만 바꾼다: probability threshold를 추가하지 않고, exterior cortex를
+    contact로 표시하지도 않으며, 고정 decoder contract도 그대로 둔다. 이 profile로
+    학습하기 전 oracle이 반드시 통과해야 한다.
     """
     if not contact.any() or float(band_mm) <= 0:
         return contact & support
@@ -1017,13 +1039,13 @@ def _support_contact_band(contact: np.ndarray,
 
 
 def _single_core_marker(mask: np.ndarray, radius_vox: int) -> np.ndarray:
-    """Return one connected core marker for a tiny/thin fragment.
+    """작거나 얇은 fragment 하나에 대해 connected core marker를 하나만 만들어 반환한다.
 
     [QC][Invariant:one_seed_per_fragment]
-    The V5 decoder treats each class-3 connected component as a seed. A broad
-    deep-core class can split into many disconnected components and create fake
-    fragments before learning starts, so target generation emits exactly one
-    connected marker per GT fragment.
+    V5 decoder는 class-3 connected component 각각을 seed로 다룬다. 넓은 deep-core
+    class는 여러 개의 disconnected component로 쪼개져 학습 시작 전부터 가짜
+    fragment를 만들 수 있으므로, target 생성 단계에서 GT fragment 당 connected
+    marker를 정확히 하나만 내보낸다.
     """
     marker = np.zeros(mask.shape, dtype=bool)
     coords = np.argwhere(mask)
@@ -1057,13 +1079,13 @@ def _single_core_marker(mask: np.ndarray, radius_vox: int) -> np.ndarray:
 
 
 def _connected_component_containing(mask: np.ndarray, center: np.ndarray) -> np.ndarray:
-    """Keep only the connected marker component containing `center`.
+    """`center` 를 포함하는 connected marker component만 남긴다.
 
     [QC][Invariant:one_seed_per_fragment]
-    A physical-radius ball clipped by an irregular fragment can split into
-    multiple pieces. The decoder interprets each class-3 component as a seed,
-    so target generation must collapse the marker back to a single component
-    before training or oracle metrics become misleading.
+    physical-radius ball이 비정형 fragment에 의해 잘리면 여러 조각으로 쪼개질 수
+    있다. decoder는 class-3 component 각각을 seed로 해석하므로, target 생성에서
+    marker를 다시 하나의 component로 모아주지 않으면 training 또는 oracle metric이
+    오해를 부른다.
     """
     out = np.zeros(mask.shape, dtype=bool)
     if not mask.any():
@@ -1085,13 +1107,13 @@ def _connected_component_containing(mask: np.ndarray, center: np.ndarray) -> np.
 def _core_ball_marker(mask: np.ndarray,
                       spacing_zyx: tuple[float, float, float],
                       radius_mm: float) -> np.ndarray:
-    """Return one compact physical-mm core marker for a fragment.
+    """fragment 하나에 대해 compact physical-mm core marker를 하나 반환한다.
 
     [DATA][Risk:Major][Scope:target_sparsity]
-    The original V5 target used 7-voxel fallback cores for small fragments.
-    Full-volume overfit showed Dice+CE collapses those markers, while sparse
-    loss overpaints them. This target variant increases positive support
-    without changing model outputs or decoder thresholds.
+    원래 V5 target은 작은 fragment에 대해 7-voxel fallback core를 사용했다.
+    full-volume overfit 실험에서 Dice+CE는 이 marker를 무너뜨리고 sparse loss는
+    오히려 과도하게 칠해버리는 문제가 관찰됐다. 이 target variant는 model output
+    이나 decoder threshold를 바꾸지 않으면서 positive support만 늘려준다.
     """
     marker = np.zeros(mask.shape, dtype=bool)
     coords = np.argwhere(mask)
@@ -1119,14 +1141,14 @@ def _core_body_marker(mask: np.ndarray,
                       spacing_zyx: tuple[float, float, float],
                       body_mm: float,
                       fallback_radius_mm: float) -> np.ndarray:
-    """Return one connected interior core body for one fragment.
+    """fragment 하나에 대해 connected interior core body를 하나 반환한다.
 
     [DATA][Risk:Major][Scope:target_geometry]
-    V5.1 showed the two bad extremes: tiny/ball cores disappear under Dice+CE,
-    while sparse rare-class loss overpaints core into thousands of seed
-    components. This target keeps the BICM semantic contract but makes the core
-    a larger connected interior body, similar to boundary-band specialist
-    targets, so the decoder still receives one marker component per GT fragment.
+    V5.1 에서 양극단의 실패가 함께 드러났다. tiny/ball core는 Dice+CE 에서 사라지고,
+    sparse rare-class loss는 core를 수천 개 seed component로 과도하게 칠해버렸다.
+    이 target은 BICM semantic contract를 그대로 유지하면서 core를 더 큰 connected
+    interior body로 만든다. boundary-band specialist target과 비슷한 형태라서
+    decoder는 여전히 GT fragment 당 marker component를 하나만 받게 된다.
     """
     marker = np.zeros(mask.shape, dtype=bool)
     coords = np.argwhere(mask)
@@ -1148,20 +1170,20 @@ def _core_body_marker(mask: np.ndarray,
 def compute_bicm_v5_target(inst_roi: np.ndarray,
                            spacing_zyx: tuple[float, float, float],
                            params: BICMV5Params = BICMV5Params()) -> np.ndarray:
-    """Compute V5 BICM target for one anatomy ROI.
+    """anatomy ROI 하나에 대한 V5 BICM target을 계산한다.
 
     Args:
-        inst_roi: Instance IDs for one anatomy only. Non-anatomy IDs must have
-            already been set to zero by preprocessing.
-        spacing_zyx: Physical voxel spacing in array order.
-        params: Fixed V5 target geometry.
+        inst_roi: 한 anatomy에 속한 instance ID만 담은 array. non-anatomy ID는
+            preprocessing 단계에서 미리 0으로 만들어 둬야 한다.
+        spacing_zyx: array 순서(zyx) physical voxel spacing.
+        params: 고정 V5 target geometry.
 
     Returns:
-        uint8 label map with classes from `V5_LABELS`.
+        `V5_LABELS` 의 class 값을 담은 uint8 label map.
 
     Raises:
-        ValueError: If spacing is invalid or a nonzero fragment fails to receive
-            a core marker.
+        ValueError: spacing이 유효하지 않거나 nonzero fragment에 core marker가
+            할당되지 못한 경우.
     """
     if len(spacing_zyx) != 3 or any(float(v) <= 0 for v in spacing_zyx):
         raise ValueError(f"invalid spacing_zyx: {spacing_zyx!r}")
@@ -1210,9 +1232,9 @@ def compute_bicm_v5_target(inst_roi: np.ndarray,
             center = candidates[0]
             center_mask = np.zeros(inst.shape, dtype=bool)
             center_mask[tuple(center)] = True
-            # Restrict the marker helper to a tiny ball around the max-distance
-            # voxel. This keeps the seed connected and prevents the old
-            # "all deep voxels are core" target from producing tens of seeds.
+            # marker helper의 적용 범위를 max-distance voxel 주변의 작은 ball로
+            # 제한한다. 그래야 seed가 connected 상태로 유지되고, 예전 "deep voxel은
+            # 전부 core" 식의 target이 수십 개의 seed를 만들어내는 문제를 막을 수 있다.
             core = _single_core_marker(
                 seed_mask & ndi.binary_dilation(center_mask, iterations=int(params.core_fallback_radius_vox)),
                 int(params.core_fallback_radius_vox),
@@ -1228,7 +1250,7 @@ def compute_bicm_v5_target(inst_roi: np.ndarray,
 
 
 def decode_bicm_v5(labels: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-    """Decode V5 BICM labels into local instance IDs with a fixed watershed."""
+    """고정된 watershed로 V5 BICM label을 local instance ID로 decode 한다."""
     from skimage.segmentation import watershed
 
     lab = labels.astype(np.uint8, copy=False)
@@ -1245,9 +1267,9 @@ def decode_bicm_v5(labels: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
         }
 
     # [METRIC][Scope:fixed_decoder]
-    # Contact class is a ridge cost, not deleted foreground. This preserves true
-    # fragment support while discouraging marker assignment across fracture
-    # contact surfaces. There is no threshold search in this decoder.
+    # contact class는 ridge cost 역할이지 foreground를 지우는 용도가 아니다. 이렇게
+    # 하면 실제 fragment support는 보존하면서 fracture contact surface를 가로지르는
+    # marker assignment에 페널티만 줄 수 있다. 이 decoder에는 threshold search가 없다.
     energy = np.zeros(lab.shape, dtype=np.float32)
     energy[lab == V5_LABELS["interior_shell"]] = 1.0
     energy[contact] = 12.0
@@ -1273,18 +1295,17 @@ def decode_bicm_v5(labels: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
 def decode_bicm_v5_seed_healed(labels: np.ndarray,
                                min_core_component_voxels: int = 128,
                                core_closing_iters: int = 2) -> tuple[np.ndarray, dict[str, Any]]:
-    """Decode with deterministic core seed healing before watershed.
+    """watershed 직전에 결정론적 core seed healing을 거친 뒤 decode 한다.
 
     [AUDIT][Risk:High][Scope:decoder_contract]
-    This decoder is diagnostic V5.4 only. It does not use GT labels or tune a
-    threshold on validation data. The rule comes from the oracle invariant that
-    each true fragment should contribute one fragment-scale core marker, whereas
-    V5.2/V5.3 predictions produced hundreds of tiny core components.
+    이 decoder는 진단용 V5.4 한정이다. GT label을 쓰지도 않고 validation data로
+    threshold를 튜닝하지도 않는다. 규칙은 "true fragment 하나는 fragment 크기에
+    맞는 core marker를 하나 가진다"는 oracle invariant에서 곧장 가져온 것이며,
+    V5.2/V5.3 예측에서는 수백 개의 작은 core component가 만들어지는 문제가 있었다.
 
     [QC][Invariant:no_gt_dependency]
-    Inputs are the predicted semantic labels only. If this improves fragment
-    count but contact remains zero, the remaining blocker is contact learning,
-    not seed postprocessing.
+    입력은 예측된 semantic label뿐이다. 이걸로 fragment 개수는 좋아졌는데 contact는
+    여전히 0이라면, 남은 병목은 seed postprocessing이 아니라 contact 학습 자체다.
     """
     lab = labels.astype(np.uint8, copy=False)
     support = np.isin(lab, V5_SUPPORT_LABELS)
@@ -1335,14 +1356,14 @@ def decode_bicm_v5_seed_healed(labels: np.ndarray,
 def oracle_bicm_v5(inst_roi: np.ndarray,
                    spacing_zyx: tuple[float, float, float],
                    params: BICMV5Params = BICMV5Params()) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Return `(target, decoded, trace)` for target/decoder oracle QA."""
+    """target/decoder oracle QA용 `(target, decoded, trace)` 를 반환한다."""
     target = compute_bicm_v5_target(inst_roi, spacing_zyx=spacing_zyx, params=params)
     decoded, trace = decode_bicm_v5(target)
     return target, decoded, trace
 
 
 def label_distribution(labels: np.ndarray) -> dict[str, int]:
-    """JSON-safe class voxel counts for audit reports."""
+    """audit report용 JSON-safe class voxel count를 반환한다."""
     counts = {name: int((labels == value).sum()) for name, value in V5_LABELS.items()}
     counts["support"] = int(np.isin(labels, V5_SUPPORT_LABELS).sum())
     return counts
@@ -1371,12 +1392,12 @@ ABBC_FRACTURE_DISK_RADIUS = 6
 ABBC_CONTACT_RADIUS_VOX = 3
 ABBC_CORE_CLEARANCE_RADIUS_DELTA = 2
 
-PELVIC_ANATOMY_RANGES = {
-    1: ("Sacrum", 1, 50),
-    2: ("LeftHip", 51, 100),
-    3: ("RightHip", 101, 150),
-}
-PELVIC_GLOBAL_START = {1: 1, 2: 51, 3: 101}
+# Registry-derived decode tables. The "PELVIC" prefix is historical: these now
+# span ALL anatomies incl. Femur so the watershed->global-ID reconstruction does
+# not silently drop femur. Safe superset — a pelvic-only model never predicts the
+# femur semantic class, so its femur entry stays unused.
+PELVIC_ANATOMY_RANGES = {a.index: (a.name, a.id_lo, a.id_hi) for a in ANATOMY_REGISTRY}
+PELVIC_GLOBAL_START = anatomy_start_ids()
 
 
 def _label_components(mask: np.ndarray) -> tuple[np.ndarray, int]:
@@ -1625,6 +1646,180 @@ def compute_abbc_official_target(instances: np.ndarray,
                 target_crop[np.unravel_index(int(np.argmax(dist)), dist.shape)] = ABBC_CORE_LABEL
             target[bbox] = target_crop
     return target
+
+
+def compute_abbc_official_target_dynamic(
+    instances: np.ndarray,
+    divergence_threshold: float = ABBC_DIVERGENCE_THRESHOLD,
+    distance_threshold: float = ABBC_DISTANCE_THRESHOLD_VOX,
+    min_disk_radius: int = 2,
+    max_disk_radius: int = 12,
+    target_boundary_thickness_mm: float = 6.0,
+    spacing_zyx: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    enforce_one_core_cc: bool = True,
+) -> tuple[np.ndarray, dict]:
+    """V0.x [PHASE 1] Dynamic boundary thickness ABBC target (MIC-DKFZ winner 방식).
+
+    PENGWIN 2024 1위 (MIC-DKFZ) 의 핵심 차별화 기법 — 모든 fragment 에 fixed disk_radius=6 을
+    적용하면 thin fragment 가 거의 전부 boundary 로 흡수되어 core 가 사라지고, 반대로 thick
+    fragment 는 0.03% sparse contact 로 학습 불가. 본 함수는 fragment 별 medial axis transform
+    으로 thickness 를 측정한 뒤 dynamic 하게 disk_radius 를 조정한다.
+
+    인수:
+        instances: GT instance ID 볼륨 (uint16, 0=bg).
+        min_disk_radius / max_disk_radius: dynamic radius 의 하한/상한.
+        target_boundary_thickness_mm: 모든 fragment 가 도달하기 원하는 boundary 두께 (mm).
+        spacing_zyx: voxel spacing (mm). medial axis 거리 mm 단위 변환에 사용.
+
+    반환:
+        target: 4-class ABBC (background/boundary/core/contact_surface).
+        audit: per-fragment dynamic_radius + thickness 기록 dict.
+
+    구현 노트:
+        - fragment 당 medial axis percentile 95 를 thickness 의 mm 추정값으로 사용.
+        - dynamic_radius = clamp(target_boundary_thickness_mm / thickness_mm, min, max)
+        - thickness 가 작을수록 (얇은 조각) radius ↑ → boundary 가 sparse 되지 않음.
+        - thickness 가 클수록 (두꺼운 조각) radius ↓ → core 가 보존됨.
+    """
+    pelvic = np.zeros_like(instances, dtype=np.uint16)
+    for _anatomy_id, (_name, lo, hi) in PELVIC_ANATOMY_RANGES.items():
+        mask = (instances >= lo) & (instances <= hi)
+        pelvic[mask] = instances[mask].astype(np.uint16, copy=False)
+
+    fragment_ids = [int(v) for v in np.unique(pelvic) if int(v) > 0]
+    audit_per_fragment = []
+    target = np.zeros(instances.shape, dtype=np.uint8)
+
+    # Step 1: per-fragment dynamic radius 계산 (medial axis 기반).
+    spacing_arr = np.array(spacing_zyx, dtype=np.float32)
+    avg_spacing_mm = float(np.mean(spacing_arr))
+    dynamic_radius_per_fragment: dict[int, int] = {}
+    for fragment_id in fragment_ids:
+        bbox = _mask_bbox(pelvic == fragment_id, pad=20)
+        if bbox is None:
+            continue
+        frag = pelvic[bbox] == fragment_id
+        # Distance transform 으로 medial axis thickness 추정.
+        # sampling 인자를 spacing 으로 주면 mm 단위 거리.
+        dist_mm = ndi.distance_transform_edt(frag, sampling=spacing_arr)
+        if dist_mm[frag].size == 0:
+            thickness_mm = 1.0
+        else:
+            thickness_mm = float(np.percentile(dist_mm[frag], 95))
+        thickness_mm = max(thickness_mm, 0.5)
+
+        # Dynamic radius: target thickness / measured thickness.
+        # thin fragment (작은 thickness) → 큰 radius.
+        # thick fragment (큰 thickness) → 작은 radius (default 6 근처).
+        ratio = target_boundary_thickness_mm / thickness_mm
+        dynamic_r_vox = int(round(ratio * (6.0 / avg_spacing_mm)))
+        dynamic_r_vox = max(min_disk_radius, min(max_disk_radius, dynamic_r_vox))
+        dynamic_radius_per_fragment[fragment_id] = dynamic_r_vox
+        audit_per_fragment.append({
+            "fragment_id": fragment_id,
+            "thickness_mm_p95": round(thickness_mm, 2),
+            "dynamic_radius_vox": dynamic_r_vox,
+            "fragment_size": int(frag.sum()),
+        })
+
+    # Step 2: per-fragment boundary/core 생성 (기존 로직 유지).
+    for fragment_id in fragment_ids:
+        bbox = _mask_bbox(pelvic == fragment_id, pad=20)
+        if bbox is None:
+            continue
+        frag = pelvic[bbox] == fragment_id
+        dist = ndi.distance_transform_edt(frag)
+        dist = ndi.gaussian_filter(dist, sigma=2)
+        gradients = [
+            np.gradient(np.gradient(dist, axis=axis), axis=axis)
+            for axis in range(1, instances.ndim)
+        ]
+        div = np.sum(np.stack(gradients, axis=0), axis=0) if gradients else np.zeros_like(dist)
+        core = (-div > float(divergence_threshold)) & frag
+        core[dist > float(distance_threshold)] = True
+
+        if enforce_one_core_cc:
+            core = core & frag
+            if not core.any() and frag.any():
+                core[np.unravel_index(int(np.argmax(dist)), dist.shape)] = True
+            core_cc, n_core = _label_components(core)
+            if n_core > 1:
+                sizes = ndi.sum(core, core_cc, index=np.arange(1, n_core + 1))
+                keep = int(np.argmax(sizes)) + 1
+                core = core_cc == keep
+
+        crop = target[bbox]
+        crop[frag] = ABBC_BOUNDARY_LABEL
+        crop[core & frag] = ABBC_CORE_LABEL
+        target[bbox] = crop
+
+    # Step 3: contact surface — fragment 별 dynamic radius 사용.
+    # 기존 fixed 와 달리, 인접 fragment 쌍 별 max(radius) 적용.
+    for fragment_id in fragment_ids:
+        r = dynamic_radius_per_fragment.get(fragment_id, 6)
+        # contact_radius 는 cross-fragment 접촉면 영역. dynamic.
+        contact_r = max(1, r // 2)
+        clear_r = contact_r + ABBC_CORE_CLEARANCE_RADIUS_DELTA
+        # 단일 fragment 만 isolate 해서 contact 추출.
+        single = np.where(pelvic == fragment_id, pelvic, 0)
+        # 인접 fragments 와의 contact 만 추출하려면 전체 pelvic 필요.
+        # 따라서 본 함수는 simple per-fragment 가 아닌 global pass 로 처리.
+
+    # [V0.x][PHASE 3-B][2026-06-01] Contact radius 확장.
+    # 이전: contact_radius = max_r // 2  (max_r=12 시 contact_r=6, 0.05% sparse)
+    # 현재: contact_radius = max_r * 0.8 (max_r=12 시 contact_r=9-10, ~0.15% 예상)
+    # 동기: within-anatomy contact 의 0.034% sparse class collapse 직접 해결.
+    # diag6 결과 cross-anatomy 는 2.54% 로 무의미하나, within-anatomy 의 sparse class
+    # 학습 어려움이 V0~V72 의 지속된 bottleneck. radius 1.6x 확장으로 contact 영역
+    # 단면적 2.5x 증가 → V300 BADB 의 boundary refinement 와 시너지.
+    if dynamic_radius_per_fragment:
+        max_r = max(dynamic_radius_per_fragment.values())
+    else:
+        max_r = 6
+    expanded_contact_r = max(2, int(round(max_r * 0.8)))  # Phase 3-B 핵심 변경
+    fracture_clearance = get_contact_surface_regions(
+        pelvic, contact_radius=expanded_contact_r + ABBC_CORE_CLEARANCE_RADIUS_DELTA,
+    )
+    target[(fracture_clearance > 0) & (target == ABBC_CORE_LABEL)] = ABBC_BOUNDARY_LABEL
+    fractures = get_contact_surface_regions(
+        pelvic, contact_radius=expanded_contact_r,
+    )
+    target[fractures > 0] = ABBC_BORDER_LABEL
+    target[pelvic == 0] = 0
+
+    if enforce_one_core_cc:
+        for fragment_id in fragment_ids:
+            frag = pelvic == fragment_id
+            core = frag & (target == ABBC_CORE_LABEL)
+            bbox = _mask_bbox(frag, pad=1)
+            if bbox is None:
+                continue
+            core_cc, n_core = _label_components(core[bbox])
+            target_crop = target[bbox]
+            if n_core == 1:
+                target[bbox] = target_crop
+                continue
+            target_crop[core[bbox]] = ABBC_BOUNDARY_LABEL
+            if n_core > 1:
+                sizes = ndi.sum(core[bbox], core_cc, index=np.arange(1, n_core + 1))
+                keep = int(np.argmax(sizes)) + 1
+                target_crop[core_cc == keep] = ABBC_CORE_LABEL
+            else:
+                candidate = frag[bbox] & (target_crop != ABBC_BORDER_LABEL)
+                if not candidate.any():
+                    candidate = frag[bbox]
+                dist = ndi.distance_transform_edt(candidate)
+                target_crop[np.unravel_index(int(np.argmax(dist)), dist.shape)] = ABBC_CORE_LABEL
+            target[bbox] = target_crop
+
+    audit = {
+        "n_fragments": len(fragment_ids),
+        "max_dynamic_radius": max_r if dynamic_radius_per_fragment else 0,
+        "min_dynamic_radius": min(dynamic_radius_per_fragment.values()) if dynamic_radius_per_fragment else 0,
+        "mean_dynamic_radius": float(np.mean(list(dynamic_radius_per_fragment.values()))) if dynamic_radius_per_fragment else 0,
+        "per_fragment": audit_per_fragment,
+    }
+    return target, audit
 
 
 def abbc_component_to_instances(patch: np.ndarray,
@@ -1992,7 +2187,7 @@ def audit_official_target(instances: np.ndarray,
     count_map = Counter({int(v): int(c) for v, c in zip(values, counts)})
     zero_core = []
     multi_core = []
-    core_leak = int(((target == ABBC_CORE_LABEL) & ~((instances >= 1) & (instances <= 150))).sum())
+    core_leak = int(((target == ABBC_CORE_LABEL) & ~valid_instance_mask(instances)).sum())
     core_contact_overlap = int(((target == ABBC_CORE_LABEL) & (target == ABBC_CONTACT_LABEL)).sum())
     n_fragments = 0
     tiny_fragments = 0

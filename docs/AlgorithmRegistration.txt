@@ -1,48 +1,42 @@
 ================================================================
 Grand Challenge - "Create Algorithm for Challenge" form fill
-PENGWIN 2026 Task 1 Preliminary Submission
+PENGWIN 2026 Task 1 Submission (V1 STU-Net)
 ================================================================
 
-[Title] (단일 라인, method 식별용)
+[Title] (single line, method identifier)
 ----------------------------------------------------------------
-Per-Anatomy ABBC nnU-Net with Core-Seed Watershed (PENGWIN-Auto)
+Per-Anatomy ABBC STU-Net with Core-Seed Watershed (PENGWIN-Auto)
 ----------------------------------------------------------------
-(64 chars, 의미 명확, "test/debug" 단어 미포함, 향후 컨테이너 교체 후에도 그대로 사용 가능)
-
-대안 (더 짧게):
-- ABBC nnU-Net for Pelvic Fracture Instance Segmentation  (54 chars)
-- Per-Anatomy ABBC nnU-Net (PENGWIN-Auto)                 (40 chars)
+(method-level; reusable across container versions)
 
 
 [Description] (max 1024 chars)
 ----------------------------------------------------------------
 Pelvic and femoral fracture fragment instance segmentation in CT.
 
-Pipeline (two models, loaded serially on a single GPU):
-1. Anatomy classifier — Dataset532_PelvicAnatomyV2 nnU-Net runs on the full CT to label Sacrum, Left/Right Hipbone, and Femur and to crop per-anatomy ROIs. The model is then released from GPU memory.
-2. Per-anatomy fragment segmenter — Dataset537 V291 ABBC nnU-Net v2 ResEnc-L is loaded on the freed GPU and run per ROI. It uses a 4-class Adaptive Border/Boundary/Core representation (background/border/boundary/core); a boundary-class CE+Dice weight sharpens inter-fragment separation.
-3. Instance decoding — core-seeded watershed converts the softmax into instance masks; components <~1 cm^3 are pruned and an anatomy-size-ratio filter merges spurious tiny fragments.
+Two-stage cascade (two STU-Net-B models, loaded serially on one GPU):
+1. Anatomy — Dataset539_PelvicFemurAnatomyV3 runs on the full CT, labelling Sacrum, Left/Right Hipbone and Femur (5-class) and cropping per-anatomy ROIs; then released from GPU.
+2. Fracture — Dataset538 ABBC STU-Net is loaded on the freed GPU and run per ROI on a 3-channel input (bone-LUT CT, anatomy probability, signed distance). It emits a 4-class Adaptive Border/Boundary/Core field.
+3. Decoding — core-seeded watershed yields instance masks; ~1 cm^3 components are pruned and a small-fragment merge removes spurious splits.
 
-Output: integer label map per PENGWIN convention (0 bg; 1-50 sacrum; 51-100 L hipbone; 101-150 R hipbone; 151-200 femur).
+Backbone STU-Net-B (Apache-2.0) warm-started from a TotalSegmentator bone pretrain. Femur is fully modelled. Trained on a leakage-free case-grouped split shared by both stages.
 
-GPU: T4 16 GiB. Peak = max(Ds532, V291), not sum (serial load). V291 patch 224x160x192 ~11 GiB.
+Output: PENGWIN label map (0 bg; 1-50 sacrum; 51-100 L hip; 101-150 R hip; 151-200 femur).
+
+GPU: T4 16 GiB. Peak = max(stage1, stage2), not sum (serial load); STU-Net-B ~4 GiB/stage.
 ----------------------------------------------------------------
-(약 1019 chars, 한도 1024 이내)
 
 
 [Job requires gpu type]
 ----------------------------------------------------------------
-NVIDIA T4 Tensor Core GPU (16 GiB VRAM)  -- 그대로 유지 (기본값 맞음)
+NVIDIA T4 Tensor Core GPU (16 GiB VRAM)
 
-이유: 두 모델(Ds532 anatomy classifier + V291 ABBC fragment segmenter)은
-      직렬(serial)로 로드/해제되므로 peak VRAM = max(Ds532, V291), not sum.
-      V291 ABBC inference 시 patch_size 224x160x192 + ResEnc-L 백본
-      → 약 11 GiB VRAM 사용. Ds532는 그보다 작음.
-      따라서 T4 16 GiB로 충분 (마진 ~5 GiB). 더 큰 GPU는 비용 증가만 발생.
-
+Reason: the two STU-Net-B models (Ds539 anatomy + Ds538 ABBC fracture) are
+loaded/released serially, so peak VRAM = max(stage1, stage2) ~ 4 GiB, not sum.
+Measured end-to-end runtime 45-205 s/case (3090), well within the T4 / 10-min
+budget. T4 16 GiB has ample margin.
 
 ================================================================
-참고: 이 알고리즘은 한 번 등록 후 향후 V1/V2... 컨테이너로 교체 가능.
-      Title/Description은 method 자체를 표현하므로 V0 pipeline test
-      이후에도 그대로 사용. 단일 알고리즘 슬롯 권고.
+Note: single algorithm slot; Title/Description are method-level and survive
+future container swaps.
 ================================================================
