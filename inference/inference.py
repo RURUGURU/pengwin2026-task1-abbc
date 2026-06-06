@@ -367,7 +367,19 @@ def build_predictor(dataset: str, trainer: str, plans: str, config: str,
         use_folds=(int(fold),),
         checkpoint_name=checkpoint_name,
     )
-    log(f"build_predictor: {dataset} {trainer[-30:]} device={device}")
+    # DIAG: confirm the RIGHT architecture (STUNet, not ResEnc) + non-random weights loaded.
+    # A wrong/random network here is exactly the 73%-one-class / thousands-of-CC garbage signature.
+    try:
+        import torch as _t
+        _net = predictor.network
+        _ps = list(_net.parameters())
+        _nparam = sum(p.numel() for p in _ps)
+        with _t.no_grad():
+            _w0 = float(_ps[0].detach().float().abs().sum().cpu()) if _ps else 0.0
+        log(f"build_predictor: {dataset} {trainer[-30:]} NET={type(_net).__name__} "
+            f"params={_nparam/1e6:.1f}M w0sum={_w0:.4e} device={device}")
+    except Exception as _e:
+        log(f"build_predictor: {dataset} {trainer[-30:]} device={device} (net-diag err: {_e})")
     return predictor
 
 
@@ -914,6 +926,16 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     img_lps, arr_clipped = canonicalize_and_clip_image(ref_img)
     image_npy_lps = arr_clipped.astype(np.float32, copy=False)
     ct_lut_full = bone_lut_normalize(arr_clipped)
+    # DIAG: raw (pre-clip) HU stats — detects an OOD / mis-calibrated GC input (e.g. uint16
+    # raw pixels needing rescale, or a non-HU intensity range) that would make Ds539 garbage.
+    try:
+        _raw = sitk.GetArrayFromImage(img_lps)
+        log(f"DIAG raw-HU: dtype={_raw.dtype} min={float(_raw.min()):.0f} max={float(_raw.max()):.0f} "
+            f"mean={float(_raw.mean()):.0f} p1={float(np.percentile(_raw,1)):.0f} "
+            f"p99={float(np.percentile(_raw,99)):.0f} bone(>200)={float((_raw>200).mean()):.4f} "
+            f"air(<-500)={float((_raw<-500).mean()):.4f}")
+    except Exception as _e:
+        log(f"DIAG raw-HU: failed ({_e})")
     spacing_xyz = img_lps.GetSpacing()
     spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
     img_shape = image_npy_lps.shape
@@ -976,6 +998,17 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     # === Layer 2: Ds539 5-class argmax 기반 anatomy mask 추출 (Femur 포함) ===
     ds539_masks = ds539_argmax_masks(probs_full)
     log("L2 Ds539 argmax: " + ", ".join(f"{a}={int(ds539_masks[a].sum())}" for a in ALL_ANATOMIES))
+    # DIAG: Ds539 health — each anatomy's fraction of the WHOLE volume. The GC failure was
+    # RightHip=73% + Sacrum 18141 CCs; a healthy case is each anatomy ~1-2% of volume.
+    try:
+        _tot = float(np.prod(img_shape))
+        _fr = {a: int(ds539_masks[a].sum()) / max(1.0, _tot) for a in ALL_ANATOMIES}
+        _maxa = max(_fr, key=_fr.get)
+        log("DIAG Ds539 health: frac={" + ", ".join(f"{a}:{_fr[a]:.3f}" for a in ALL_ANATOMIES) + "} "
+            f"largest={_maxa}({_fr[_maxa]:.3f}) HEALTH="
+            + ("GARBAGE(>50%_one_class!)" if _fr[_maxa] > 0.50 else "ok"))
+    except Exception as _e:
+        log(f"DIAG Ds539 health: failed ({_e})")
 
     # === Layer 2b: pelvic vs femur 라우팅 (Ds539 argmax 부피 비율) ===
     if forced_anatomies is not None:
