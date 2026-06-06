@@ -64,8 +64,6 @@ def configure_nnunet_env(force: bool = False) -> dict[str, str]:
     return values
 
 
-_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-_LOG_DATEFMT = "%H:%M:%S"
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -74,16 +72,6 @@ def get_logger(name: str) -> logging.Logger:
     if not log.handlers:
         log.setLevel(logging.INFO)
     return log
-
-
-def setup_cli_logging(level: int = logging.INFO) -> None:
-    """Configure stdout logging once for command-line entry points."""
-    root = logging.getLogger()
-    root.setLevel(level)
-    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
-        root.addHandler(handler)
 
 
 configure_nnunet_env()
@@ -166,12 +154,6 @@ ABBC_HARD_NEGATIVE_LABEL = 4
 # module while we delete heavy V3/V4 artifacts. Active Dataset537 V5 does not
 # use these heads or sidecars; registry and CLI must point to `bicm_v5` only.
 FACTOR_INSTANCE_OUTPUT_CHANNELS = 15
-FACTOR_SUPPORT_CH = 0
-FACTOR_CONTACT_CH = 1
-FACTOR_CORE_CH = 2
-FACTOR_HARD_NEGATIVE_CH = 3
-FACTOR_OFFSET_CHS = (4, 5, 6)
-FACTOR_EMBEDDING_CHS = tuple(range(7, 15))
 FACTOR_INSTANCE_CHANNEL_NAMES = [
     "support_logit",
     "contact_energy_logit",
@@ -195,13 +177,10 @@ BOUNDARY_FRAGMENT_V3_TARGET_SIDECAR_DIR = "boundary_fragment_v3_targets"
 # Retained for old JSON/probe readers only. This 19-channel morphology/edge
 # contract is not the active Dataset537 training contract.
 CONTACT_INSTANCE_OUTPUT_CHANNELS = 19
-CONTACT_INSTANCE_MORPH_BG_CH = 0
 CONTACT_INSTANCE_MORPH_SUPPORT_CH = 1
 CONTACT_INSTANCE_MORPH_CONTACT_CH = 2
 CONTACT_INSTANCE_MORPH_HARD_NEGATIVE_CH = 3
 CONTACT_INSTANCE_CORE_CH = 4
-CONTACT_INSTANCE_OFFSET_CHS = (5, 6, 7)
-CONTACT_INSTANCE_EMBEDDING_CHS = tuple(range(8, 16))
 CONTACT_INSTANCE_EDGE_BREAK_CHS = (16, 17, 18)
 CONTACT_INSTANCE_CHANNEL_NAMES = [
     "morph_background_logit",
@@ -226,81 +205,14 @@ CONTACT_INSTANCE_CHANNEL_NAMES = [
     ]
 
 BICM_V38_OUTPUT_CHANNELS = 8
-BICM_V38_CHANNEL_NAMES = [
-    "support_logit",
-    "contact_edge_ridge_logit",
-    "core_marker_logit",
-    "exterior_context_logit",
-    "roi_contact_present_logit",
-    "edge_break_z_logit",
-    "edge_break_y_logit",
-    "edge_break_x_logit",
-]
 
 BICM_V68_OUTPUT_CHANNELS = 10
-BICM_V68_CHANNEL_NAMES = [
-    "semantic_background_logit",
-    "semantic_exterior_context_logit",
-    "semantic_interior_shell_logit",
-    "semantic_core_logit",
-    "semantic_contact_surface_logit",
-    "contact_topology_logit",
-    "core_marker_logit",
-    "edge_break_z_logit",
-    "edge_break_y_logit",
-    "edge_break_x_logit",
-]
 
 BFV3_BINARY_BARRIER_OUTPUT_CHANNELS = 6
 BFV3_BINARY_BARRIER_SEED_OUTPUT_CHANNELS = 7
 BFV3_XYZ_AFFINITY_OUTPUT_CHANNELS = 8
-BFV3_XYZ_AFFINITY_CHANNEL_NAMES = [
-    "semantic_background_logit",
-    "semantic_exterior_context_logit",
-    "semantic_contact_label2_logit",
-    "semantic_shell_label3_logit",
-    "semantic_core_label4_logit",
-    "same_fragment_affinity_z_logit",
-    "same_fragment_affinity_y_logit",
-    "same_fragment_affinity_x_logit",
-]
 BFV3_AFFINITY13_SEED_OUTPUT_CHANNELS = 18
-BFV3_AFFINITY13_SEED_CHANNEL_NAMES = [
-    "support_logit",
-    "exterior_context_logit",
-    "fracture_surface_logit",
-    "seed_center_logit",
-    "seed_body_logit",
-    "same_fragment_affinity_0_0_1_logit",
-    "same_fragment_affinity_0_1_-1_logit",
-    "same_fragment_affinity_0_1_0_logit",
-    "same_fragment_affinity_0_1_1_logit",
-    "same_fragment_affinity_1_-1_-1_logit",
-    "same_fragment_affinity_1_-1_0_logit",
-    "same_fragment_affinity_1_-1_1_logit",
-    "same_fragment_affinity_1_0_-1_logit",
-    "same_fragment_affinity_1_0_0_logit",
-    "same_fragment_affinity_1_0_1_logit",
-    "same_fragment_affinity_1_1_-1_logit",
-    "same_fragment_affinity_1_1_0_logit",
-    "same_fragment_affinity_1_1_1_logit",
-]
 BFV3_MUTEX13_SEED_OUTPUT_CHANNELS = 31
-BFV3_MUTEX13_SEED_CHANNEL_NAMES = BFV3_AFFINITY13_SEED_CHANNEL_NAMES + [
-    "different_fragment_mutex_0_0_1_logit",
-    "different_fragment_mutex_0_1_-1_logit",
-    "different_fragment_mutex_0_1_0_logit",
-    "different_fragment_mutex_0_1_1_logit",
-    "different_fragment_mutex_1_-1_-1_logit",
-    "different_fragment_mutex_1_-1_0_logit",
-    "different_fragment_mutex_1_-1_1_logit",
-    "different_fragment_mutex_1_0_-1_logit",
-    "different_fragment_mutex_1_0_0_logit",
-    "different_fragment_mutex_1_0_1_logit",
-    "different_fragment_mutex_1_1_-1_logit",
-    "different_fragment_mutex_1_1_0_logit",
-    "different_fragment_mutex_1_1_1_logit",
-]
 BFV3_NO_CONTACT_PAIRWISE_V273_OUTPUT_CHANNELS = 28
 BFV3_NO_CONTACT_PAIRWISE_V273_CHANNEL_NAMES = [
     "support_logit",
@@ -333,19 +245,12 @@ BFV3_NO_CONTACT_PAIRWISE_V273_CHANNEL_NAMES = [
     "cut_1_1_1_logit",
 ]
 BFV3_FRAGMENT_POSITION_V275_OUTPUT_CHANNELS = 51
-BFV3_FRAGMENT_POSITION_V275_CHANNEL_NAMES = [
-    "background_logit",
-] + [f"fragment_position_{idx:02d}_logit" for idx in range(1, 51)]
 BFV3_SEPARATOR_GAP_V277_OUTPUT_CHANNELS = 2
 BFV3_SEPARATOR_GAP_V277_CHANNEL_NAMES = [
     "support_logit",
     "separator_gap_logit",
 ]
 BFV3_SEPARATOR_ENERGY_V278_OUTPUT_CHANNELS = 2
-BFV3_SEPARATOR_ENERGY_V278_CHANNEL_NAMES = [
-    "support_logit",
-    "separator_energy_logit",
-]
 BFV3_SEPARATOR_SOFTMAX_V287_OUTPUT_CHANNELS = 3
 BFV3_SEPARATOR_SOFTMAX_V287_CHANNEL_NAMES = [
     "background_logit",
@@ -360,77 +265,17 @@ BFV3_ABBC_V288_CHANNEL_NAMES = [
     "core_logit",
 ]
 BFV3_ABBC_SDF_V289_OUTPUT_CHANNELS = 4
-BFV3_ABBC_SDF_V289_CHANNEL_NAMES = [
-    "background_logit",
-    "border_logit",
-    "boundary_sdf",
-    "core_logit",
-]
 BFV3_ABBC_SDF_FDM_V290_OUTPUT_CHANNELS = 4
-BFV3_ABBC_SDF_FDM_V290_CHANNEL_NAMES = BFV3_ABBC_SDF_V289_CHANNEL_NAMES
 BFV3_ABBC_BWEIGHT_V291_OUTPUT_CHANNELS = 4
 BFV3_ABBC_BWEIGHT_V291_CHANNEL_NAMES = BFV3_ABBC_V288_CHANNEL_NAMES
 BFV3_CENTER_FLOW_OUTPUT_CHANNELS = 8
-BFV3_CENTER_FLOW_CHANNEL_NAMES = [
-    "support_logit",
-    "exterior_context_logit",
-    "fracture_surface_logit",
-    "center_heatmap_logit",
-    "distance_field_logit",
-    "offset_to_center_z",
-    "offset_to_center_y",
-    "offset_to_center_x",
-]
 BFV3_NO_CONTACT_CENTER_FLOW_OUTPUT_CHANNELS = 5
-BFV3_NO_CONTACT_CENTER_FLOW_CHANNEL_NAMES = [
-    "support_logit",
-    "center_heatmap_logit",
-    "offset_to_center_z",
-    "offset_to_center_y",
-    "offset_to_center_x",
-]
 BFV3_SPATIAL_EMBEDDING_OUTPUT_CHANNELS = 4
-BFV3_SPATIAL_EMBEDDING_CHANNEL_NAMES = [
-    "support_logit",
-    "sink_z_logit",
-    "sink_y_logit",
-    "sink_x_logit",
-]
 BFV3_QUERY_MASK_V280_OUTPUT_CHANNELS = 1
-BFV3_QUERY_MASK_V280_CHANNEL_NAMES = [
-    "query_fragment_mask_logit",
-]
 BFV3_QUERY_MASK_PN_V281_OUTPUT_CHANNELS = 1
-BFV3_QUERY_MASK_PN_V281_CHANNEL_NAMES = [
-    "query_fragment_mask_logit",
-]
-BFV3_GLOBAL_COORD_QUERY_MASK_V285_OUTPUT_CHANNELS = 1
-BFV3_GLOBAL_COORD_QUERY_MASK_V285_CHANNEL_NAMES = BFV3_QUERY_MASK_V280_CHANNEL_NAMES
-BFV3_GLOBAL_COORD_QUERY_MASK_PN_V286_OUTPUT_CHANNELS = 1
-BFV3_GLOBAL_COORD_QUERY_MASK_PN_V286_CHANNEL_NAMES = BFV3_QUERY_MASK_PN_V281_CHANNEL_NAMES
 BFV3_FREE_EMBEDDING_V282_OUTPUT_CHANNELS = 5
-BFV3_FREE_EMBEDDING_V282_CHANNEL_NAMES = [
-    "support_logit",
-    "free_embedding_0",
-    "free_embedding_1",
-    "free_embedding_2",
-    "free_embedding_3",
-]
 BFV3_GLOBAL_COORD_FREE_EMBEDDING_V283_OUTPUT_CHANNELS = 5
-BFV3_GLOBAL_COORD_FREE_EMBEDDING_V283_CHANNEL_NAMES = BFV3_FREE_EMBEDDING_V282_CHANNEL_NAMES
 
-BICM_V105_CHANNEL_NAMES = [
-    "semantic_background_logit",
-    "semantic_exterior_context_logit",
-    "semantic_interior_shell_logit",
-    "semantic_core_logit",
-    "semantic_contact_surface_logit",
-    "contact_metric_logit",
-    "core_marker_logit",
-    "offset_to_center_z",
-    "offset_to_center_y",
-    "offset_to_center_x",
-]
 
 
 @dataclass(frozen=True)
@@ -623,18 +468,6 @@ DATASETS: dict[int, DatasetCfg] = {
 }
 
 
-RESERVED_DATASETS = {
-    534: "retired_deleted_20260519",
-    535: "retired_deleted_20260519",
-    536: "retired_deleted_20260519",
-}
-
-
-def dataset_cfg(ds_id: int) -> DatasetCfg:
-    """Return the active dataset config."""
-    if ds_id not in DATASETS:
-        raise KeyError(f"unknown active dataset {ds_id}. active={sorted(DATASETS)}")
-    return DATASETS[ds_id]
 
 
 # =============================================================================

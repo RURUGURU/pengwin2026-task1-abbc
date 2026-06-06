@@ -69,16 +69,6 @@ def canonicalize_sitk(img: sitk.Image,
     return sitk_mod.DICOMOrient(img, orientation)
 
 
-def reorient_to_reference(img: sitk.Image, ref_img: sitk.Image) -> sitk.Image:
-    """Orient `img` back to `ref_img`'s direction and metadata."""
-    ref_code = orientation_code(ref_img)
-    sitk_mod = _require_sitk()
-    out = sitk_mod.DICOMOrient(img, ref_code) if orientation_code(img) != ref_code else img
-    if out.GetSize() == ref_img.GetSize():
-        out.CopyInformation(ref_img)
-    return out
-
-
 def find_case_dir(case_id: str) -> Path | None:
     """Locate case folder under data/task1_2/extracted/<part>/<case_id>/."""
     cid = str(case_id).zfill(3)
@@ -118,16 +108,6 @@ def inst_to_anat(inst: np.ndarray) -> np.ndarray:
     for idx, (_name, lo, hi) in enumerate(ANATOMY_RANGES, start=1):
         out[(inst >= lo) & (inst <= hi)] = idx
     return out
-
-
-def find_bbox(mask: np.ndarray, pad: int = PAD) -> tuple[slice, ...] | None:
-    """Return an axis-aligned bounding box for foreground voxels."""
-    coords = np.argwhere(mask)
-    if len(coords) == 0:
-        return None
-    mins = np.maximum(coords.min(axis=0) - pad, 0)
-    maxs = np.minimum(coords.max(axis=0) + pad + 1, mask.shape)
-    return tuple(slice(int(a), int(b)) for a, b in zip(mins, maxs))
 
 
 def crop_save_mha(arr_full: np.ndarray, ref_img: sitk.Image, bbox: tuple,
@@ -249,12 +229,6 @@ def prepare_lps_ct_for_nnunet(source_image: str | Path | sitk.Image,
         "input_dtype": str(sitk_mod.GetArrayFromImage(img).dtype),
         "output_dtype": str(clipped.dtype),
     }
-
-
-def detect_region(img: sitk.Image) -> str:
-    """Fallback region detector from z-spacing; case ID remains preferred."""
-    z_sp = float(img.GetSpacing()[2])
-    return "Pelvic" if z_sp < 0.9 else "Femur"
 
 
 
@@ -1353,15 +1327,6 @@ def decode_bicm_v5_seed_healed(labels: np.ndarray,
     return decoded, trace
 
 
-def oracle_bicm_v5(inst_roi: np.ndarray,
-                   spacing_zyx: tuple[float, float, float],
-                   params: BICMV5Params = BICMV5Params()) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """target/decoder oracle QA용 `(target, decoded, trace)` 를 반환한다."""
-    target = compute_bicm_v5_target(inst_roi, spacing_zyx=spacing_zyx, params=params)
-    decoded, trace = decode_bicm_v5(target)
-    return target, decoded, trace
-
-
 def label_distribution(labels: np.ndarray) -> dict[str, int]:
     """audit report용 JSON-safe class voxel count를 반환한다."""
     counts = {name: int((labels == value).sum()) for name, value in V5_LABELS.items()}
@@ -1434,13 +1399,6 @@ def _bbox_from_slices(slices: tuple[slice, ...]) -> list[list[int]]:
 
 def _slices_from_bbox(bbox: list[list[int]] | tuple[tuple[int, int], ...]) -> tuple[slice, ...]:
     return tuple(slice(int(lo), int(hi)) for lo, hi in bbox)
-
-
-def _pad_bbox(bbox: list[list[int]], pad: int, shape: tuple[int, ...]) -> list[list[int]]:
-    return [
-        [max(0, int(lo) - int(pad)), min(int(dim), int(hi) + int(pad))]
-        for (lo, hi), dim in zip(bbox, shape)
-    ]
 
 
 def _distance_assign(seed_cc: np.ndarray,

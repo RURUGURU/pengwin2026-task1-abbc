@@ -80,16 +80,6 @@ def fold_dir(ds_id: int, fold: int = 0,
     return NN_RES / cfg["name"] / f"{cfg['trainer']}__{plans}__{config}" / f"fold_{fold}"
 
 
-def best_ckpt(ds_id: int, fold: int = 0) -> Path:
-    """Path to nnUNet's checkpoint_best.pth for given dataset / fold."""
-    return fold_dir(ds_id, fold) / "checkpoint_best.pth"
-
-
-def latest_ckpt(ds_id: int, fold: int = 0) -> Path:
-    """Path to nnUNet's checkpoint_latest.pth for given dataset / fold."""
-    return fold_dir(ds_id, fold) / "checkpoint_latest.pth"
-
-
 # =============================================================================
 # SWA — Stochastic Weight Averaging
 # =============================================================================

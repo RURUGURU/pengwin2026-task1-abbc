@@ -430,19 +430,6 @@ def render_label_mips(image: np.ndarray, label: np.ndarray, out_path: Path,
     plt.close(fig)
 
 
-ABBC_COLORS = {
-    1: (0.95, 0.72, 0.15),  # boundary
-    2: (0.18, 0.72, 0.95),  # core
-    3: (0.95, 0.18, 0.18),  # border
-}
-
-
-def _class_rgb(label_proj: np.ndarray, colors: dict[int, tuple[float, float, float]]) -> np.ndarray:
-    """Map a small class-label projection to fixed QC colors."""
-    rgb = np.zeros(label_proj.shape + (3,), dtype=np.float32)
-    for value, color in colors.items():
-        rgb[label_proj == value] = color
-    return rgb
 
 
 def _write_obj(path: Path, verts_xyz: np.ndarray, faces: np.ndarray) -> None:
@@ -733,60 +720,6 @@ def fragment_stats(label_inst: np.ndarray) -> dict:
         "fragments_by_anatomy": by_anatomy,
         "fragments": rows,
     }
-
-
-def _dice_binary(gt_mask: np.ndarray, pred_mask: np.ndarray) -> float:
-    """Dice for sparse binary masks, treating absent/absent as perfect."""
-    denom = int(gt_mask.sum() + pred_mask.sum())
-    if denom == 0:
-        return 1.0
-    return float(2.0 * int((gt_mask & pred_mask).sum()) / denom)
-
-
-def _select_border_diagnosis_cases(ds_id: int, fold: int) -> list[str]:
-    """Pick zero-, mid-, and high-border validation cases for QC.
-
-    This intentionally selects by target distribution, not model score. The
-    question is whether low `border` pseudo dice reflects true contact failures
-    or the fact that many validation cases have almost no border voxels.
-    """
-    split_path = NN_PREP / DATASETS[ds_id]["name"] / "splits_final.json"
-    splits = json.loads(split_path.read_text())
-    rows = []
-    for token in splits[int(fold)]["val"]:
-        cid = str(token).split("_")[-1].zfill(3)
-        seg_path = NN_PREP / DATASETS[ds_id]["name"] / "nnUNetPlans_3d_fullres" / f"PENGWIN_{cid}.npz"
-        if not seg_path.exists():
-            continue
-        seg = np.load(seg_path)["seg"][0].astype(np.int16, copy=False)
-        valid = seg[seg >= 0]
-        counts = np.bincount(valid.ravel(), minlength=4)[:4]
-        fg = int(counts[1] + counts[2] + counts[3])
-        frac = float(counts[2] / fg) if fg else 0.0
-        rows.append({"case": cid, "counts": counts.tolist(), "border_fg_fraction": frac})
-    zero = [r["case"] for r in rows if r["counts"][2] == 0][:3]
-    nonzero = [r for r in rows if r["counts"][2] > 0]
-    nonzero.sort(key=lambda r: r["border_fg_fraction"])
-    mid = []
-    if nonzero:
-        for idx in sorted({len(nonzero) // 3, len(nonzero) // 2, (2 * len(nonzero)) // 3}):
-            mid.append(nonzero[min(idx, len(nonzero) - 1)]["case"])
-    high = [r["case"] for r in nonzero[-3:]]
-    ordered = []
-    for cid in zero + mid + high:
-        if cid not in ordered:
-            ordered.append(cid)
-    return ordered
-
-
-def _read_case_image_and_label(cid: str) -> tuple[np.ndarray, object, np.ndarray, object, Path]:
-    """Read source CT and GT label in canonical LPS for aligned visual QC."""
-    case_dir = find_case_dir(cid)
-    if case_dir is None:
-        raise FileNotFoundError(f"case {cid} not found under {DATA_RAW}")
-    image, img_ref = _read_mha_array(case_dir / "image.mha")
-    label, label_ref = _read_mha_array(case_dir / "label.mha")
-    return image, img_ref, label.astype(np.uint16, copy=False), label_ref, case_dir
 
 
 def export_hard_view(case_set: str = "hard10",
