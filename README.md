@@ -125,9 +125,9 @@ github_repo/
 ```bash
 # 1. Push + tag the release
 git push origin main
-git tag v1.2.0 && git push origin v1.2.0
+git tag v1.2.1 && git push origin v1.2.1
 
-# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.2.0
+# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.2.1
 #    → wait for the server build to reach "Active"
 
 # 3. Upload model.tar.gz to the algorithm's "Models" tab
@@ -198,7 +198,7 @@ are identical to the baseline — only the algorithm differs.
 | v0.2 – v0.3.4 | 2026-05 | ResEnc two-stage, pelvic-only, **femur = background** (archived). | 0.612 → 0.641 | 0.683 → 0.826 |
 | **v1** | 2026-06-06 | **STU-Net 2-stage, femur modeled, leakage-free grouped split, anatomy-specific sacrum decode.** | **0.799** | **0.919** |
 | **v1.1** | 2026-06-06 | Repo cleanup — whole-program dead-code fixpoint (~50k dead lines removed; **inference-equivalent & verified**). Same V1 model + I/O contract; slimmer container. | **0.799** | **0.919** |
-| **v1.2.0** | 2026-06-06 | Identical code to v1.1 — fresh SemVer tag pushed to re-trigger the Grand Challenge auto-build after the GitHub app was reinstalled. | **0.799** | **0.919** |
+| **v1.2.1** | 2026-06-06 | Identical code to v1.1 — tag pushed after re-binding the Grand Challenge GitHub link (the app reinstall had left a stale binding, so earlier v1.x tags never auto-built). | **0.799** | **0.919** |
 
 ---
 
