@@ -1,6 +1,11 @@
-% PENGWIN 2026 Task 1 — V1 STU-Net Two-Stage Submission
+% PENGWIN 2026 Task 1 — V1.1 STU-Net Two-Stage Submission
 % Algorithm Description
 % 2026-06-06
+
+> **V1.1** is a repo/container cleanup release: the inference behaviour, model
+> weights, and I/O contract are identical to V1 (verified inference-equivalent);
+> only dead code was removed for a slimmer container. The metrics below are
+> unchanged.
 
 # 0. Submission intent
 
