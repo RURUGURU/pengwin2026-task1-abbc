@@ -63,9 +63,7 @@ Two segmentation stages plus a deterministic post-processing step:
    - **L3** post-pad bbox sanity (≤ 50% of volume) — rejects OOD masks
    - **L4** 480-second time budget — guarantees the 10-minute GC limit
 
-   Pelvic-vs-femur routing is decided **after** Stage-1 inference by the
-   femur/pelvic argmax volume ratio (≈90% accurate, vs ≈50% for the old
-   spacing-only heuristic).
+   Per-anatomy routing is **robust** (V1.3): every Ds539-confident anatomy (>=20% of the largest present mask) is processed, replacing a brittle femur/pelvic volume-ratio gate that misrouted ~25% of cases to 0 (end-to-end fracture Dice 0.726->0.968).
 
 At inference: Stage (1) gives per-anatomy masks; Stage (2) labels each masked
 anatomy with its ABBC field; Stage (3) decodes per-fragment instances; Stage (4)

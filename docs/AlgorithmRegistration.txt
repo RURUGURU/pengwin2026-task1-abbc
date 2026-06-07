@@ -1,6 +1,6 @@
 ================================================================
 Grand Challenge - "Create Algorithm for Challenge" form fill
-PENGWIN 2026 Task 1 Submission (V1 STU-Net)
+PENGWIN 2026 Task 1 Submission (V1.3.1 STU-Net)
 ================================================================
 
 [Title] (single line, method identifier)
@@ -15,7 +15,7 @@ Per-Anatomy ABBC STU-Net with Core-Seed Watershed (PENGWIN-Auto)
 Pelvic and femoral fracture fragment instance segmentation in CT.
 
 Two-stage cascade (two STU-Net-B models, loaded serially on one GPU):
-1. Anatomy — Dataset539_PelvicFemurAnatomyV3 runs on the full CT, labelling Sacrum, Left/Right Hipbone and Femur (5-class) and cropping per-anatomy ROIs; then released from GPU.
+1. Anatomy — Dataset539_PelvicFemurAnatomyV3 runs on the full CT, labelling Sacrum, Left/Right Hipbone and Femur (5-class) and cropping ROIs for every confidently-present anatomy (robust to the cross-group hallucination Ds539 produces; no brittle pelvic/femur gate); then released from GPU.
 2. Fracture — Dataset538 ABBC STU-Net is loaded on the freed GPU and run per ROI on a 3-channel input (bone-LUT CT, anatomy probability, signed distance). It emits a 4-class Adaptive Border/Boundary/Core field.
 3. Decoding — core-seeded watershed yields instance masks; ~1 cm^3 components are pruned and a small-fragment merge removes spurious splits.
 
