@@ -38,14 +38,11 @@ femur ROI 는 bone-skeleton 분해(pelvic 전용)에 의존하지 않고 Ds539 a
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
-import time as _time  # V0.3 시간 예산 헬퍼에서 사용 (이름 충돌 회피용 alias)
 import traceback
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import SimpleITK as sitk
@@ -116,29 +113,23 @@ ALL_ANATOMIES = ("Sacrum", "LeftHip", "RightHip", "Femur")
 # bone-skeleton 분해는 pelvic 전용(중앙/좌/우 CC 분류)이므로 femur 는 제외한다.
 PELVIC_ANATOMIES = ("Sacrum", "LeftHip", "RightHip")
 
-# --- pelvic vs femur 라우팅 (Ds539 argmax 기반). ---
-# PENGWIN 케이스는 pelvic(001-120,151-200) 이거나 femur(251-420) 이며 둘은 disjoint
-# 이다. 그러나 case-ID 는 추론 시점에 알 수 없고, spacing 룰은 femur 케이스를 거의 전부
-# pelvic 으로 오라우팅한다(검증 정확도 ~50%). 반면 Ds539(부분-라벨 marginal 학습)는
-# pelvic 케이스에도 femur 채널을 환각하지만, femur 대 pelvic 부피 비율은 두 그룹을 잘
-# 가른다(검증 fold0 36 femur / 32 pelvic 기준 thr=0.45 에서 ~90% 정확, 균형 오류).
-#   route = femur  iff  (femur_voxels / pelvic_voxels) > FEMUR_PELVIC_RATIO_THRESHOLD
-FEMUR_PELVIC_RATIO_THRESHOLD = float(
-    os.environ.get("PENGWIN_FEMUR_PELVIC_RATIO_THRESHOLD", "0.45")
-)
+# --- anatomy routing: process every anatomy whose Ds539 argmax mask is a substantial
+#     fraction of the largest present mask (see route_from_ds539_masks). ---
 ROI_PAD_VOX = 24
-ANATOMY_PROB_THRESHOLD = 0.50
 SDF_CLIP_MM = 40.0
 BONE_HU_RANGE = (-1000.0, 2000.0)
 
 # --- ABBC decode 하이퍼파라미터 (V0.1 description.md 의 "bw=10 + sr=0.05" 와 동일). ---
 BACKGROUND_THRESHOLD = 0.50
 CORE_THRESHOLD = 0.50
-ANATOMY_SIZE_RATIO_KEEP = 0.05
+# [v1.3.3 DEC-2] non-Sacrum size-ratio merge DISABLED (was 0.05). At 0.05 any fragment
+# smaller than 5% of the bone's largest fragment was merged away — for a ~400k-voxel hip
+# that cutoff (~20k vox) swallowed genuine 1-11 cm^3 fracture fragments, causing the GC
+# under-segmentation (instance_recall 0.456, merge_error 0.65, split_error 0). The validated
+# offline eval (eval.py) uses 0.0 for non-Sacrum; the deploy decoder had silently diverged.
+# Sacrum keeps its deliberate 0.10 precision guard via the max(...) at its call site.
+ANATOMY_SIZE_RATIO_KEEP = 0.0
 MIN_COMPONENT_VOXELS = 1820  # V5 plan 해상도에서 약 1 cm^3 에 해당
-
-# --- anatomy routing (PENGWIN 2026 Task 1 스펙 그대로). ---
-FEMUR_RANGE = ANATOMY_RANGES["Femur"]  # (151, 200)
 
 # --- V0.3 견고화 관련 플래그 ---
 V03_USE_BONE_SKELETON_FALLBACK = True  # Ds539 실패 시 bone HU mask fallback 사용
@@ -151,7 +142,6 @@ TIME_BUDGET_HARD_LIMIT = 540.0   # 9분: 이 시점 이후로는 남은 anatomy 
 BONE_HU_THRESHOLD = 200.0
 BONE_MIN_COMPONENT_VOXELS = 10000
 SANITY_MAX_BBOX_FRACTION = 0.35
-SANITY_MAX_POSTPAD_BBOX_FRACTION = 0.50  # pad 적용 후 bbox 가 전체 볼륨의 50% 미만이어야 한다
 LARGEST_CC_KEEP_ONLY = True  # 가장 큰 CC 만 유지해 25개 슬롯이 노이즈 fragment 로 채워지는 것 방지
 MIN_DS539_CC_VOXELS = 500  # Ds539 mask 의 sparse outlier CC 제거 임계값 (voxels)
 DS539_MORPH_OPENING_ITERS = 1  # Ds539 mask 에 적용할 binary_opening 반복 횟수
@@ -159,67 +149,6 @@ DS539_MORPH_OPENING_ITERS = 1  # Ds539 mask 에 적용할 binary_opening 반복 
 
 def log(msg: str) -> None:
     print(f"[pengwin_v0] {msg}", flush=True)
-
-
-def classify_pelvic_femur(spacing_x, spacing_y, spacing_z, physical_x_mm, physical_z_mm):
-    if physical_x_mm <= 285.35:
-        if spacing_x <= 0.71:
-            return "pelvic"
-        elif spacing_z <= 0.90:
-            return "femur"
-        else:
-            return "pelvic" if spacing_y <= 0.91 else "femur"
-    else:
-        if spacing_z <= 0.68:
-            return "pelvic" if physical_z_mm <= 193.55 else "femur"
-        else:
-            return "pelvic" if physical_z_mm <= 390.78 else "femur"
-
-
-def classify_pelvic_femur_v2(arr_clipped, spacing_zyx,
-                             spacing_x, spacing_y, spacing_z,
-                             physical_x_mm, physical_z_mm,
-                             hu_threshold=BONE_HU_THRESHOLD,
-                             min_component_voxels=BONE_MIN_COMPONENT_VOXELS,
-                             min_bone_size_voxels=BONE_MIN_COMPONENT_VOXELS):
-    """Bone-skeleton 기반 anatomy 라우팅 (V0.4).
-
-    spacing 기반 classify_pelvic_femur 가 case 163/189 처럼 spacing_z=0.80 인
-    pelvic small-FOV 케이스를 'femur' 로 잘못 라우팅해 zero output 을 내는 문제를
-    해결하기 위해, bone HU mask 로부터 Sacrum/LeftHip/RightHip 가 충분히 추출되면
-    'pelvic' 으로 강제한다. 그 외엔 기존 spacing 룰로 fallback.
-
-    Returns:
-        tuple[str, dict|None]:
-            ('pelvic', bone_masks dict)  — bone-skeleton 분해 성공시
-            (spacing-rule-result, None)  — fallback
-    """
-    try:
-        bone_masks = bone_skeleton_anatomy_decomposition(
-            arr_clipped, spacing_zyx,
-            hu_threshold=hu_threshold,
-            min_component_voxels=min_component_voxels,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log(f"classify_pelvic_femur_v2: bone decomposition failed ({exc}); falling back to spacing rule")
-        bone_masks = {}
-
-    # 충분한 크기의 hip/sacrum 가 2개 이상 추출됐는지 검사
-    candidate_keys = ('Sacrum', 'LeftHip', 'RightHip')
-    valid = 0
-    for k in candidate_keys:
-        m = bone_masks.get(k)
-        if m is not None and int(m.sum()) >= int(min_bone_size_voxels):
-            valid += 1
-    if valid >= 2:
-        log(f"classify_pelvic_femur_v2: bone-skeleton detected {valid} anatomies -> route=pelvic")
-        return "pelvic", bone_masks
-
-    fallback = classify_pelvic_femur(
-        spacing_x, spacing_y, spacing_z, physical_x_mm, physical_z_mm,
-    )
-    log(f"classify_pelvic_femur_v2: bone-skeleton insufficient ({valid} valid) -> spacing fallback={fallback}")
-    return fallback, None
 
 
 # ---------------------------------------------------------------------------
@@ -877,28 +806,21 @@ def estimate_fracture_inference_seconds(bbox, patch_size=(192, 160, 224), second
     return float(n_patches) * float(seconds_per_patch)
 
 
-def route_from_ds539_masks(ds539_masks: dict,
-                           ratio_threshold: float = FEMUR_PELVIC_RATIO_THRESHOLD
-                           ) -> tuple[str, tuple[str, ...]]:
-    """Ds539 argmax mask 의 femur/pelvic 부피 비율로 pelvic vs femur 라우팅.
+def route_from_ds539_masks(ds539_masks: dict) -> tuple[str, tuple[str, ...]]:
+    """Process EVERY anatomy whose Ds539 argmax mask is a substantial fraction of the largest
+    present mask. The genuinely-present anatomy is always kept (no misroute -> 0); a small
+    hallucination is dropped by the fraction gate, a sizable one becomes a minor FP, never a zero.
 
-    Ds539 는 부분-라벨 marginal 학습 때문에 pelvic 케이스에도 femur 채널을 환각하지만,
-    femur 대 pelvic 부피 비율(femur_vox / (sacrum+lefthip+righthip)_vox)은 두 그룹을
-    안정적으로 가른다(검증 ~90%). spacing 룰(~50%)보다 훨씬 신뢰도가 높다.
-
-    Returns:
-        (route, target_anatomies):
-            ('femur',  ('Femur',))                         — femur 케이스
-            ('pelvic', ('Sacrum','LeftHip','RightHip'))    — pelvic 케이스
+    [v1.3.3 note] An absolute-volume + confidence variant was prototyped and REJECTED on the
+    evidence: Ds539's softmax confidence does NOT separate a real bone from a confidently-painted
+    cross-group hallucination (both 0.97-0.99), and Ds539 anatomy masks for present bones are all
+    large (>100 cm^3) whether real or phantom — so no inference-side gate (relative or absolute)
+    can drop the LARGE cross-group phantom without dropping real bone. Pure absolute presence
+    additionally regressed femur-only cases (it kept small phantom pelvic bones the relative gate
+    drops). The cross-group false positive is a MODEL-level issue (Ds539's partial-label marginal
+    training) whose fundamental fix is retraining, not a routing threshold. Keep the validated
+    relative gate.
     """
-    # [2026-06-06] Single femur-vs-pelvic ratio gate was catastrophically brittle:
-    # Ds539's marginal training hallucinates the cross-group anatomy, and ~25% of
-    # cases (both directions) flipped past the 0.45 threshold -> the entire case
-    # routed to the WRONG set -> 0 score (verified e2e: 251/254 femur->pelvic,
-    # 011 pelvic->femur). Robust fix: process EVERY anatomy whose Ds539 mask is a
-    # substantial fraction of the largest present mask. The genuinely-present
-    # anatomy is always kept (no misroute -> 0); a small hallucination is dropped
-    # by the fraction gate, and a sizable one becomes a minor FP, never a zero.
     sizes = {a: int(ds539_masks[a].sum()) for a in ALL_ANATOMIES
              if a in ds539_masks and ds539_masks[a] is not None}
     biggest = max(sizes.values(), default=0)
@@ -1077,53 +999,13 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
             log(f"[{anatomy}] mask empty after CC filter, emit zero")
             continue
 
-        # FIX #2: pad 적용 후 bbox sanity check.
-        # mask 가 작더라도 tight-FOV 입력에서는 pad 가 추가되며 bbox 가 폭증할 수 있다.
-        # bbox 가 볼륨의 50% 를 넘으면 Ds538 추론이 매우 느려지고 결과 신뢰도가 떨어진다.
-        bbox_fraction = float(np.prod([bbox[i].stop - bbox[i].start for i in range(3)])) / float(np.prod(img_shape))
-        if bbox_fraction > SANITY_MAX_POSTPAD_BBOX_FRACTION:
-            log(f"[{anatomy}] bbox covers {bbox_fraction*100:.1f}% (>{SANITY_MAX_POSTPAD_BBOX_FRACTION*100:.0f}%); "
-                f"shrinking pad_vox to keep bbox under threshold")
-            # pad_vox 를 단계적으로 줄여가며 임계값 밑으로 떨어뜨린다
-            bbox_found = False
-            for shrunk_pad in (12, 6, 0):
-                bbox_try = bbox_from_mask(mask, pad_vox=shrunk_pad)
-                if bbox_try is None:
-                    continue
-                bbox_fraction_try = float(np.prod([bbox_try[i].stop - bbox_try[i].start for i in range(3)])) / float(np.prod(img_shape))
-                if bbox_fraction_try <= SANITY_MAX_POSTPAD_BBOX_FRACTION:
-                    log(f"[{anatomy}] shrunk pad_vox={shrunk_pad}, new bbox fraction={bbox_fraction_try*100:.1f}%")
-                    bbox = bbox_try
-                    bbox_fraction = bbox_fraction_try
-                    bbox_found = True
-                    break
-            if not bbox_found:
-                # V0.3.2 fix: 포기하기 전에 bone-skeleton mask 로 한 번 더 시도
-                bone_mask = bone_masks.get(anatomy)
-                if bone_mask is not None and bone_mask.any():
-                    # 가장 큰 CC 만 남기기
-                    if LARGEST_CC_KEEP_ONLY:
-                        import scipy.ndimage as _ndi
-                        bcc_labels, bcc_n = _ndi.label(bone_mask, structure=np.ones((3, 3, 3), dtype=bool))
-                        if bcc_n > 1:
-                            bcc_sizes = _ndi.sum(bone_mask, bcc_labels, index=np.arange(1, bcc_n + 1))
-                            keep_idx = int(np.argmax(bcc_sizes)) + 1
-                            bone_mask = (bcc_labels == keep_idx)
-                    bbox_bone = bbox_from_mask(bone_mask, pad_vox=ROI_PAD_VOX)
-                    if bbox_bone is not None:
-                        bbox_bone_fraction = float(np.prod([bbox_bone[i].stop - bbox_bone[i].start for i in range(3)])) / float(np.prod(img_shape))
-                        if bbox_bone_fraction <= SANITY_MAX_POSTPAD_BBOX_FRACTION:
-                            log(f"[{anatomy}] bone-skeleton fallback after bbox-sanity fail: bbox fraction {bbox_bone_fraction*100:.1f}%")
-                            mask = bone_mask
-                            bbox = bbox_bone
-                            bbox_fraction = bbox_bone_fraction
-                            info['source'] = 'bone_after_bbox_sanity_fail'
-                            # Ds538 입력의 mask 확률 채널을 다시 계산해 준다
-                            bbox_found = True
-                if not bbox_found:
-                    # pad=0 으로도 너무 크고 bone fallback 도 실패 — zero 로 처리
-                    log(f"[{anatomy}] even bone-skeleton bbox too large or absent; emit zero")
-                    continue
+        # [v1.3.3 ROB-3] The bbox>50% "sanity" band-aid was removed. It fired on CLEAN large
+        # anatomy in a tight FOV (e.g. a hip legitimately covering 53.6% of the volume), shrank
+        # the pad and ultimately swapped the soft Ds539 probability ROI for a hard 0/1 bone-HU
+        # mask — feeding Ds538 an out-of-distribution channel and degrading the decode. It only
+        # existed to bound the speckle-era garbage masks, which the v1.3.2 weight-load fix
+        # eliminated. The bbox keeps pad=24 with the soft probability channel; the time-budget
+        # gate below is the sole (and sufficient) guard against an oversized/slow crop.
 
         # 시간 예산 기반 sanity check (Grand Challenge 10분 제한 보호)
         eta = estimate_fracture_inference_seconds(bbox)

@@ -57,13 +57,13 @@ Two segmentation stages plus a deterministic post-processing step:
    bone whose core can speckle into spurious fragments), while the
    multi-fragment hips/femur keep the defaults.
 
-4. **4-layer robust pipeline** (Grand Challenge out-of-distribution defense)
-   - **L1** bone-skeleton anatomy decomposition (HU > 200 + 3D CC) — fallback
+4. **Robustness pipeline**
    - **L2** Ds539 argmax masks — mutually-exclusive anatomy assignment
-   - **L3** post-pad bbox sanity (≤ 50% of volume) — rejects OOD masks
-   - **L4** 480-second time budget — guarantees the 10-minute GC limit
+   - **L4** 480-second time budget — guarantees the 10-minute GC limit (sole crop guard)
 
    Per-anatomy routing is **robust** (V1.3): every Ds539-confident anatomy (>=20% of the largest present mask) is processed, replacing a brittle femur/pelvic volume-ratio gate that misrouted ~25% of cases to 0 (end-to-end fracture Dice 0.726->0.968).
+
+   > **[V1.3.3]** The speckle-era robustness band-aids (L1 bone-skeleton fallback, L3 "bbox > 50%" sanity) were defenses against the random-weight garbage that the V1.3.2 weight-load fix eliminated. The **L3 bbox-sanity** (`ROB-3`) was *removed*: it fired on clean large anatomy in a tight FOV and swapped the soft probability ROI for a hard bone mask (OOD decode). The time-budget gate (L4) is now the sole crop guard.
 
 At inference: Stage (1) gives per-anatomy masks; Stage (2) labels each masked
 anatomy with its ABBC field; Stage (3) decodes per-fragment instances; Stage (4)
@@ -123,9 +123,9 @@ github_repo/
 ```bash
 # 1. Push + tag the release
 git push origin main
-git tag v1.3.2 && git push origin v1.3.2
+git tag v1.3.3 && git push origin v1.3.3
 
-# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.3.2
+# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.3.3
 #    → wait for the server build to reach "Active"
 
 # 3. Upload model.tar.gz to the algorithm's "Models" tab
@@ -200,6 +200,7 @@ are identical to the baseline — only the algorithm differs.
 | **v1.3.0** | 2026-06-06 | Routing fix — process every Ds539-confident anatomy instead of a brittle femur/pelvic ratio gate (the gate misrouted ~25% of cases to the wrong set -> 0). e2e-verified mean fracture Dice 0.726->0.968; plus INPUT/OUTPUT dir env-override for the local e2e gate. | **0.799** | **0.919** |
 | **v1.3.1** | 2026-06-06 | Routing fix (v1.3.0) **plus self-diagnostic logging** — the container now logs the loaded network type (STUNet vs ResEnc), input raw-HU distribution, and each Ds539 anatomy's volume fraction with a GARBAGE flag, so a 0-score GC run self-diagnoses from the build/run log. | **0.799** | **0.919** |
 | **v1.3.2** | 2026-06-07 | **ROOT-CAUSE FIX of the prior ~0 GC scores.** The container pins `nnunetv2==2.5.1`, whose `initialize_from_trained_model_folder()` does **not** load the checkpoint into `predictor.network` (it defers to `perform_actual_prediction()`); our custom predict path bypasses that, so both stages ran with **random weights** → speckle anatomy → ~0. `build_predictor` now loads the weights explicitly (version-independent). Reproduced + verified on 2.5.1: `w0sum` 82.9 (random) → 104.03, Ds539 6812 → 2 CCs. Model unchanged. | **0.799** | **0.919** |
+| **v1.3.3** | 2026-06-07 | **Under-segmentation fix (inference-only, model unchanged).** Disable the non-Sacrum size-ratio merge (0.05→0.0) that collapsed real 1-11cm³ fragments (it had diverged from the validated offline eval). Sacrum keeps its 0.10 precision guard. Local instance proxy: recall 0.46→0.51, F1 0.50→0.55, split_error 0, precision held. Also removed a "bbox>50%" band-aid (ROB-3) + ~120 dead lines. | **0.799** | **0.919** |
 
 ---
 
