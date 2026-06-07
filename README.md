@@ -123,9 +123,9 @@ github_repo/
 ```bash
 # 1. Push + tag the release
 git push origin main
-git tag v1.3.1 && git push origin v1.3.1
+git tag v1.3.2 && git push origin v1.3.2
 
-# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.3.1
+# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.3.2
 #    → wait for the server build to reach "Active"
 
 # 3. Upload model.tar.gz to the algorithm's "Models" tab
@@ -199,6 +199,7 @@ are identical to the baseline — only the algorithm differs.
 | **v1.2.1** | 2026-06-06 | Identical code to v1.1 — tag pushed after re-binding the Grand Challenge GitHub link (the app reinstall had left a stale binding, so earlier v1.x tags never auto-built). | **0.799** | **0.919** |
 | **v1.3.0** | 2026-06-06 | Routing fix — process every Ds539-confident anatomy instead of a brittle femur/pelvic ratio gate (the gate misrouted ~25% of cases to the wrong set -> 0). e2e-verified mean fracture Dice 0.726->0.968; plus INPUT/OUTPUT dir env-override for the local e2e gate. | **0.799** | **0.919** |
 | **v1.3.1** | 2026-06-06 | Routing fix (v1.3.0) **plus self-diagnostic logging** — the container now logs the loaded network type (STUNet vs ResEnc), input raw-HU distribution, and each Ds539 anatomy's volume fraction with a GARBAGE flag, so a 0-score GC run self-diagnoses from the build/run log. | **0.799** | **0.919** |
+| **v1.3.2** | 2026-06-07 | **ROOT-CAUSE FIX of the prior ~0 GC scores.** The container pins `nnunetv2==2.5.1`, whose `initialize_from_trained_model_folder()` does **not** load the checkpoint into `predictor.network` (it defers to `perform_actual_prediction()`); our custom predict path bypasses that, so both stages ran with **random weights** → speckle anatomy → ~0. `build_predictor` now loads the weights explicitly (version-independent). Reproduced + verified on 2.5.1: `w0sum` 82.9 (random) → 104.03, Ds539 6812 → 2 CCs. Model unchanged. | **0.799** | **0.919** |
 
 ---
 

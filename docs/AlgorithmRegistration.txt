@@ -1,6 +1,6 @@
 ================================================================
 Grand Challenge - "Create Algorithm for Challenge" form fill
-PENGWIN 2026 Task 1 Submission (V1.3.1 STU-Net)
+PENGWIN 2026 Task 1 Submission (V1.3.2 STU-Net)
 ================================================================
 
 [Title] (single line, method identifier)

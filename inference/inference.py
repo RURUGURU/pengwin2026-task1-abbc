@@ -367,6 +367,18 @@ def build_predictor(dataset: str, trainer: str, plans: str, config: str,
         use_folds=(int(fold),),
         checkpoint_name=checkpoint_name,
     )
+    # CRITICAL (nnUNet version-independence): nnUNet 2.5.1 — the version pinned for the GC
+    # container — builds the network in initialize_from_trained_model_folder() but does NOT
+    # apply the checkpoint to predictor.network. It only stashes the weights in
+    # predictor.list_of_parameters and defers the load to perform_actual_prediction().
+    # Our custom inference path (_predict_custom_logits_from_preprocessed_data) reads
+    # predictor.network directly and never calls that method, so on 2.5.1 the network would
+    # run with its RANDOM initialization -> catastrophic speckle anatomy (tens of thousands
+    # of CCs) -> ~0 score. nnUNet 2.5.2+ loads at init (MIC-DKFZ/nnUNet#2520), which is why
+    # the local 2.5.2 env was clean while the 2.5.1 GC container scored 0. Load the trained
+    # weights into the network explicitly so this is correct on ANY nnUNet version.
+    if getattr(predictor, "list_of_parameters", None):
+        predictor.network.load_state_dict(predictor.list_of_parameters[0])
     # DIAG: confirm the RIGHT architecture (STUNet, not ResEnc) + non-random weights loaded.
     # A wrong/random network here is exactly the 73%-one-class / thousands-of-CC garbage signature.
     try:

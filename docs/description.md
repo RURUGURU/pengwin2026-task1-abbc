@@ -1,12 +1,20 @@
-% PENGWIN 2026 Task 1 — V1.3.1 STU-Net Two-Stage Submission
+% PENGWIN 2026 Task 1 — V1.3.2 STU-Net Two-Stage Submission
 % Algorithm Description
 % 2026-06-07
 
-> **V1.3.1** keeps the V1 STU-Net model and I/O contract unchanged, and adds two
-> container-side fixes over V1: (1) a **robust per-anatomy routing** that replaces
-> a brittle pelvic-vs-femur volume-ratio gate (which had misrouted ~25 % of cases
-> to a 0 score), and (2) **self-diagnostic logging** so any failed run explains
-> itself from the log. Model weights are identical to V1.
+> **V1.3.2** fixes the *actual* root cause of the earlier ~0 Grand-Challenge scores
+> and keeps the V1 STU-Net model and I/O contract unchanged. The GC container pins
+> `nnunetv2==2.5.1`, whose `initialize_from_trained_model_folder()` builds the network
+> but does **not** load the checkpoint into `predictor.network` (it defers the load to
+> `perform_actual_prediction()`). Our custom inference path reads `predictor.network`
+> directly and never triggers that deferred load, so **both stages ran with random
+> initialization** → speckle anatomy (tens of thousands of connected components) → ~0.
+> The local dev env happened to run nnUNet **2.5.2**, which *does* load at init
+> (MIC-DKFZ/nnUNet#2520), so the bug was invisible locally. V1.3.2 loads the trained
+> weights into the network **explicitly** in `build_predictor`, making inference correct
+> on any nnUNet version. It also retains the V1.3 robust per-anatomy routing and the
+> self-diagnostic logging (now including a per-stage weight checksum `w0sum`).
+> **Model weights are identical to V1.**
 
 # 0. Submission intent
 
@@ -85,15 +93,17 @@ fallback. L2) Ds539 argmax masks + the V1.3 multi-anatomy routing above.
 L3) post-pad bbox sanity (<= 50 % of volume) — rejects OOD masks. L4) 480 s time
 budget — guarantees the 10-minute GC limit. Largest-CC-keep per anatomy.
 
-# 7. Self-diagnostic logging  [new in V1.3.1]
+# 7. Self-diagnostic logging  [V1.3.1; w0sum diagnosis confirmed in V1.3.2]
 
 The container logs, every run: the **loaded network class** (STU-Net vs the
-plans' ResEnc — a wrong/random network is the classic 73%-one-class garbage
-signature) plus a weight checksum; the **input raw-HU distribution**
-(min/max/mean/percentiles, bone>200 and air<-500 fractions — detects an OOD or
-mis-calibrated input); and **each Ds539 anatomy's volume fraction with a GARBAGE
-flag** (>50 % one class). A 0-score run is therefore self-explaining from the GC
-build/run log.
+plans' ResEnc) plus a **weight checksum `w0sum`** (the abs-sum of the stem conv);
+the **input raw-HU distribution** (min/max/mean/percentiles, bone>200 and
+air<-500 fractions); and **each Ds539 anatomy's volume fraction with a GARBAGE
+flag**. This logging is what pinned the V1.3.2 root cause: `w0sum` was **different
+on every GC case** (≈80.5, 81.7) instead of the trained checkpoint's constant
+**104.03** — the signature of an *unloaded, randomly-initialised* network (see the
+header). The fix restores a constant `w0sum=104.03` (Ds539) / `194.38` (Ds538) on
+the GC container, so a 0-score run is self-explaining from the log.
 
 # 8. Performance (held-out, dev proxy)
 
