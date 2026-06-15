@@ -2,12 +2,18 @@
 """PENGWIN 2026 Task 1 — Training orchestrator.
 
 Subcommands:
-    train        Train active nnU-Net datasets (wraps nnUNetv2_train CLI)
+    train             Train an active dataset (wraps nnUNetv2_train CLI)
+    queue             Run the planned fold training queue
+    status            Summarize training logs and early-stop ETA
+    stunet-finetune   STU-Net warm-start fine-tune launcher (absorbed run_finetuning_stunet.py;
+                      forwards remaining args verbatim to nnU-Net, monkeypatching the pretrained loader)
+
+Active datasets: 539 (PelvicFemurAnatomyV3 anatomy) + 538 (PelvicFemurBICMFragmentV5 fracture).
+532/533/537 retired.
 
 Usage:
-    python train.py train 532 --gpu 0                     # PelvicAnatomyV2
-    python train.py train 533 --gpu 1                     # FemurAnatomyV2
-    python train.py train 537 --gpu 0 --trainer PengwinTrainer
+    python train.py train 539 --gpu 0                                 # anatomy
+    python train.py stunet-finetune 538 3d_fullres 0 -tr <ABBC trainer> -num_gpus 2   # fracture DDP
 
 Hard-mining/self-training orchestration was removed from the active workflow.
 """
@@ -46,15 +52,46 @@ def _write_json(path: Path, payload) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+def run_stunet_finetune(argv=None):
+    """STU-Net warm-start fine-tune 런처 (formerly run_finetuning_stunet.py).
+
+    목적
+    ----
+    nnU-Net 2.5.2 의 표준 `nnUNetv2_train` 은 pretrained 적재 시
+    `nnunetv2.run.run_training.load_pretrained_weights` 를 호출하는데, 이 기본 로더는
+    (1) STUNet 의 seg head 네이밍(`seg_outputs.*`)을 skip 하지 못하고(`.seg_layers.` 만 skip),
+    (2) 입력 채널 inflation 을 처리하지 못해 STUNet warm-start 에서 깨진다.
+
+    본 런처는 STU-Net 공식 run_finetuning_stunet.py 와 동일한 monkey-patch 방식으로,
+    표준 nnU-Net 학습 진입점(run_training_entry)을 그대로 쓰되 pretrained 로더만 우리
+    `model.load_stunet_pretrained_weights`(prefix 처리 + stem inflate + 안전 역직렬화)로
+    교체한다. 설치된 nnU-Net 파일은 건드리지 않는다.
+
+    사용 예 (인자는 전부 nnUNetv2_train / run_training_entry 와 동일하게 전달된다)
+    -------
+        PYTHONPATH=/workspace/code_task1 \
+        nnUNet_raw=.../result/raw nnUNet_preprocessed=.../result/preprocessed \
+        nnUNet_results=.../result/results \
+        python -m train stunet-finetune 539 3d_fullres 0 \
+            -tr PengwinTrainerSTUNetBaseAnatomyV301 \
+            -p nnUNetResEncUNetLPlans \
+            -pretrained_weights result/weights/stunet_base_TotalSeg.pth \
+            --npz [-num_gpus 2]
+    """
+    from unittest.mock import patch
+    import nnunetv2.run.run_training as _rt
+    from model import load_stunet_pretrained_weights
+
+    if argv is not None:
+        sys.argv = [sys.argv[0]] + list(argv)
+    # nnU-Net 의 run_training 네임스페이스에 import 된 load_pretrained_weights 를
+    # 우리 STUNet 로더로 교체. 시그니처(network, fname, verbose) 호환.
+    with patch.object(_rt, "load_pretrained_weights", load_stunet_pretrained_weights):
+        _rt.run_training_entry()
+
+
 PRETRAINED_DEFAULT = str(RESULT_WEIGHT / "pelvic_s1_swa.pth")
-PELVIC_FOUNDATION_DEFAULT = (
-    NN_RES / "Dataset532_PelvicAnatomyV2"
-    / "PengwinTrainer__nnUNetResEncUNetLPlans__3d_fullres"
-    / "fold_0" / "checkpoint_best.pth"
-)
-PELVIC_FOUNDATION_WEIGHTS_ONLY = RESULT_WEIGHT / "pretrained_ds532_fold0_network_weights_only.pth"
-NEED_INIT_FROM_PELVIC: set[int] = set()
-DEFAULT_FOLD0_ORDER = [532, 533]
+DEFAULT_FOLD0_ORDER = [538, 539]
 
 # Speed best practices for nnUNet training (reduces bottleneck on dual-GPU).
 # Applied automatically in train(); can be overridden via extra_env.
@@ -384,266 +421,13 @@ OVERSAMPLE_PROFILES = [
     "boundary_fragment_v3_sidecar_precision",
     "factorized_instance_v4_v163",
 ]
-TRAINERS = [
-    "PengwinTrainer",
-    "PengwinTrainerBICMFactorizedV6",
-    "PengwinTrainerBICMOracleAlignedDirectV250",
-    "PengwinTrainerBICMContactV8",
-    "PengwinTrainerBICMContactV9",
-    "PengwinTrainerBICMContactV10",
-    "PengwinTrainerBICMContactV11",
-    "PengwinTrainerBICMContactV12",
-    "PengwinTrainerBICMContactV13",
-    "PengwinTrainerBICMContactV14",
-    "PengwinTrainerBICMContactV15",
-    "PengwinTrainerBICMContactV16",
-    "PengwinTrainerBICMContactV17",
-    "PengwinTrainerBICMContactV18",
-    "PengwinTrainerBICMContactV19",
-    "PengwinTrainerBICMContactV20",
-    "PengwinTrainerBICMContactV22",
-    "PengwinTrainerBICMContactV23",
-    "PengwinTrainerBICMContactV24",
-    "PengwinTrainerBICMContactV25",
-    "PengwinTrainerBICMContactV26",
-    "PengwinTrainerBICMContactV27",
-    "PengwinTrainerBICMContactV28",
-    "PengwinTrainerBICMContactV29",
-    "PengwinTrainerBICMContactV30",
-    "PengwinTrainerBICMContactV31",
-    "PengwinTrainerBICMContactV32",
-    "PengwinTrainerBICMContactV34",
-    "PengwinTrainerBICMContactV35",
-    "PengwinTrainerBICMContactV36",
-    "PengwinTrainerBICMContactV37",
-    "PengwinTrainerBICMEdgeAffinityV38",
-    "PengwinTrainerBICMEdgePrimaryV39",
-    "PengwinTrainerBICMEdgeCoreV40",
-    "PengwinTrainerBICMInstanceCoreV41",
-    "PengwinTrainerBICMInstanceCoreV42",
-    "PengwinTrainerBICMEdgeContactV43",
-    "PengwinTrainerBICMEdgeLocalRankV44",
-    "PengwinTrainerBICMEdgeCandidateV45",
-    "PengwinTrainerBICMEdgeCurriculumV46",
-    "PengwinTrainerBICMSeparatedContactV47",
-    "PengwinTrainerBICMSupportAwareContactV48",
-    "PengwinTrainerBICMDecoderFeatureContactV49",
-    "PengwinTrainerBICMDecoderFeaturePhaseV50",
-    "PengwinTrainerBICMDenseEdgeCostV51",
-    "PengwinTrainerBICMDenseEdgeCoreV52",
-    "PengwinTrainerBICMFragmentMarkerCoreV53",
-    "PengwinTrainerBICMSparseHeadBalancedV54",
-    "PengwinTrainerBICMCalibratedSparseHeadV55",
-    "PengwinTrainerBICMPhasedMarkerContactV56",
-    "PengwinTrainerBICMDecoderFeatureMarkerPhaseV57",
-    "PengwinTrainerBICMHeatmapMarkerContactV58",
-    "PengwinTrainerBICMCorePreservingContactV59",
-    "PengwinTrainerBICMStrictCoreTopologyV60",
-    "PengwinTrainerBICMPeakSeedV61",
-    "PengwinTrainerBICMSemanticCandidateV66",
-    "PengwinTrainerBICMSemanticEdgePairV67",
-    "PengwinTrainerBICMSemanticTopologyV68",
-    "PengwinTrainerBICMTopologyCalibratedV69",
-    "PengwinTrainerBICMTopologyConsistencyV70",
-    "PengwinTrainerBICMEdgeCutPrimaryV71",
-    "PengwinTrainerBICMLogitCalibratedV72",
-    "PengwinTrainerBICMInstanceTopologyV73",
-    "PengwinTrainerBICMAdaptiveInstanceTopologyV74",
-    "PengwinTrainerBICMEdgePrecisionSeedTopologyV75",
-    "PengwinTrainerBICMGentleEdgePrecisionV76",
-    "PengwinTrainerBICMEdgeCurriculumV77",
-    "PengwinTrainerBICMCoreAnchoredEdgeCurriculumV78",
-    "PengwinTrainerBICMDuplicateSeedEdgeV79",
-    "PengwinTrainerBICMTopologyStateAdaptiveV80",
-    "PengwinTrainerBICMCoreStableEdgePrecisionV81",
-    "PengwinTrainerBICMSeedRecallEdgeSeparationV82",
-    "PengwinTrainerBICMSeedSafeEdgeCalibrationV83",
-    "PengwinTrainerBICMDualHeadContactCalibrationV84",
-    "PengwinTrainerBICMSemanticGateContactV85",
-    "PengwinTrainerBICMEvalBandEdgePrimaryV86",
-    "PengwinTrainerBICMEvalBandSemanticGateV87",
-    "PengwinTrainerBICMCorePreservingBandPrecisionV88",
-    "PengwinTrainerBICMBandFalseOnlyPrecisionV89",
-    "PengwinTrainerBICMSemanticBandProductV90",
-    "PengwinTrainerBICMTopologyAwareEdgeBalanceV91",
-    "PengwinTrainerBICMEvalAlignedSupportContactV93",
-    "PengwinTrainerBICMFinalRowCalibratedV94",
-    "PengwinTrainerBICMDecoderFeatureContactV95",
-    "PengwinTrainerBICMDenseBandGateV96",
-    "PengwinTrainerBICMPositiveDenseBandGateV97",
-    "PengwinTrainerBICMTeacherDistilledDenseGateV98",
-    "PengwinTrainerBICMAdaptiveDualMarginDenseGateV99",
-    "PengwinTrainerBICMNegativeBalancedDenseGateV100",
-    "PengwinTrainerBICMDualFieldProductGateV101",
-    "PengwinTrainerBICMDistanceRankDenseGateV102",
-    "PengwinTrainerBICMSemanticDistanceContactV103",
-    "PengwinTrainerBICMTeacherSemanticContactV104",
-    "PengwinTrainerBICMOffsetAssignmentV105",
-    "PengwinTrainerBICMOffsetAttractorV106",
-    "PengwinTrainerBICMRadialSupportOffsetV107",
-    "PengwinTrainerBICMWatershedBarrierV108",
-    "PengwinTrainerBICMPrecisionLockedRecallV109",
-    "PengwinTrainerBICMSemanticGeometryBridgeV110",
-    "PengwinTrainerBICMJointSupportProductV111",
-    "PengwinTrainerBICMEdgeGraphAssignmentV112",
-    "PengwinTrainerBICMAdaptiveBoundaryProductV113",
-    "PengwinTrainerBICMAdaptiveBoundaryProductV113HighLR",
-    "PengwinTrainerBICMEncoderAdapterV114",
-    "PengwinTrainerBICMSemanticOracleAdapterV115",
-    "PengwinTrainerBICMGraphCostSeparatorV116",
-    "PengwinTrainerBICMSupportGateSemanticContactV117",
-    "PengwinTrainerBICMWarmSupportGateSemanticContactV118",
-    "PengwinTrainerBICMAllNetworkAdaptiveBoundaryV119",
-    "PengwinTrainerBICMSameFragmentAffinityV120",
-    "PengwinTrainerBICMWarmSameFragmentAffinityV121",
-    "PengwinTrainerBICMWarmEdgeProductPrecisionV122",
-    "PengwinTrainerBICMHighRecallGateCleanupV123",
-    "PengwinTrainerBICMSupportConditionedEdgePrecisionV124",
-    "PengwinTrainerBICMSaturatedEdgeDenseGateV125",
-    "PengwinTrainerBICMLocalAdjacencyProductV126",
-    "PengwinTrainerBICMLocalAdjacencyProductV126FromV96",
-    "PengwinTrainerBICMEdgeResetLocalAdjacencyProductV127",
-    "PengwinTrainerBICMSupportBridgeSuppressionV128",
-    "PengwinTrainerBICMAffinitySharpeningV129",
-    "PengwinTrainerBICMSupportTopologyRepairV130",
-    "PengwinTrainerBICMAllNetworkSupportTopologyRepairV131",
-    "PengwinTrainerBICMSupportVetoGateV132",
-    "PengwinTrainerBICMSupportVetoSemanticV133",
-    "PengwinTrainerBICMSupportVetoGateHighLRV134",
-    "PengwinTrainerBICMSupportVetoGateUltraLRV135",
-    "PengwinTrainerBICMSupportTopologyHighLRV136",
-    "PengwinTrainerBICMSupportTopologyUltraLRV137",
-    "PengwinTrainerBICMSupportTopologyMidLRV138",
-    "PengwinTrainerBICMSupportTopologyUpperMidLRV139",
-    "PengwinTrainerBICMSupportTopologyLowBracketLRV140",
-    "PengwinTrainerBICMSupportTopologyHighBracketLRV141",
-    "PengwinTrainerBICMSupportTopologyCoreSeedLowLRV142",
-    "PengwinTrainerBICMSupportTopologyCoreSeedMidLRV143",
-    "PengwinTrainerBICMStrongCoreSeedLowLRV144",
-    "PengwinTrainerBICMStrongCoreSeedMidLRV145",
-    "PengwinTrainerBICMFragmentSeedPresenceLowLRV146",
-    "PengwinTrainerBICMFragmentSeedPresenceMidLRV147",
-    "PengwinTrainerBICMCoreHeatmapSeedLowLRV148",
-    "PengwinTrainerBICMCoreHeatmapSeedMidLRV149",
-    "PengwinTrainerBICMCoreOnlyHeatmapSeedMidLRV150",
-    "PengwinTrainerBICMCoreOnlyHeatmapSeedHighLRV151",
-    "PengwinTrainerBICMCoreOnlyCenterSeedMidLRV152",
-    "PengwinTrainerBICMCoreHeatmapCenterSeedMidLRV153",
-    "PengwinTrainerBICMCoreOnlyCenterSeedSamplerV154",
-    "PengwinTrainerBICMCoreHeatmapCenterSeedSamplerV155",
-    "PengwinTrainerBICMCoreOnlyCenterSeedAffinitySamplerV158",
-    "PengwinTrainerBICMCoreHeatmapCenterSeedAffinitySamplerV159",
-    "PengwinTrainerBICMCoreOnlyCenterSeedOffsetSamplerV160",
-    "PengwinTrainerBICMCoreHeatmapCenterSeedOffsetSamplerV161",
-    "PengwinTrainerBICMBoundaryFragmentRemapV162",
-    "PengwinTrainerFactorizedInstanceEmbeddingV163",
-    "PengwinTrainerBoundaryFragmentSidecarV164",
-    "PengwinTrainerBoundaryFragmentSidecarPrecisionV165",
-    "PengwinTrainerBoundaryFragmentSidecarCoreSeedV166",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRidgeV167",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRidgeHighEdgeV168",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallRidgeV169",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallMassCapV170",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallTightMassCapV171",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallPositiveMassCapV172",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftPositiveMassCapV173",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallVerySoftPositiveMassCapV174",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftMassCapStableScoreV175",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallVerySoftMassCapStableScoreV176",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftMassCapStrictStableV177",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallVerySoftMassCapStrictStableV178",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallLogitCalibratedV179",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallPrecisionLogitCalibratedV180",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallShellContrastV181",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallStrongShellContrastV182",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallBinaryBarrierHeadV183",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallPrecisionBinaryBarrierHeadV184",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallPositiveFloorBinaryBarrierHeadV185",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallPositiveFloorMassCapBinaryBarrierHeadV186",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateBinaryBarrierHeadV187",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateMassCapBinaryBarrierHeadV188",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateSoftRidgeBarrierHeadV189",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateSoftRidgeContrastBarrierHeadV190",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateLogitRidgeBarrierHeadV191",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallCandidateLogitRidgePrecisionBarrierHeadV192",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBinaryBarrierHeadV193",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateMassCapBarrierHeadV194",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateWeakMassCapBarrierHeadV195",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftDenseCandidateBarrierHeadV196",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateLongProbeV197",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateLowLRLongProbeV198",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactV199",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreRecallV200",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBarrierContrastV205",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallSoftDenseCandidateBarrierContrastV206",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCoverageOpenV209",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCoverageGuardedV210",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateInstanceCoreGuardV213",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateInstanceCoreStrongGuardV214",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateBalancedContactV215",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateFragmentPeakCoreV216",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateWeakFragmentMassCoreV217",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateLooseFragmentMassCoreV218",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025WeakPeakCompactV219",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCompactV220",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakBalancedContactV241",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakTightBalancedContactV242",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakSoftContactRidgeV243",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakPrecisionSoftContactRidgeV244",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakContactShellContrastV245",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakStrongContactShellContrastV246",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakDecoderContactV247",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakXYZAffinityV248",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakAffinity13SeedHealedV253",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakAffinity13ContactHardNegativeSeedHealedV254",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedHealedV255",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SupportLeakGuardSeedHealedV256",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedStableSupportLeakGuardSeedHealedV257",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedPeakSupportLeakGuardSeedHealedV258",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13SeedPeakBodySupportLeakGuardSeedHealedV259",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakMutex13FractureSeedCalibratedSupportLeakGuardSeedHealedV260",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakPairwiseSoftmaxMutex13SeedHealedV266",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxMutex13SeedHealedV268",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxSeedHealedV273",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactPairwiseSoftmaxSeedCalibratedV274",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordPairwiseV284",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFragmentPositionV275",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFragmentPositionDiceV276",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSeparatorGapV277",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSeparatorEnergyV278",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSeparatorSoftmaxV287",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV288",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSDFV289",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSDFFDMV290",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCV291",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterFlowV261",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterPeakFlowV262",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakCenterPeakFlowCalibratedV263",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakDenseCenterHeatmapFlowCalibratedV264",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakTopologyConstrainedCenterHeatmapFlowCalibratedV265",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCenterHeatmapFlowV267",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSpatialEmbeddingV270",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactSpatialEmbeddingContrastiveV271",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactCoordSpatialEmbeddingV279",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskV280",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactQueryMaskPositiveNegativeV281",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordQueryMaskV285",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordQueryMaskPositiveNegativeV286",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactFreeEmbeddingV282",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactGlobalCoordFreeEmbeddingV283",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakCompactV221",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025ContactPreservePeakCompactV222",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakCoverageCompactV223",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025OriginalContactMidPeakCompactV224",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakContactCapCompactV226",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakTightContactCapCompactV227",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakSupportSeedCompactV230",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025MidPeakConservativeCoreTailCompactV231",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateSeedHeadV201",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactSeedHeadV202",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateSparseSeedHeadV203",
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCoreCompactSparseSeedHeadV204",
-]
+# [cleanup 2026-06-07] TRAINERS is derived from the actual PengwinTrainer* classes in `core`
+# (the single source of truth). The old hand-maintained list had drifted to 258 entries —
+# ~235 phantom (no such class) AND missing the active STU-Net trainers — so `--trainer
+# <active>` failed argparse validation and the list misled anyone reading it. dir(core)
+# is always correct.
+import core as _core_mod
+TRAINERS = sorted(n for n in dir(_core_mod) if n.startswith("PengwinTrainer"))
 
 
 def _resolve_training_profiles(trainer: str,
@@ -652,10 +436,11 @@ def _resolve_training_profiles(trainer: str,
                                oversample_profile: str | None) -> tuple[str, str, str]:
     """Apply trainer-specific defaults without changing explicit user choices."""
     # The active STU-Net trainers resolve their loss profile inside the
-    # trainer class (core._build_loss); the live launcher is
-    # run_finetuning_stunet.py. Every legacy per-trainer branch (252 dead
-    # versions) was removed — explicit user choices pass through, else
-    # generic defaults below.
+    # trainer class (core._build_loss); the live launcher is the
+    # `stunet-finetune` subcommand / run_stunet_finetune() in this module
+    # (formerly run_finetuning_stunet.py). Every legacy per-trainer branch
+    # (252 dead versions) was removed — explicit user choices pass through,
+    # else generic defaults below.
     return (
         loss_profile or "dc_ce",
         ce_class_weights or "off",
@@ -664,7 +449,10 @@ def _resolve_training_profiles(trainer: str,
 
 
 def _dataset_input_channels(ds_id: int) -> int:
-    dataset_json = Path(os.environ.get("nnUNet_raw", str(Path("/workspace/nnunet/raw")))) / DATASETS[ds_id]["name"] / "dataset.json"
+    # core.configure_nnunet_env() normally sets nnUNet_raw on import; the fallback resolves the
+    # real layout (<root>/code_task1/result/raw) from this file's location, not a hardcoded path.
+    _raw_default = Path(__file__).resolve().parent / "result" / "raw"
+    dataset_json = Path(os.environ.get("nnUNet_raw", str(_raw_default))) / DATASETS[ds_id]["name"] / "dataset.json"
     if not dataset_json.exists():
         return 1
     try:
@@ -674,62 +462,6 @@ def _dataset_input_channels(ds_id: int) -> int:
         return 1
 
 
-def _pelvic_foundation_init_path(target_input_channels: int = 1) -> Path | None:
-    """Return the preferred Dataset532 checkpoint for explicit warm-start tests."""
-    if PELVIC_FOUNDATION_DEFAULT.exists():
-        return _ensure_weights_only_pretrained(PELVIC_FOUNDATION_DEFAULT, target_input_channels=target_input_channels)
-    fallback = Path(PRETRAINED_DEFAULT)
-    if fallback.exists():
-        return _ensure_weights_only_pretrained(fallback, target_input_channels=target_input_channels)
-    return None
-
-
-def _ensure_weights_only_pretrained(src: Path, target_input_channels: int = 1) -> Path:
-    """Create a PyTorch-2.6-safe pretrained file containing network weights only.
-
-    nnU-Net 2.5.x calls `torch.load(fname)` in its pretrained loader. In recent
-    PyTorch versions that defaults to `weights_only=True`, which rejects older
-    nnU-Net checkpoints carrying numpy scalars in optimizer/logger metadata.
-    The local Dataset532 checkpoint is trusted, so we load it once with
-    `weights_only=False`, strip everything except `network_weights`, and save a
-    minimal tensor-only file that nnU-Net can safely consume.
-    """
-    target_input_channels = int(target_input_channels)
-    out_path = (
-        PELVIC_FOUNDATION_WEIGHTS_ONLY
-        if target_input_channels == 1
-        else RESULT_WEIGHT / f"pretrained_ds532_fold0_network_weights_only_in{target_input_channels}.pth"
-    )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if (
-        out_path.exists()
-        and out_path.stat().st_mtime >= src.stat().st_mtime
-    ):
-        return out_path
-    import torch
-
-    ckpt = torch.load(str(src), map_location="cpu", weights_only=False)
-    if "network_weights" not in ckpt:
-        raise KeyError(f"pretrained checkpoint missing network_weights: {src}")
-    weights = dict(ckpt["network_weights"])
-    if target_input_channels > 1:
-        # nnU-Net stores the first encoder convolution twice for this network
-        # wrapper (`encoder.*` and `decoder.encoder.*`). Expand every matching
-        # 1-channel stem tensor so the official loader can keep its strict
-        # all-non-head-shapes-must-match contract.
-        for key, tensor in list(weights.items()):
-            if (
-                not key.endswith(("stem.convs.0.conv.weight", "stem.convs.0.all_modules.0.weight"))
-                or getattr(tensor, "ndim", 0) != 5
-                or int(tensor.shape[1]) != 1
-            ):
-                continue
-            expanded = tensor.new_zeros((tensor.shape[0], target_input_channels, *tensor.shape[2:]))
-            expanded[:, 0:1] = tensor
-            expanded[:, 1:] = tensor.mean(dim=1, keepdim=True) * 0.05
-            weights[key] = expanded
-    torch.save({"network_weights": weights}, str(out_path))
-    return out_path
 
 
 # =============================================================================
@@ -815,16 +547,6 @@ def train(ds_id: int, fold: int = 0, gpu: int = 0,
             )
         cmd.append("--c")
         init_weights = None
-    if init_weights is None and not continue_training and ds_id in NEED_INIT_FROM_PELVIC:
-        init_path = _pelvic_foundation_init_path(target_input_channels=_dataset_input_channels(ds_id))
-        if init_path is not None:
-            init_weights = str(init_path)
-            print(f"[train] auto-init from {init_weights}")
-        else:
-            print(
-                "[train] no Dataset532 checkpoint_best or fallback pretrained "
-                f"weights at {PRETRAINED_DEFAULT}, training from scratch"
-            )
     if init_weights:
         cmd += ["-pretrained_weights", str(init_weights)]
 
@@ -1022,10 +744,6 @@ def _start_train_for_queue(ds_id: int, fold: int, gpu: int,
         "-tr", trainer, "-p", plans,
     ]
     init_weights = None
-    if ds_id in NEED_INIT_FROM_PELVIC:
-        init_path = _pelvic_foundation_init_path(target_input_channels=_dataset_input_channels(ds_id))
-        if init_path is not None:
-            init_weights = str(init_path)
     if init_weights:
         cmd += ["-pretrained_weights", init_weights]
 
@@ -1345,6 +1063,13 @@ def training_status(ds_id: int = 532,
 # CLI
 # =============================================================================
 def main():
+    # `stunet-finetune` forwards ALL remaining args verbatim to nnU-Net's
+    # run_training_entry (which has its own parser using -tr/-p/-pretrained_weights
+    # style flags), so it is intercepted before our argparse to avoid clashing.
+    if len(sys.argv) > 1 and sys.argv[1] == "stunet-finetune":
+        run_stunet_finetune(sys.argv[2:])
+        return
+
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
 

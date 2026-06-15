@@ -42,7 +42,7 @@ from utils import (
 )
 # Registry single source: generic fragment loops use the FULL view (femur shown
 # when present); the Ds537 per-anatomy ROI viz stays pelvic_only by design.
-from anatomy_registry import (
+from utils import (
     MIN_INSTANCE_ID,
     MAX_INSTANCE_ID,
     anatomy_ranges_by_name,

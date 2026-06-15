@@ -59,7 +59,7 @@ from utils import (
 # Registry single-source helpers. Active decode/scoring uses the FULL (femur-
 # inclusive) view; legacy per-version oracle proxies stay 3-anatomy via the
 # explicit pelvic_only=True view (intent visible, not hidden behind a magic 150).
-from anatomy_registry import (
+from utils import (
     NUM_ANATOMIES,
     MIN_INSTANCE_ID,
     PELVIC_MAX_INSTANCE_ID,
@@ -209,7 +209,7 @@ def run_boundary_fragment_eval(cases: list[str],
     result = {
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "mode": "boundary_fragment_v3_oracle" if oracle else "boundary_fragment_v3_prediction",
-        "dataset": DATASETS[537]["name"],
+        "dataset": DATASETS[538]["name"],
         "decoder_profile": decoder_profile,
         "target_profile": target_profile,
         "contact_band_mm": float(contact_band_mm),
@@ -734,6 +734,7 @@ def compute_task1_official_aligned_v2_metrics(pred_instances: np.ndarray,
                 "present": False,
                 "gt_instance_count": 0,
                 "pred_instance_count": n_pred,
+                "fracture_iou_per_fragment": None,
                 "fracture_dice_per_fragment": None,
                 "local_dice_per_fragment_20mm": None,
                 "hd95_mm_per_fragment": None,
@@ -754,6 +755,7 @@ def compute_task1_official_aligned_v2_metrics(pred_instances: np.ndarray,
 
         # fragment별 surface metric (Dice/HD95/ASSD)과 local Dice를 계산한다.
         dice_values: list[float | None] = []
+        iou_values: list[float | None] = []   # fracture-wise IoU (IoU-F) — the OFFICIAL headline metric
         hd95_values: list[float | None] = []
         assd_values: list[float | None] = []
         local_dice_values: list[float | None] = []
@@ -775,6 +777,11 @@ def compute_task1_official_aligned_v2_metrics(pred_instances: np.ndarray,
             pred_mask = np.zeros_like(gt_mask, dtype=bool) if pid is None else (pred_part == int(pid))
             surf = _per_fragment_hd95_assd(gt_mask, pred_mask, spacing_zyx)
             dice_values.append(surf.get("dice"))
+            # fracture-wise IoU (IoU-F): the PENGWIN official headline metric. Over-segmentation
+            # (a GT fragment split across pred ids) drives the matched IoU down harder than Dice.
+            _inter = float((gt_mask & pred_mask).sum())
+            _union = float((gt_mask | pred_mask).sum())
+            iou_values.append((_inter / _union) if _union > 0 else 0.0)
             hd95_values.append(surf.get("hd95_mm"))
             assd_values.append(surf.get("assd_mm"))
             local_gt = gt_mask & local_band
@@ -831,6 +838,7 @@ def compute_task1_official_aligned_v2_metrics(pred_instances: np.ndarray,
             "present": True,
             "gt_instance_count": n_gt,
             "pred_instance_count": n_pred,
+            "fracture_iou_per_fragment": _mean_skip_none(iou_values),
             "fracture_dice_per_fragment": _mean_skip_none(dice_values),
             "local_dice_per_fragment_20mm": _mean_skip_none(local_dice_values),
             "hd95_mm_per_fragment": _mean_skip_none(hd95_values),
@@ -863,6 +871,7 @@ def compute_task1_official_aligned_v2_metrics(pred_instances: np.ndarray,
 
     cohort_macro = {
         "present_anatomies": list(present),
+        "fracture_iou": _macro("fracture_iou_per_fragment"),   # IoU-F — OFFICIAL headline
         "fracture_dice": _macro("fracture_dice_per_fragment"),
         "local_dice_20mm": _macro("local_dice_per_fragment_20mm"),
         "hd95_mm": _macro("hd95_mm_per_fragment"),
@@ -911,13 +920,6 @@ def compute_task1_official_aligned_v2_metrics(pred_instances: np.ndarray,
 
 
 
-TASK1_V252_AFFINITY13_OFFSETS: tuple[tuple[int, int, int], ...] = (
-    (0, 0, 1),
-    (0, 1, -1), (0, 1, 0), (0, 1, 1),
-    (1, -1, -1), (1, -1, 0), (1, -1, 1),
-    (1, 0, -1), (1, 0, 0), (1, 0, 1),
-    (1, 1, -1), (1, 1, 0), (1, 1, 1),
-)
 
 TASK1_V288_OUTPUT_CHANNELS = 4
 
@@ -1196,7 +1198,7 @@ def _aggregate_task1_v2_samples(per_sample: list[dict[str, Any]]) -> dict[str, A
     """Macro-average per-sample official-aligned v2 metrics across held-out val
     samples, with a per-anatomy breakdown. Each sample is one held-out
     (case, anatomy) ROI scored against that anatomy's GT fragments only."""
-    mean_keys = ["fracture_dice", "local_dice_20mm", "hd95_mm", "assd_mm",
+    mean_keys = ["fracture_iou", "fracture_dice", "local_dice_20mm", "hd95_mm", "assd_mm",
                  "instance_recall", "instance_precision", "instance_f1", "topology_consistency"]
 
     def _macro(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1265,6 +1267,18 @@ def run_task1_abbc_eval(*,
     )
     predictor.initialize_from_trained_model_folder(
         str(model_dir), use_folds=(int(fold),), checkpoint_name=checkpoint)
+    # [CRITICAL 2026-06-08] nnUNet 2.5.1 (pinned) does NOT load weights into predictor.network at
+    # init — it stashes them in list_of_parameters and defers the load to perform_actual_prediction.
+    # Our custom predict (_predict_custom_logits_from_preprocessed_data) reads predictor.network
+    # DIRECTLY, so without this explicit load the eval runs a RANDOM network -> speckle -> ~0 score
+    # (the exact GC 0-point bug; this eval previously "worked" only on 2.5.2 which loads at init).
+    if getattr(predictor, "list_of_parameters", None):
+        predictor.network.load_state_dict(predictor.list_of_parameters[0])
+    try:
+        _w0 = float(list(predictor.network.parameters())[0].detach().float().abs().sum().cpu())
+        print(f"[abbc-eval] NET={type(predictor.network).__name__} w0sum={_w0:.3f} (loaded; ~random if <95)")
+    except Exception:
+        pass
 
     gt_cache: dict[str, tuple[np.ndarray, tuple]] = {}
     per_sample: list[dict[str, Any]] = []
@@ -1430,6 +1444,7 @@ def _predict_custom_logits_from_preprocessed_data(predictor: Any,
     # dead V-version channel counts; the active call (run_task1_abbc_eval, output_channels=
     # TASK1_V288_OUTPUT_CHANNELS=4) passed ONLY because BICM_V6_OUTPUT_CHANNELS also == 4.
     # Pin it explicitly to the active ABBC contract so removing the dead constants cannot break it.
+    # 4 = ABBC export (the only active head; the retired 9-channel affinity arm was removed 2026-06-10).
     allowed = {int(TASK1_V288_OUTPUT_CHANNELS)}
     if int(output_channels) not in allowed:
         raise ValueError(f"unsupported custom output_channels={output_channels}; allowed={sorted(allowed)}")
@@ -1548,32 +1563,6 @@ def _resize_channel_first_probabilities(probs: np.ndarray, target_shape: tuple[i
     return np.clip(resized, 0.0, 1.0).astype(np.float32, copy=False)
 
 
-class _BICMDisjointSet:
-    """Small union-find for V112 edge-graph decoder diagnostics."""
-
-    def __init__(self, size: int):
-        self.parent = np.arange(int(size), dtype=np.int32)
-        self.rank = np.zeros(int(size), dtype=np.uint8)
-
-    def find(self, value: int) -> int:
-        parent = self.parent
-        value = int(value)
-        while int(parent[value]) != value:
-            parent[value] = parent[int(parent[value])]
-            value = int(parent[value])
-        return value
-
-    def union_many(self, left: np.ndarray, right: np.ndarray) -> None:
-        for a, b in zip(left.tolist(), right.tolist()):
-            ra = self.find(int(a))
-            rb = self.find(int(b))
-            if ra == rb:
-                continue
-            if self.rank[ra] < self.rank[rb]:
-                ra, rb = rb, ra
-            self.parent[rb] = ra
-            if self.rank[ra] == self.rank[rb]:
-                self.rank[ra] += 1
 
 
 

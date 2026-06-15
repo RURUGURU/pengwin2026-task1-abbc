@@ -38,7 +38,7 @@ from scipy import ndimage as ndi
 # guard becomes "<= MAX_INSTANCE_ID", which spans Femur (151-200). This is a safe
 # superset — pelvic ROIs hold no 151-200 voxels, femur ROIs are no longer dropped.
 # NOTE: "150" inside class names (BICMV150...) is a version tag, NOT an instance id.
-from anatomy_registry import MAX_INSTANCE_ID
+from utils import MAX_INSTANCE_ID
 
 
 class BoundaryFragmentV3Loss(nn.Module):
@@ -4009,7 +4009,7 @@ class BoundaryFragmentV3RidgeFitDeepSupervisionWrapper(nn.Module):
 
 
 class BICMV5SparseLoss(nn.Module):
-    """Sparse core/contact objective for Dataset537 BICM V5.
+    """Sparse core/contact objective for Dataset538 BICM V5.
 
     V5 deliberately keeps the output as a normal 5-class nnU-Net semantic head:
     `0 background, 1 exterior_context, 2 shell, 3 core, 4 contact_surface`.
@@ -4161,7 +4161,7 @@ class BICMV5SparseLoss(nn.Module):
 
 
 class BICMV5SupportGeometryLoss(nn.Module):
-    """Support-geometry objective for Dataset537 BICM V5.
+    """Support-geometry objective for Dataset538 BICM V5.
 
     The V5.4 oracle-hybrid diagnostic showed that deterministic seed healing
     can remove core component explosion, but IoU-F remains poor when predicted
@@ -5239,7 +5239,7 @@ class ContactEnergyLoss3D(nn.Module):
 class ContactFuseLoss3D(ContactEnergyLoss3D):
     """Contact-LegacyFuse objective with explicit hard-negative supervision.
 
-    Dataset537 adds class 4 (`contact_hard_negative`) for voxels where contact
+    Dataset538 adds class 4 (`contact_hard_negative`) for voxels where contact
     false positives are especially damaging: outside-pelvis bone-like CT,
     foundation leakage, and non-contact cortical surfaces. The class is not a
     decoder fragment. It exists to teach the contact head where *not* to build
@@ -5537,6 +5537,77 @@ def _smoke_test():
     print(f"  compute_class_weights: weights={w} (mean={w.mean():.3f})  ✓")
 
     print("[loss.py smoke] OK")
+
+
+class LeakFreeInstanceABBCLoss(nn.Module):
+    """Leak-free instance-label ABBC loss (boundary-weighted) — the working Phase-1 base loss. NO conn.
+
+    Reads the nnUNet seg-label AS the per-anatomy fragment instance map (1..K; -1=nnUNet ignore, 0=bg)
+    — NO sidecar, NO anatomy-context channel. Builds the validated ABBC 4-class target
+    [bg,border,boundary,core] on the fly (reusing the V288/V277 classmethods) and trains the 4-channel
+    head with valid-masked CE + foreground Dice, boundary class up-weighted (boundary is only ~5% of
+    support voxels). The real submission decoder (decode_task1_v288_abbc: core-seed watershed REGROW +
+    small-CC merge) turns this field into instances.
+
+    SUPERSEDES the retired InstanceConnectivityABBCLoss: the loss-level merge/split topology penalty was
+    mis-scaled (~25x the base — raw conn ~8.5 vs base ~0.32 at boost=8) and collapsed training the
+    instant it ramped in. Under the real decoder the plain ABBC head reaches held-out instance-F1 ~0.85,
+    so the connectivity term was both unstable AND unnecessary. docs/Plan.md Phase 1 ·
+    [[pengwin-instance-label-nosidecar]]. Env: PENGWIN_ABBC_BOUNDARY_WEIGHT (default 5.0).
+    """
+
+    NUM_CLASSES = 4
+    BG, BORDER, BOUNDARY, CORE = 0, 1, 2, 3
+    BOUNDARY_DILATE_VOX = 2
+    CORE_ERODE_VOX = 2
+    _ABBC = BoundaryFragmentV3Core025StrongPeakNoContactABBCV288HeadLoss
+
+    def __init__(self):
+        super().__init__()
+        self.boundary_class_weight = float(os.environ.get("PENGWIN_ABBC_BOUNDARY_WEIGHT", "5.0"))
+        if self.boundary_class_weight <= 0.0:
+            raise ValueError(f"boundary_class_weight must be > 0, got {self.boundary_class_weight}")
+
+    @staticmethod
+    def _as_full_res(x):
+        return x[0] if isinstance(x, (list, tuple)) else x
+
+    def _split_instance(self, target):
+        """Return (instance>=0 [B,Z,Y,X] long, ignore mask bool). -1 (nnUNet ignore) -> ignore+bg."""
+        t = self._as_full_res(target)
+        if t.ndim == 5 and int(t.shape[1]) == 1:
+            t = t[:, 0]
+        t = t.long()
+        ignore = t < 0
+        return t.clamp_min(0), ignore
+
+    def _dice_ce(self, logits, class_target, valid, class_weight):
+        ce_map = F.cross_entropy(logits, class_target, weight=class_weight, reduction="none")
+        ce = ce_map[valid].mean() if bool(valid.any()) else logits.sum() * 0.0
+        probs = torch.softmax(logits, dim=1)
+        oh = F.one_hot(class_target, num_classes=self.NUM_CLASSES).permute(0, 4, 1, 2, 3).float()
+        vmask = valid.unsqueeze(1).float()
+        probs = probs * vmask
+        oh = oh * vmask
+        dims = (0, 2, 3, 4)
+        inter = (probs * oh).sum(dims)
+        denom = probs.sum(dims) + oh.sum(dims)
+        dice = (2 * inter + 1e-5) / (denom + 1e-5)
+        dice_loss = 1.0 - dice[1:].mean()  # foreground classes (border/boundary/core)
+        return ce + dice_loss
+
+    def forward(self, pred_logits, target):
+        logits = self._as_full_res(pred_logits)
+        instance, ignore = self._split_instance(target)
+        valid = ~ignore
+        class_target, _support = self._ABBC._abbc_class_target(
+            instance, boundary_dilate_vox=self.BOUNDARY_DILATE_VOX, core_erode_vox=self.CORE_ERODE_VOX)
+        cw = torch.ones(self.NUM_CLASSES, device=logits.device)
+        cw[self.BOUNDARY] = self.boundary_class_weight
+        base = self._dice_ce(logits, class_target, valid, cw)
+        if not torch.isfinite(base):
+            raise ValueError(f"LeakFreeInstanceABBCLoss produced non-finite loss: {float(base.detach().cpu())}")
+        return base
 
 
 if __name__ == "__main__":

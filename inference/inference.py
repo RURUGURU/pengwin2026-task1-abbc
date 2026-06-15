@@ -83,14 +83,15 @@ DS539_CONFIG = "3d_fullres"
 DS539_FOLD = 0
 DS539_OUTPUT_CHANNELS = 5  # background, Sacrum, LeftHip, RightHip, Femur
 
-# --- Dataset538 (STU-Net): anatomy 별 ABBC instance segmenter (V301). ---
-#     ABBC 헤드는 V291 과 동일(0=background,1=border/exterior,2=boundary/interior,3=core)
-#     이므로 inline core-seed watershed decode 를 그대로 재사용한다.
+# --- Dataset538 (STU-Net): anatomy 별 ABBC instance segmenter (V302, leak-free). ---
+#     [v1.4] LEAK-FREE: V302 trainer = CT-ONLY 1-channel input (the old sidecar trainer fed a
+#     3-channel [CT, Ds539-anatomy-prob, SDF] tensor — the anatomy-prob channel was Stage-A→B
+#     leakage). V302 drops it; Stage-B input is now just the bone-LUT CT crop. ABBC 4-class head
+#     is identical (0=bg,1=border,2=boundary,3=core) so the inline core-seed watershed decode is
+#     reused unchanged. Localization bbox still comes from the Ds539 anatomy prob (routing, not a
+#     model input channel — that is legitimate cascade routing, not leakage).
 DS538_DATASET = "Dataset538_PelvicFemurBICMFragmentV5"
-DS538_TRAINER = (
-    "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025"
-    "StrongPeakNoContactABBCSTUNetBV301"
-)
+DS538_TRAINER = "PengwinTrainerSTUNetBaseABBCPhase1V302"
 DS538_PLANS = "nnUNetResEncUNetLPlans"
 DS538_CONFIG = "3d_fullres"
 DS538_FOLD = 0
@@ -142,7 +143,9 @@ TIME_BUDGET_HARD_LIMIT = 540.0   # 9분: 이 시점 이후로는 남은 anatomy 
 BONE_HU_THRESHOLD = 200.0
 BONE_MIN_COMPONENT_VOXELS = 10000
 SANITY_MAX_BBOX_FRACTION = 0.35
-LARGEST_CC_KEEP_ONLY = True  # 가장 큰 CC 만 유지해 25개 슬롯이 노이즈 fragment 로 채워지는 것 방지
+# Routing CC policy is now env-driven at the use-site: PENGWIN_ROUTE_CC_MODE in
+# {largest (default, = old LARGEST_CC_KEEP_ONLY=True), union, floor}; floor uses
+# PENGWIN_ROUTE_CC_MIN_VOX (default MIN_COMPONENT_VOXELS). See run_per_anatomy().
 MIN_DS539_CC_VOXELS = 500  # Ds539 mask 의 sparse outlier CC 제거 임계값 (voxels)
 DS539_MORPH_OPENING_ITERS = 1  # Ds539 mask 에 적용할 binary_opening 반복 횟수
 
@@ -985,14 +988,26 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
             continue
 
         mask = info['mask']
-        # 가장 큰 connected component 만 유지 (작은 노이즈 CC 가 fragment 슬롯을 낭비하는 것 방지)
-        if LARGEST_CC_KEEP_ONLY:
+        # Routing CC policy (ablatable via PENGWIN_ROUTE_CC_MODE; default 'largest' = deployed
+        # v1.3.x behaviour). The largest-CC-only policy is a suspected recall lever: a DISPLACED
+        # fracture fragment forms its own CC and is dropped before Stage-B, so its instance is lost.
+        #   largest : keep only the biggest CC (current default — drops displaced fragments).
+        #   union   : keep ALL CCs -> the ROI bbox spans every fragment of this anatomy (recall fix).
+        #   floor   : keep CCs >= PENGWIN_ROUTE_CC_MIN_VOX (drop only noise CCs, keep real ones).
+        _cc_mode = os.environ.get("PENGWIN_ROUTE_CC_MODE", "largest").strip().lower()
+        if _cc_mode != "union":
             import scipy.ndimage as ndi
             cc_labels, n_cc = ndi.label(mask, structure=np.ones((3,3,3), dtype=bool))
             if n_cc > 1:
                 sizes = ndi.sum(mask, cc_labels, index=np.arange(1, n_cc+1))
-                keep_idx = int(np.argmax(sizes)) + 1
-                mask = (cc_labels == keep_idx)
+                if _cc_mode == "floor":
+                    min_vox = int(os.environ.get("PENGWIN_ROUTE_CC_MIN_VOX", str(MIN_COMPONENT_VOXELS)))
+                    keep = [i + 1 for i, s in enumerate(sizes) if s >= min_vox] or [int(np.argmax(sizes)) + 1]
+                    mask = np.isin(cc_labels, keep)
+                else:  # 'largest' (default)
+                    keep_idx = int(np.argmax(sizes)) + 1
+                    mask = (cc_labels == keep_idx)
+        # 'union' leaves the multi-CC mask untouched so bbox_from_mask spans every fragment.
 
         bbox = bbox_from_mask(mask, pad_vox=ROI_PAD_VOX)
         if bbox is None:
@@ -1017,14 +1032,12 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
             log(f"[{anatomy}] elapsed+ETA={elapsed+eta:.0f}s > budget {TIME_BUDGET_SECONDS}s, emit zero")
             continue
 
-        # Ds538 입력: 3-channel anatomy-aware 텐서 구성
-        # (V5 학습 레시피와 동일 — CT_LUT / anatomy prob / SDF)
+        # [v1.4 LEAK-FREE] Ds538 입력: 1-channel CT-ONLY (bone-LUT CT crop).
+        # V302 trains on CT only — the old 3-channel [CT, Ds539-prob, SDF] tensor leaked the
+        # Stage-A anatomy probability into Stage-B. The bbox above still uses the Ds539 prob for
+        # localization (cascade routing), but the model input is now pure CT.
         ct_lut_crop = ct_lut_full[bbox]
-        # Channel 1: Ds539 anatomy 확률 ([0,1] clip). bone fallback 시에는 mask 자체를 0/1 로 사용
-        prob_crop = probs_full[DS539_PROB_CHANNEL[anatomy]][bbox] if info['source'] == 'ds539' else np.clip(mask[bbox].astype(np.float32), 0.0, 1.0)
-        # Channel 2: prob>=0.5 mask 의 signed distance field
-        sdf_crop = selected_anatomy_sdf_from_prob(prob_crop, spacing_zyx, clip_mm=SDF_CLIP_MM)
-        ds538_image_4d = np.stack([ct_lut_crop, prob_crop, sdf_crop], axis=0)
+        ds538_image_4d = ct_lut_crop[None]  # (1, Z, Y, X)
         ds538_props = {"spacing": list(spacing_zyx)}
 
         # Ds538 sliding-window 추론 실행

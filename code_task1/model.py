@@ -27,437 +27,327 @@ configure_nnunet_env()
 log = get_logger(__name__)
 
 
-TRAINER_INFO = {
-    "PengwinTrainer": {
-        "module": "nnunetv2.training.nnUNetTrainer.variants.pengwin.PengwinTrainer",
-        "class_attrs": {
-            "NUM_EPOCHS_DEFAULT": 1500,
-            "ES_PATIENCE": 50,
-            "ES_MIN_DELTA": 5e-3,
-            "WARMUP_EPOCHS": 30,
-            "DISABLE_X_MIRROR_DATASETS": {"Dataset532_PelvicAnatomyV2"},
-        },
-    },
-}
-
-
-PENGWIN_PLAN_CONFIGS = {
-    # Split anatomy datasets intentionally use the nnU-Net ResEncL planner output without
-    # a hand-authored patch. Keeping the hook as `None` makes this decision
-    # explicit and lets `model.py patch-plans all` be a safe no-op.
-    532: None,
-    533: None,
-    537: None,
-}
-
-
-SPLIT_ANATOMY_PLAN_VARIANTS = {
-    # Femur shape failures after the split baseline should be tested with more
-    # context before reintroducing mixed labels.
-    "femur_zcontext_b1": {
-        "source_plans": "nnUNetResEncUNetLPlans",
-        "target_plans": "nnUNetResEncUNetLPlansFemurZContextB1",
-        "dataset": 533,
-        "description": "Dataset533 Femur ablation: deeper z context with batch size 1.",
-        "configuration": {
-            "3d_fullres": {
-                "patch_size": [160, 288, 192],
-                "batch_size": 1,
-            }
-        },
-    },
-}
-
-
 # =============================================================================
-# Checkpoint location helpers
+# STU-Net network architecture — PENGWIN 2026 Task 1 백본 후보 (V0.x).
+# (consolidated here from the former stunet.py module — 2026-06-12)
+#
+# 출처 / 라이선스
+# --------------
+# - 원본: https://github.com/uni-medical/STU-Net (nnUNet-2.2/.../STUNetTrainer.py)
+# - 논문: Huang et al., "STU-Net: Scalable and Transferable Medical Image
+#   Segmentation Models Empowered by Large-Scale Supervised Pre-training",
+#   arXiv:2304.06716.
+# - 라이선스: Apache License 2.0 (license-clean). TotalSegmentator(1204 CT, 104 구조 /
+#   59개 뼈: sacrum, hip_left/right, femur_left/right 포함) 4000-epoch 사전학습 가중치
+#   전이를 위해 본 네트워크를 vendor.
+#
+# [V0.x][2026-06-01] vendoring 원칙
+# --------------------------------
+# - 클래스/속성 이름(conv_blocks_context, upsample_layers, conv_blocks_localization,
+#   seg_outputs, BasicResBlock.conv1/norm1/conv2/norm2/conv3, Upsample_Layer_nearest.conv)
+#   은 **원본과 byte-identical** 로 유지한다. 사전학습 state_dict 키가 그대로 매칭돼야
+#   warm-start 가 동작하기 때문이다. 이름을 절대 바꾸지 말 것.
+# - nnU-Net 2.5.2 용 trainer(build_network_architecture 새 시그니처)는 core.py 에 별도
+#   정의하고, 본 섹션에서는 STUNet nn.Module 만 제공한다(프레임워크 비의존).
+# - STUNet 은 `self.decoder.deep_supervision` 를 노출하므로 nnU-Net 의
+#   set_deep_supervision_enabled 및 우리 BADB 래퍼(.decoder forward)와 호환된다.
+#   단 `.encoder` 속성은 없으므로 래퍼에서 방어적으로 처리해야 한다.
+#
+# 변형 변이(architecture variants)
+# ------------------------------
+# - small : dims=[16·(1,2,4,8,16,16)], depth=[1]*6  (~14.6M)
+# - base  : dims=[32·(1,2,4,8,16,16)], depth=[1]*6  (~58.26M)  ← PENGWIN 채택
+# - large : dims=[64·(1,2,4,8,16,16)], depth=[2]*6  (~440.30M)
+# - huge  : dims=[96·(1,2,4,8,16,16)], depth=[3]*6  (~1.46B)
 # =============================================================================
-def fold_dir(ds_id: int, fold: int = 0,
-             plans: str = "nnUNetResEncUNetLPlans",
-             config: str = "3d_fullres") -> Path:
-    """Return path to nnUNet fold directory."""
-    cfg = DATASETS[ds_id]
-    return NN_RES / cfg["name"] / f"{cfg['trainer']}__{plans}__{config}" / f"fold_{fold}"
+from torch import nn
 
 
-# =============================================================================
-# SWA — Stochastic Weight Averaging
-# =============================================================================
-def swa_average(ckpt_paths: List[Path], out_path: Path) -> None:
-    """Equal-weight average of `network_weights` across multiple checkpoints.
+class Decoder(nn.Module):
+    """nnU-Net 호환을 위한 최소 decoder 스텁.
 
-    Algorithm:
-      1. Load each checkpoint, sum tensors in float32 (avoid fp16 underflow).
-      2. Divide by N at end, cast back to ORIGINAL dtype (taken from first
-         checkpoint — assumes all checkpoints have identical dtypes per key,
-         which is true for same-architecture models). If key dtypes differ
-         across checkpoints (rare, unsupported), falls back to first ckpt's.
-      3. Preserve all non-weights metadata (init_args, optimizer_state,
-         _best_ema etc.) from the FIRST ckpt — only `network_weights` change.
-      4. Append `_swa_n` (count) and `_swa_sources` (paths) for traceability.
-
-    Args:
-        ckpt_paths: list of .pth files. Order matters only for metadata source
-            (first one is base for everything except weights).
-        out_path: where to write the averaged checkpoint (.pth).
-
-    Raises: ValueError if list is empty.
+    nnU-Net 의 set_deep_supervision_enabled 는 `network.decoder.deep_supervision`
+    을 직접 토글한다. STUNet 은 단일 forward 안에서 deep supervision 출력을 만들지만,
+    이 플래그를 노출하기 위해 stub decoder 를 둔다.
     """
-    if not ckpt_paths:
-        raise ValueError("no checkpoints to average")
-    print(f"[SWA] averaging {len(ckpt_paths)} ckpts:")
-    for p in ckpt_paths:
-        print(f"   {p.name}")
 
-    sums: Dict[str, torch.Tensor] = {}
-    dtypes: Dict[str, torch.dtype] = {}   # captured from FIRST checkpoint, authoritative
-    n = 0
-    for p in ckpt_paths:
-        # nnU-Net checkpoints include optimizer/logger metadata beyond tensors.
-        # These files are local training artifacts, so loading with
-        # weights_only=False is an explicit trust-boundary decision.
-        ck = torch.load(str(p), map_location="cpu", weights_only=False)
-        weights = ck["network_weights"]
-        if not sums:
-            sums = {k: v.float().clone() for k, v in weights.items()}
-            dtypes = {k: v.dtype for k, v in weights.items()}   # original dtype
+    def __init__(self):
+        super().__init__()
+        self.deep_supervision = True
+
+
+class BasicResBlock(nn.Module):
+    """Conv-IN-LReLU x2 + (선택적) 1x1 shortcut 의 residual block."""
+
+    def __init__(self, input_channels, output_channels, kernel_size=3, padding=1,
+                 stride=1, use_1x1conv=False):
+        super().__init__()
+        self.conv1 = nn.Conv3d(input_channels, output_channels, kernel_size, stride=stride, padding=padding)
+        self.norm1 = nn.InstanceNorm3d(output_channels, affine=True)
+        self.act1 = nn.LeakyReLU(inplace=True)
+
+        self.conv2 = nn.Conv3d(output_channels, output_channels, kernel_size, padding=padding)
+        self.norm2 = nn.InstanceNorm3d(output_channels, affine=True)
+        self.act2 = nn.LeakyReLU(inplace=True)
+
+        if use_1x1conv:
+            self.conv3 = nn.Conv3d(input_channels, output_channels, kernel_size=1, stride=stride)
         else:
-            for k, v in weights.items():
-                sums[k] += v.float()
-        n += 1
+            self.conv3 = None
 
-    # Cast back to original dtype (per-key from first ckpt) to keep file size +
-    # downstream load behavior identical.
-    avg = {k: (v / n).to(dtypes[k]) for k, v in sums.items()}
-    base = torch.load(str(ckpt_paths[0]), map_location="cpu", weights_only=False)
-    base["network_weights"] = avg
-    base["_swa_n"] = n
-    base["_swa_sources"] = [str(p) for p in ckpt_paths]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(base, str(out_path))
-    print(f"\n✅ saved SWA ckpt → {out_path}  ({n} ckpts averaged)")
+    def forward(self, x):
+        y = self.conv1(x)
+        y = self.act1(self.norm1(y))
+        y = self.norm2(self.conv2(y))
+        if self.conv3:
+            x = self.conv3(x)
+        y += x
+        return self.act2(y)
 
 
-def swa_for_dataset(ds_id: int, last_n: int = 3, fold: int = 0,
-                    out_path: Path | None = None) -> Path:
-    """SWA last-N checkpoints in fold dir."""
-    fdir = fold_dir(ds_id, fold)
-    if not fdir.is_dir():
-        raise FileNotFoundError(f"fold dir missing: {fdir}")
-    candidates = sorted(_glob.glob(str(fdir / "checkpoint*.pth")))
-    if not candidates:
-        raise FileNotFoundError(f"no checkpoints in {fdir}")
-    # Prefer checkpoint_best + checkpoint_latest if exist, else last N by mtime
-    selected = []
-    for name in ["checkpoint_best.pth", "checkpoint_latest.pth"]:
-        p = fdir / name
-        if p.exists() and len(selected) < last_n:
-            selected.append(p)
-    # Fill remaining from any other checkpoint files
-    for p in candidates:
-        path = Path(p)
-        if path not in selected and len(selected) < last_n:
-            selected.append(path)
+class Upsample_Layer_nearest(nn.Module):
+    """nearest interpolate + 1x1 conv 업샘플."""
 
-    # Keep derived weights under code_task1/result so checkpoint artifacts and
-    # result dashboards stay in one auditable tree. Raw nnU-Net checkpoints
-    # remain under nnunet/results and are referenced by visualize.py manifests.
-    out_path = out_path or (RESULT_WEIGHT / f"swa_ds{ds_id}_fold{fold}.pth")
-    swa_average(selected, out_path)
-    return out_path
+    def __init__(self, input_channels, output_channels, pool_op_kernel_size, mode='nearest'):
+        super().__init__()
+        self.conv = nn.Conv3d(input_channels, output_channels, kernel_size=1)
+        self.pool_op_kernel_size = pool_op_kernel_size
+        self.mode = mode
+
+    def forward(self, x):
+        x = nn.functional.interpolate(x, scale_factor=self.pool_op_kernel_size, mode=self.mode)
+        x = self.conv(x)
+        return x
 
 
-def patch_plans_json(ds_id: int, plans_name: str = "nnUNetResEncUNetLPlans") -> Path:
-    """Apply optional PENGWIN plan overrides to nnU-Net's generated JSON."""
-    if ds_id not in PENGWIN_PLAN_CONFIGS:
-        raise ValueError(f"plans patch only defined for {sorted(PENGWIN_PLAN_CONFIGS)}")
-    cfg = PENGWIN_PLAN_CONFIGS[ds_id]
-    ds_name = DATASETS[ds_id]["name"]
-    plans_path = NN_PREP / ds_name / f"{plans_name}.json"
-    if not plans_path.exists():
-        raise FileNotFoundError(f"plans json not found: {plans_path}")
-    if cfg is None:
-        print(f"[Ds{ds_id}] {ds_name}")
-        print("  planner_default: no manual plan patch for this dataset")
-        print(f"  checked:         {plans_path}")
-        return plans_path
+class STUNet(nn.Module):
+    """STU-Net: residual U-Net (6 stage, 고정 dims/depth per variant).
 
-    plans = json.loads(plans_path.read_text())
-    before = copy.deepcopy(plans["configurations"]["3d_fullres"])
-    fullres = plans["configurations"]["3d_fullres"]
-    arch = fullres["architecture"]["arch_kwargs"]
-    fullres["patch_size"] = cfg["patch_size"]
-    arch["n_stages"] = cfg["n_stages"]
-    arch["features_per_stage"] = cfg["features_per_stage"]
-    arch["n_blocks_per_stage"] = cfg["n_blocks_per_stage_encoder"]
-    arch["n_conv_per_stage_decoder"] = cfg["n_conv_per_stage_decoder"]
-    arch["strides"] = cfg["strides"]
-    arch["kernel_sizes"] = cfg["kernel_sizes"]
-    plans_path.write_text(json.dumps(plans, indent=4))
-
-    print(f"[Ds{ds_id}] {ds_name}")
-    print(f"  patch_size: {before['patch_size']} -> {fullres['patch_size']}")
-    print(f"  n_stages:   {before['architecture']['arch_kwargs']['n_stages']} -> {arch['n_stages']}")
-    print(f"  wrote:      {plans_path}")
-    return plans_path
-
-
-def _plans_path(ds_id: int, plans_name: str = "nnUNetResEncUNetLPlans") -> Path:
-    return NN_PREP / DATASETS[ds_id]["name"] / f"{plans_name}.json"
-
-
-def _warmstart_signature(plans: dict, config: str = "3d_fullres") -> dict:
-    """Return architecture fields that must match for checkpoint warm-start."""
-    conf = plans["configurations"][config]
-    arch = conf["architecture"]["arch_kwargs"]
-    return {
-        "patch_size": conf.get("patch_size"),
-        "batch_size": conf.get("batch_size"),
-        "architecture_class_name": conf.get("architecture", {}).get("network_class_name"),
-        "n_stages": arch.get("n_stages"),
-        "features_per_stage": arch.get("features_per_stage"),
-        "n_blocks_per_stage": arch.get("n_blocks_per_stage"),
-        "n_conv_per_stage_decoder": arch.get("n_conv_per_stage_decoder"),
-        "strides": arch.get("strides"),
-        "kernel_sizes": arch.get("kernel_sizes"),
-    }
-
-
-def audit_plans_compatible(source: int = 532,
-                           targets: list[int] | None = None,
-                           plans_name: str = "nnUNetResEncUNetLPlans",
-                           out_path: Path | None = None,
-                           fail_on_mismatch: bool = True) -> dict:
-    """Check architecture compatibility against a source plan.
-
-    [AUDIT][Risk:Medium][Scope:warmstart]
-    V5 does not require Dataset532 warm-start, but this command is kept as a
-    read-only audit. It must not silently patch plans or imply that anatomy
-    logits are model inputs for Dataset537.
+    pool_op_kernel_sizes(strides) 는 nnU-Net plan 에서 주입된다. conv 가중치는 stride 와
+    무관하게 shape 가 결정되므로(dims·kernel 고정) 사전학습 가중치가 그대로 로드된다.
     """
-    targets = targets or [
-        ds_id for ds_id, cfg in sorted(DATASETS.items())
-        if cfg["kind"] == "bicm_v5"
-    ]
-    src_path = _plans_path(source, plans_name)
-    if not src_path.exists():
-        raise FileNotFoundError(f"source plans missing: {src_path}")
-    src_plans = json.loads(src_path.read_text())
-    src_sig = _warmstart_signature(src_plans)
-    rows = {}
-    ok = True
-    for target in targets:
-        tgt_path = _plans_path(target, plans_name)
-        if not tgt_path.exists():
-            rows[str(target)] = {
-                "dataset_name": DATASETS[target]["name"],
-                "plans": str(tgt_path),
-                "ok": False,
-                "error": "target plans missing",
-            }
-            ok = False
+
+    def __init__(self, input_channels, num_classes, depth=[1, 1, 1, 1, 1, 1],
+                 dims=[32, 64, 128, 256, 512, 512],
+                 pool_op_kernel_sizes=None, conv_kernel_sizes=None,
+                 enable_deep_supervision=True):
+        super().__init__()
+        self.conv_op = nn.Conv3d
+        self.input_channels = input_channels
+        self.num_classes = num_classes
+
+        self.final_nonlin = lambda x: x
+        self.decoder = Decoder()
+        self.decoder.deep_supervision = enable_deep_supervision
+        self.upscale_logits = False
+
+        self.pool_op_kernel_sizes = pool_op_kernel_sizes
+        self.conv_kernel_sizes = conv_kernel_sizes
+        self.conv_pad_sizes = []
+        for krnl in self.conv_kernel_sizes:
+            self.conv_pad_sizes.append([i // 2 for i in krnl])
+
+        num_pool = len(pool_op_kernel_sizes)
+
+        assert num_pool == len(dims) - 1
+
+        # encoder
+        self.conv_blocks_context = nn.ModuleList()
+        stage = nn.Sequential(
+            BasicResBlock(input_channels, dims[0], self.conv_kernel_sizes[0], self.conv_pad_sizes[0], use_1x1conv=True),
+            *[BasicResBlock(dims[0], dims[0], self.conv_kernel_sizes[0], self.conv_pad_sizes[0]) for _ in range(depth[0] - 1)])
+        self.conv_blocks_context.append(stage)
+        for d in range(1, num_pool + 1):
+            stage = nn.Sequential(
+                BasicResBlock(dims[d - 1], dims[d], self.conv_kernel_sizes[d], self.conv_pad_sizes[d],
+                              stride=self.pool_op_kernel_sizes[d - 1], use_1x1conv=True),
+                *[BasicResBlock(dims[d], dims[d], self.conv_kernel_sizes[d], self.conv_pad_sizes[d]) for _ in range(depth[d] - 1)])
+            self.conv_blocks_context.append(stage)
+
+        # upsample_layers
+        self.upsample_layers = nn.ModuleList()
+        for u in range(num_pool):
+            upsample_layer = Upsample_Layer_nearest(dims[-1 - u], dims[-2 - u], pool_op_kernel_sizes[-1 - u])
+            self.upsample_layers.append(upsample_layer)
+
+        # decoder
+        self.conv_blocks_localization = nn.ModuleList()
+        for u in range(num_pool):
+            stage = nn.Sequential(
+                BasicResBlock(dims[-2 - u] * 2, dims[-2 - u], self.conv_kernel_sizes[-2 - u], self.conv_pad_sizes[-2 - u], use_1x1conv=True),
+                *[BasicResBlock(dims[-2 - u], dims[-2 - u], self.conv_kernel_sizes[-2 - u], self.conv_pad_sizes[-2 - u]) for _ in range(depth[-2 - u] - 1)])
+            self.conv_blocks_localization.append(stage)
+
+        # outputs
+        self.seg_outputs = nn.ModuleList()
+        for ds in range(len(self.conv_blocks_localization)):
+            self.seg_outputs.append(nn.Conv3d(dims[-2 - ds], num_classes, kernel_size=1))
+
+        self.upscale_logits_ops = []
+        for usl in range(num_pool - 1):
+            self.upscale_logits_ops.append(lambda x: x)
+
+    def forward(self, x):
+        skips = []
+        seg_outputs = []
+
+        for d in range(len(self.conv_blocks_context) - 1):
+            x = self.conv_blocks_context[d](x)
+            skips.append(x)
+
+        x = self.conv_blocks_context[-1](x)
+
+        for u in range(len(self.conv_blocks_localization)):
+            x = self.upsample_layers[u](x)
+            x = torch.cat((x, skips[-(u + 1)]), dim=1)
+            x = self.conv_blocks_localization[u](x)
+            seg_outputs.append(self.final_nonlin(self.seg_outputs[u](x)))
+
+        if self.decoder.deep_supervision:
+            return tuple([seg_outputs[-1]] + [i(j) for i, j in
+                                              zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])])
+        else:
+            return seg_outputs[-1]
+
+
+# 변형별 dims/depth — core.py 의 trainer build_network_architecture 가 참조.
+STUNET_VARIANTS = {
+    "small": {"dims": [16 * x for x in [1, 2, 4, 8, 16, 16]], "depth": [1] * 6},
+    "base":  {"dims": [32 * x for x in [1, 2, 4, 8, 16, 16]], "depth": [1] * 6},
+    "large": {"dims": [64 * x for x in [1, 2, 4, 8, 16, 16]], "depth": [2] * 6},
+    "huge":  {"dims": [96 * x for x in [1, 2, 4, 8, 16, 16]], "depth": [3] * 6},
+}
+
+
+def load_stunet_pretrained_weights(network, fname, verbose=False, inflate="ct0"):
+    """STU-Net TotalSegmentator 사전학습 가중치를 warm-start 로 적재한다.
+
+    STU-Net 공식 run_finetuning_stunet.py 의 로더를 우리 파이프라인에 맞게 개선:
+
+    1. **BADB 래퍼 prefix 처리** — fracture 모델은 STUNet 이 `_V300...Network.base` 에
+       들어가 state_dict 키가 `base.conv_blocks_context...` 가 된다. pretrained 키
+       (prefix 없음)에 동일 prefix 를 부여해 매칭한다. anatomy 모델은 prefix="".
+    2. **하드 assert 제거** — BADB refinement block(`...boundary_refine...`) 처럼
+       pretrained 에 없는 신규 모듈은 자신의 초기값(BADB 는 zero-init)을 유지한다.
+       원본 로더는 비-seg 키 전부가 pretrained 에 존재한다고 assert 하여 신규 모듈에서
+       깨진다.
+    3. **seg head skip** — STUNet 의 출력 head 는 `seg_outputs.*` 네이밍(nnU-Net 의
+       `.seg_layers.` 가 아님). 클래스 수가 다르므로(105 → 5/4) 항상 reinit.
+    4. **입력 stem inflate** — pretrained 는 1ch(CT). 우리 입력이 N>1 채널이면:
+         - inflate="ct0"  (기본): 채널0 = pretrained CT 가중치, 나머지 채널 = 0.
+           우리 입력(ct_lut, anatprob, sdf)은 CT modality 복제가 아니므로 tiling 보다
+           "보조 채널은 0 에서 학습" 이 안정적이다(표준 신규-채널 전이 init).
+         - inflate="repeat": STU-Net 공식(멀티모달 동일 modality 가정) — CT 가중치를
+           모든 채널에 복제.
+
+    반환: dict(loaded, skipped_seg, kept_init, total_model_keys) — QA 용 통계.
+    """
+    import torch
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    try:
+        from torch._dynamo import OptimizedModule
+    except Exception:  # pragma: no cover
+        OptimizedModule = ()
+
+    # [SECURITY][2026-06-01] weights_only=True 로 안전 역직렬화 — 임의 pickle 코드 실행
+    # (외부 체크포인트發 RCE) 차단. nnU-Net v1 .model 체크포인트는 메타데이터에 numpy
+    # 스칼라/배열을 담으므로, 임의코드 실행과 무관한 numpy 재구성 global 만 명시 allowlist
+    # 한다(여전히 weights_only=True 안전 경로 유지). 부득이 unsafe 가 필요하면 출처를 검증한
+    # 뒤 PENGWIN_ALLOW_UNSAFE_TORCH_LOAD=1 을 명시.
+    import os as _os
+    _unsafe = _os.environ.get("PENGWIN_ALLOW_UNSAFE_TORCH_LOAD", "") == "1"
+    if not _unsafe:
+        try:
+            import numpy as _np
+            import torch.serialization as _ts
+            _safe = [_np.ndarray, _np.dtype,
+                     _np.core.multiarray.scalar, _np.core.multiarray._reconstruct]
+            try:
+                import numpy.dtypes as _ndt
+                _safe += [getattr(_ndt, _n) for _n in dir(_ndt) if _n.endswith("DType")]
+            except Exception:
+                pass
+            _ts.add_safe_globals(_safe)
+        except Exception:
+            pass
+    try:
+        saved = torch.load(fname, map_location="cpu", weights_only=not _unsafe)
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(
+            f"체크포인트 안전 로드 실패 ({fname}): {e}\n"
+            f"출처를 검증한 뒤에만 PENGWIN_ALLOW_UNSAFE_TORCH_LOAD=1 로 재시도하세요."
+        ) from e
+    if isinstance(saved, dict) and "network_weights" in saved:
+        pretrained = saved["network_weights"]
+    elif isinstance(saved, dict) and "state_dict" in saved:
+        pretrained = saved["state_dict"]
+    else:
+        pretrained = saved  # raw state_dict 가정
+
+    mod = network
+    if isinstance(mod, DDP):
+        mod = mod.module
+    if OptimizedModule and isinstance(mod, OptimizedModule):
+        mod = mod._orig_mod
+    model_dict = mod.state_dict()
+
+    # STUNet 키 prefix 탐지 (anatomy: "" / fracture BADB: "base.")
+    anchor = "conv_blocks_context.0.0.conv1.weight"
+    if anchor in model_dict:
+        prefix = ""
+    else:
+        cands = [k[: -len(anchor)] for k in model_dict if k.endswith(anchor)]
+        if not cands:
+            raise RuntimeError("STUNet anchor 키 부재 — STUNet 백본이 아니거나 구조 불일치")
+        prefix = cands[0]
+
+    pretrained = {prefix + k: v for k, v in pretrained.items()}
+    skip_token = prefix + "seg_outputs"
+
+    # 입력 stem inflate
+    stem1 = prefix + "conv_blocks_context.0.0.conv1.weight"
+    stem3 = prefix + "conv_blocks_context.0.0.conv3.weight"
+    num_inputs = model_dict[stem1].shape[1]
+    if num_inputs > 1 and stem1 in pretrained and pretrained[stem1].shape[1] == 1:
+        for sk in (stem1, stem3):
+            w1 = pretrained[sk]  # [out, 1, k, k, k]
+            if inflate == "repeat":
+                pretrained[sk] = w1.repeat(1, num_inputs, 1, 1, 1)
+            else:  # "ct0"
+                w = torch.zeros((w1.shape[0], num_inputs, *w1.shape[2:]), dtype=w1.dtype)
+                w[:, 0:1] = w1
+                pretrained[sk] = w
+
+    loaded, skipped_seg, kept_init = [], [], []
+    use = {}
+    for k, v in model_dict.items():
+        if skip_token in k:
+            skipped_seg.append(k)
             continue
-        tgt_plans = json.loads(tgt_path.read_text())
-        tgt_sig = _warmstart_signature(tgt_plans)
-        diff = {
-            key: {"source": src_sig[key], "target": tgt_sig[key]}
-            for key in src_sig
-            if src_sig[key] != tgt_sig[key]
-        }
-        rows[str(target)] = {
-            "dataset_name": DATASETS[target]["name"],
-            "plans": str(tgt_path),
-            "ok": not diff,
-            "diff": diff,
-            "warnings": {},
-        }
-        ok = ok and not diff
-    report = {
-        "source_dataset": source,
-        "source_name": DATASETS[source]["name"],
-        "plans_name": plans_name,
-        "source_plans": str(src_path),
-        "source_signature": src_sig,
-        "targets": rows,
-        "ok": ok,
-    }
-    if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(report, indent=2))
-    if fail_on_mismatch and not ok:
-        failed = [k for k, v in rows.items() if not v["ok"]]
-        raise RuntimeError(f"plan compatibility failed for {failed}")
-    return report
-
-
-def patch_instance_plans_from_source(source: int = 532,
-                                     targets: list[int] | None = None,
-                                     plans_name: str = "nnUNetResEncUNetLPlans") -> list[Path]:
-    """Copy Dataset532 3d_fullres topology fields into Dataset537 plans.
-
-    [QA][Status:legacy_compat]
-    This remains only for explicit manual compatibility checks. The V5 primary
-    path should normally use planner output as-is and train `PengwinTrainer`
-    with Dice+CE before any warm-start experiment is considered.
-    """
-    targets = targets or [
-        ds_id for ds_id, cfg in sorted(DATASETS.items())
-        if cfg["kind"] == "bicm_v5"
-    ]
-    src_path = _plans_path(source, plans_name)
-    if not src_path.exists():
-        raise FileNotFoundError(f"source plans missing: {src_path}")
-    src_plans = json.loads(src_path.read_text())
-    written = []
-    for target in targets:
-        tgt_path = _plans_path(target, plans_name)
-        if not tgt_path.exists():
-            raise FileNotFoundError(f"target plans missing: {tgt_path}")
-        target_plans = json.loads(tgt_path.read_text())
-        before = _warmstart_signature(target_plans)
-        source_conf = copy.deepcopy(src_plans["configurations"]["3d_fullres"])
-        target_plans["configurations"]["3d_fullres"] = source_conf
-        target_plans["_pengwin_warmstart_source"] = {
-            "source_dataset": source,
-            "source_name": DATASETS[source]["name"],
-            "source_plans": str(src_path),
-            "purpose": "explicit manual V5 topology alignment audit only",
-        }
-        after = _warmstart_signature(target_plans)
-        tgt_path.write_text(json.dumps(target_plans, indent=4))
-        print(f"[plans] Ds{target} {DATASETS[target]['name']}:")
-        print(f"  before: {before}")
-        print(f"  after:  {after}")
-        print(f"  wrote:  {tgt_path}")
-        written.append(tgt_path)
-    return written
-
-
-patch_abbc_plans_from_source = patch_instance_plans_from_source
-
-
-def create_plan_variant(ds_id: int, variant: str, overwrite: bool = False) -> Path:
-    """Create a named plans JSON variant without modifying the B0 base plan.
-
-    Upgrade experiments should use separate plans names so they are auditable
-    and cannot accidentally change the active baseline checkpoints.
-    """
-    if ds_id not in DATASETS:
-        raise ValueError(f"unknown active dataset {ds_id}. Choose from {sorted(DATASETS)}")
-    if variant not in SPLIT_ANATOMY_PLAN_VARIANTS:
-        raise ValueError(f"variant must be one of {sorted(SPLIT_ANATOMY_PLAN_VARIANTS)}")
-    expected = int(SPLIT_ANATOMY_PLAN_VARIANTS[variant].get("dataset", ds_id))
-    if ds_id != expected:
-        raise ValueError(f"variant {variant} is defined for Dataset{expected}, got Dataset{ds_id}")
-    cfg = DATASETS[ds_id]
-    spec = SPLIT_ANATOMY_PLAN_VARIANTS[variant]
-    root = NN_PREP / cfg["name"]
-    src = root / f"{spec['source_plans']}.json"
-    dst = root / f"{spec['target_plans']}.json"
-    if not src.exists():
-        raise FileNotFoundError(f"source plans missing: {src}")
-    if dst.exists() and not overwrite:
-        print(f"[plan-variant] exists: {dst}")
-        return dst
-
-    plans = json.loads(src.read_text())
-    plans["plans_name"] = spec["target_plans"]
-    plans["_pengwin_variant"] = {
-        "dataset": ds_id,
-        "variant": variant,
-        "source_plans": spec["source_plans"],
-        "description": spec["description"],
-    }
-    for conf_name, updates in spec["configuration"].items():
-        if conf_name not in plans["configurations"]:
-            raise KeyError(f"configuration {conf_name!r} not in {src}")
-        conf = plans["configurations"][conf_name]
-        arch = conf["architecture"]["arch_kwargs"]
-        for key, value in updates.items():
-            if key == "n_conv_per_stage_decoder":
-                arch[key] = value
-            elif key in conf:
-                conf[key] = value
-            elif key in arch:
-                arch[key] = value
-            else:
-                raise KeyError(f"unsupported plan variant key: {key}")
-    dst.write_text(json.dumps(plans, indent=4))
-    print(f"[plan-variant] {variant}: {src.name} -> {dst.name}")
-    print(f"  description: {spec['description']}")
-    return dst
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-def main():
-    p = argparse.ArgumentParser()
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    p_swa = sub.add_parser("swa", help="SWA over fold checkpoints")
-    p_swa.add_argument("--dataset", type=int, required=True)
-    p_swa.add_argument("--fold", type=int, default=0)
-    p_swa.add_argument("--last-n", type=int, default=3)
-    p_swa.add_argument("--out", default=None)
-
-    p_info = sub.add_parser("info", help="show trainer config")
-    p_info.add_argument("--dataset", type=int, required=True)
-
-    p_patch = sub.add_parser("patch-plans", help="patch/check active nnU-Net plans JSON")
-    p_patch.add_argument("dataset", choices=[*(str(k) for k in sorted(DATASETS)), "all", "instance-from-532", "abbc-from-532"])
-    p_patch.add_argument("--plans-name", default="nnUNetResEncUNetLPlans")
-
-    p_audit = sub.add_parser("audit-plans-compatible", help="audit Dataset532 warm-start compatibility")
-    p_audit.add_argument("--source", type=int, default=532)
-    p_audit.add_argument("--targets", nargs="*", type=int, default=[537])
-    p_audit.add_argument("--plans-name", default="nnUNetResEncUNetLPlans")
-    p_audit.add_argument("--out", default=str(RESULT_REPORT / f"audit_plans_compatible_{RESULT_DATE}.json"))
-    p_audit.add_argument("--allow-mismatch", action="store_true")
-
-    p_variant = sub.add_parser("create-plan-variant", help="create split anatomy model ablation plans")
-    p_variant.add_argument("variant", choices=sorted(SPLIT_ANATOMY_PLAN_VARIANTS))
-    p_variant.add_argument("--dataset", type=int, default=533)
-    p_variant.add_argument("--overwrite", action="store_true")
-
-    args = p.parse_args()
-
-    if args.cmd == "swa":
-        out = Path(args.out) if args.out else None
-        swa_for_dataset(args.dataset, last_n=args.last_n, fold=args.fold, out_path=out)
-    elif args.cmd == "info":
-        cfg = DATASETS[args.dataset]
-        info = TRAINER_INFO[cfg["trainer"]]
-        print(f"\nDataset {args.dataset}: {cfg['name']}")
-        print(f"  kind:       {cfg['kind']}")
-        print(f"  n_classes:  {cfg['n_classes']}")
-        print(f"  trainer:    {cfg['trainer']}")
-        print(f"  module:     {info['module']}")
-        for k, v in info["class_attrs"].items():
-            print(f"  {k:<24s}: {v}")
-    elif args.cmd == "patch-plans":
-        if args.dataset in {"instance-from-532", "abbc-from-532"}:
-            patch_instance_plans_from_source(source=532, plans_name=args.plans_name)
-        elif args.dataset == "all":
-            targets = sorted(DATASETS)
-            for ds_id in targets:
-                patch_plans_json(ds_id, args.plans_name)
+        if k in pretrained and pretrained[k].shape == v.shape:
+            use[k] = pretrained[k]
+            loaded.append(k)
         else:
-            targets = [int(args.dataset)]
-            for ds_id in targets:
-                patch_plans_json(ds_id, args.plans_name)
-    elif args.cmd == "create-plan-variant":
-        create_plan_variant(args.dataset, args.variant, overwrite=args.overwrite)
-    elif args.cmd == "audit-plans-compatible":
-        report = audit_plans_compatible(
-            source=args.source,
-            targets=args.targets,
-            plans_name=args.plans_name,
-            out_path=Path(args.out),
-            fail_on_mismatch=not args.allow_mismatch,
-        )
-        print(json.dumps(report, indent=2))
+            kept_init.append(k)  # BADB 등 신규 모듈 → 초기값 유지
+
+    model_dict.update(use)
+    mod.load_state_dict(model_dict)
+
+    stats = {
+        "loaded": len(loaded),
+        "skipped_seg": len(skipped_seg),
+        "kept_init": len(kept_init),
+        "total_model_keys": len(model_dict),
+        "prefix": prefix or "(none)",
+        "inflate": inflate if num_inputs > 1 else "n/a(1ch)",
+        "num_inputs": num_inputs,
+    }
+    print(f"[STU-Net warm-start] {fname}: loaded={stats['loaded']} "
+          f"skipped_seg={stats['skipped_seg']} kept_init={stats['kept_init']} "
+          f"prefix='{stats['prefix']}' inflate={stats['inflate']}")
+    if verbose:
+        for k in kept_init:
+            print("  kept-init(new module):", k)
+    return stats
 
 
-if __name__ == "__main__":
-    main()

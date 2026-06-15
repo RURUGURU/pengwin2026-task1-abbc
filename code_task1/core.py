@@ -19,10 +19,11 @@ from typing import Literal
 # =============================================================================
 # Paths
 # =============================================================================
-# Keep /workspace as the default because this challenge workstation and the
-# current scripts are laid out there, but allow Docker/local runs to relocate the
-# tree by exporting PENGWIN_ROOT before importing any code_task1 modules.
-ROOT = Path(os.environ.get("PENGWIN_ROOT", "/workspace"))
+# PENGWIN_ROOT wins when set (the GC container's inference.py exports it = /opt/ml/model
+# BEFORE importing any code_task1 module). When unset (host/dev), auto-resolve the repo root
+# from this file's location (core.py lives at <root>/code_task1/core.py), so the tree is
+# portable across machines without hardcoding /workspace.
+ROOT = Path(os.environ.get("PENGWIN_ROOT") or Path(__file__).resolve().parents[1])
 DATA_RAW = ROOT / "data/task1_2/extracted"
 # nnUNet 출력 root 를 code_task1/result/ 아래로 통합 (2026-05-31 정리).
 # 이전: ROOT/nnunet/{raw,preprocessed,results} — workspace 루트에 분산.
@@ -89,33 +90,13 @@ configure_nnunet_env()
 # DECOY WARNING: the case-ID helpers below (is_pelvic/is_femur, 1-120/151-200/
 # 251-420) and HU/probability thresholds elsewhere are a DIFFERENT namespace that
 # happens to share the digits 150/200/50 — they must NOT route through the registry.
-from anatomy_registry import (  # noqa: E402  (beside the constants it replaces)
-    Anatomy,
-    ANATOMY_REGISTRY,
-    ANATOMY_RANGES,
-    ANATOMY_NAMES,
-    ANATOMY_RANGE_DICT,
-    ANATOMY_TO_INDEX,
-    PELVIC_ANATOMY_INDICES,
-    NUM_ANATOMIES,
-    MIN_INSTANCE_ID,
-    MAX_INSTANCE_ID,
-    PELVIC_MAX_INSTANCE_ID,
-    INSTANCE_CAPACITY,
-    anatomy_by_index,
-    anatomy_by_name,
-    anatomy_of_id,
-    id_range,
-    all_anatomy_ranges,
-    anatomy_start_ids,
-    anatomy_ranges_by_name,
-    global_to_local,
-    local_to_global,
-    valid_instance_mask,
-    clip_to_valid_instances,
-    anatomy_index_array,
-    same_anatomy,
-)
+#
+# NOTE [consolidation 2026-06-12]: the anatomy registry now lives in `utils.py`
+# (formerly the standalone `anatomy_registry.py`). core re-exports those symbols so
+# existing `from core import ANATOMY_RANGES` / `core.<x>` references keep resolving
+# unchanged. Because `utils` imports `DATA_RAW`/`PAD` from `core`, the re-export
+# import is deferred to AFTER those constants are defined (see below, post-`PAD`),
+# avoiding a core<->utils circular import.
 
 
 # =============================================================================
@@ -404,40 +385,7 @@ class DatasetCfg:
 
 
 DATASETS: dict[int, DatasetCfg] = {
-    # Active anatomy learning is split by subject region so each model sees one
-    # consistent target distribution and label set.
-    532: DatasetCfg(
-        "Dataset532_PelvicAnatomyV2",
-        "anatomy_semantic",
-        "pelvic",
-        4,
-        "PengwinTrainer",
-        anatomies=["Sacrum", "LeftHip", "RightHip"],
-    ),
-    533: DatasetCfg(
-        "Dataset533_FemurAnatomyV2",
-        "anatomy_semantic",
-        "femur",
-        2,
-        "PengwinTrainer",
-        anatomies=["Femur"],
-    ),
-    # Dataset537 keeps the V5 materialized ROI/label contract. V81 remains the
-    # active locked diagnostic: V82/V83/V84 improved isolated precision or
-    # patch metrics but lost full-volume recall/support/core balance.
-    # Fulltrain remains blocked until a fixed full-volume gate passes.
-    537: DatasetCfg(
-        "Dataset537_PelvicBICMFragmentV5",
-        "bicm_v5",
-        "pelvic",
-        5,
-        "PengwinTrainerBICMCoreStableEdgePrecisionV81",
-        anatomies=["Sacrum", "LeftHip", "RightHip"],
-        anatomy=None,
-        global_label_range=(1, 150),
-        foundation_dataset=532,
-    ),
-    # [V0.x][FIX:B2][2026-05-31] Dataset538 — Dataset537 의 4-anatomy 버전.
+    # [V0.x][FIX:B2][2026-05-31] Dataset538 — pelvic+femur 4-anatomy BICM V5.
     # filter="all" 로 170 pelvic + 170 femur (총 340) 케이스 모두 포함.
     # global_label_range=(1, 200) 로 femur fragment ID (151-200) 까지 커버.
     # anatomies=[..., "Femur"] 로 빌드 시점에 4 ROI 생성.
@@ -448,7 +396,9 @@ DATASETS: dict[int, DatasetCfg] = {
         "bicm_v5",
         "all",
         5,
-        "PengwinTrainerBICMCoreStableEdgePrecisionV81",
+        # [cleanup 2026-06-07] was "PengwinTrainerBICMCoreStableEdgePrecisionV81" — a phantom
+        # (no such class). The ACTIVE deployed Ds538 fracture trainer is the STU-Net-B ABBC one.
+        "PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025StrongPeakNoContactABBCSTUNetBV301",
         anatomies=["Sacrum", "LeftHip", "RightHip", "Femur"],
         anatomy=None,
         global_label_range=(1, 200),
@@ -462,7 +412,9 @@ DATASETS: dict[int, DatasetCfg] = {
         "anatomy_semantic",
         "all",
         5,
-        "PengwinTrainer",
+        # [cleanup 2026-06-07] was the base "PengwinTrainer" — the ACTIVE deployed Ds539
+        # anatomy trainer is the STU-Net-B one.
+        "PengwinTrainerSTUNetBaseAnatomyV301",
         anatomies=["Sacrum", "LeftHip", "RightHip", "Femur"],
     ),
 }
@@ -487,6 +439,42 @@ SOTA = {
 PAD = 15              # v8: 10→15. bbox crop 시 small fragment (~100 vox) 절단 방지.
                       #     PENGWIN spec drops <500mm³ ≈ 1000 vox at 0.8mm³, but our
                       #     GT contains down to 1 vox fragments — 5 voxel 추가 margin.
+
+
+# =============================================================================
+# PENGWIN anatomy <-> instance-ID registry (single source of truth in utils.py).
+# Re-exported here so existing `from core import ANATOMY_RANGES` / `core.<x>`
+# references resolve unchanged. `utils` is a pure leaf w.r.t. core at import time
+# (it accesses DATA_RAW lazily inside functions), so this import does not create a
+# core<->utils cycle and `utils` stays importable standalone.
+# =============================================================================
+from utils import (  # noqa: E402  (utils anatomy registry, re-exported from core)
+    Anatomy,
+    ANATOMY_REGISTRY,
+    ANATOMY_RANGES,
+    ANATOMY_NAMES,
+    ANATOMY_RANGE_DICT,
+    ANATOMY_TO_INDEX,
+    PELVIC_ANATOMY_INDICES,
+    NUM_ANATOMIES,
+    MIN_INSTANCE_ID,
+    MAX_INSTANCE_ID,
+    PELVIC_MAX_INSTANCE_ID,
+    INSTANCE_CAPACITY,
+    anatomy_by_index,
+    anatomy_by_name,
+    anatomy_of_id,
+    id_range,
+    all_anatomy_ranges,
+    anatomy_start_ids,
+    anatomy_ranges_by_name,
+    global_to_local,
+    local_to_global,
+    valid_instance_mask,
+    clip_to_valid_instances,
+    anatomy_index_array,
+    same_anatomy,
+)
 
 
 # =============================================================================
@@ -535,13 +523,13 @@ except Exception:  # pragma: no cover
 
 # Make helper modules importable when nnU-Net imports the native PengwinTrainer
 # module from its supported `nnUNetTrainer/variants` package path.
-_ROOT = Path(os.environ.get("PENGWIN_ROOT", "/workspace"))
+_ROOT = Path(os.environ.get("PENGWIN_ROOT") or Path(__file__).resolve().parents[1])
 _CODE_TASK1 = _ROOT / "code_task1"
 if str(_CODE_TASK1) not in sys.path:
     sys.path.insert(0, str(_CODE_TASK1))
 # [V0.x][2026-06-01] STU-Net 백본 (vendored, Apache-2.0) — TotalSegmentator 뼈 사전학습 전이용.
 try:
-    from stunet import STUNet, STUNET_VARIANTS
+    from model import STUNet, STUNET_VARIANTS
     _STUNET_AVAILABLE = True
 except Exception:  # pragma: no cover
     STUNet = None
@@ -571,6 +559,7 @@ try:
         BoundaryFragmentV3Core025StrongPeakNoContactSeparatorGapV277HeadLoss,
         BoundaryFragmentV3Core025StrongPeakNoContactABBCV288HeadLoss,
         BoundaryFragmentV3Core025StrongPeakNoContactABBCV291HeadLoss,
+        LeakFreeInstanceABBCLoss,
         BoundaryFragmentV3RidgeFitDeepSupervisionWrapper,
         BoundaryFragmentV3RidgeFitLoss,
         BICMV5SparseDeepSupervisionWrapper,
@@ -1420,7 +1409,11 @@ class _GroupedSplitMixin:
             return  # 단일 ROI 데이터셋 → stock 의 ungrouped split 과 동일하므로 위임
 
         group_ids = sorted(groups.keys())
-        group_splits = generate_crossval_split(group_ids, seed=12345, n_splits=5)
+        # n_splits is env-configurable so a final model can train on 90/10 (n_splits=10, fold0)
+        # over ALL source cases instead of the default 80/20 5-fold. Leak-free grouping is
+        # preserved either way (split is over source-case group IDs, seed fixed).
+        _n_splits = int(os.environ.get("PENGWIN_N_SPLITS", "5"))
+        group_splits = generate_crossval_split(group_ids, seed=12345, n_splits=_n_splits)
         splits = []
         for gs in group_splits:
             tr = sorted(k for g in gs["train"] for k in groups[g])
@@ -1457,9 +1450,11 @@ class PengwinTrainer(_GroupedSplitMixin, nnUNetTrainer):
     # Dataset532는 작은 Sacrum/LH/RH 영역을 포함하기 때문에 foreground patch를 더 공격적으로
     # oversample한다. Contact-LegacyFuse는 sparse한 core/contact-surface class를 가지고 있어서,
     # class-3 / class-4를 명시적으로 추가 sampling한다.
-    PELVIC_DATASETS_OVERSAMPLE_50 = {
-        "Dataset532_PelvicAnatomyV2",
-    }
+    # [cleanup 2026-06-12] Dataset532 (retired) removed; no active dataset
+    # currently oversamples at 0.50 via this set, so it is empty. The `elif
+    # ds_name in self.PELVIC_DATASETS_OVERSAMPLE_50` branch simply never fires
+    # (falls through to the 0.33 default). Re-add a row here to re-enable.
+    PELVIC_DATASETS_OVERSAMPLE_50: set[str] = set()
     ABBC_OFFICIAL_DATASETS: set[str] = set()
 
     # BoundaryDoU는 기본 비활성. PENGWIN 2024 상위 CT 레시피는 DC+CE를 사용하면서
@@ -1485,10 +1480,12 @@ class PengwinTrainer(_GroupedSplitMixin, nnUNetTrainer):
     # Dataset532는 LeftHip과 RightHip을 모두 포함하므로 단순 mirror를 하면 해부학적으로 좌우가
     # 뒤바뀐 이미지가 만들어지는데 라벨은 바뀌지 않은 채로 남는다.
     DISABLE_X_MIRROR_DATASETS = {
-        "Dataset532_PelvicAnatomyV2",
-        # [V0.x][FIX:LR][2026-06-02] Ds539 추가 — diag_hip_precision 조사 결과 hip 저조의
+        # [cleanup 2026-06-12] Dataset532 (retired) removed. The active Ds539
+        # entry below is the live laterality fix and MUST stay (utils QA asserts
+        # 539 ∈ this set).
+        # [V0.x][FIX:LR][2026-06-02] Ds539 — diag_hip_precision 조사 결과 hip 저조의
         # 87.6%가 좌우 hip 스왑(laterality 혼동)이고, axis-2(L/R) mirror augmentation 이
-        # L↔R 교환을 학습시키는 직접 원인. Ds532 와 동일하게 axis-2 mirror 비활성화.
+        # L↔R 교환을 학습시키는 직접 원인. axis-2 mirror 비활성화.
         "Dataset539_PelvicFemurAnatomyV3",
     }
 
@@ -1524,38 +1521,6 @@ class PengwinTrainer(_GroupedSplitMixin, nnUNetTrainer):
                 self.oversample_foreground_percent = 0.66
             else:
                 self.oversample_foreground_percent = 0.50
-        elif ds_name == "Dataset537_PelvicBICMFragmentV5":
-            # [QA][Experiment:V5_sparse_sampling]
-            # nnU-Net 기본 foreground sampling은 case003에서 core/contact를 전혀 예측하지 못했다.
-            # sparse profile은 opt-in이라, 기본 DC+CE 결과는 재현 가능한 상태로 남는다.
-            if oversample_profile == "bicm_v5_sparse":
-                self.oversample_foreground_percent = 1.00
-            elif oversample_profile == "bicm_v6_support_mixed":
-                # [DATA][Risk:High][Scope:support_negative_exposure]
-                # V6.2에서 support/core만 학습해도 여전히 support가 과대예측되는 걸 확인한 뒤,
-                # V6.3은 오로지 crop 분포만 바꾼다. foreground 비율을 1.0이 아니게 두면
-                # 기본 random crop이 진짜 background/외부 negative를 공급할 수 있다.
-                # 이걸로 HD95가 개선된다면 원인은 표현이 아니라 sampling bias였다는 뜻이다.
-                self.oversample_foreground_percent = 0.65
-            elif oversample_profile == "bicm_v7_contact_mixed":
-                # [DATA][Risk:High][Scope:contact_positive_exposure]
-                # support_mixed와 동일한 random-background 비율을 유지한다.
-                # 강제 crop이 발생할 때 어떤 foreground class를 고를지만 달라진다.
-                self.oversample_foreground_percent = 0.65
-            elif oversample_profile == "bicm_v7_contact15_mixed":
-                # [DATA][Risk:High][Scope:contact_positive_exposure]
-                # foreground-vs-random 예산은 support_mixed와 동일. 차이는 forced-class
-                # 분포에서 contact 비율이 5%에서 15%로 바뀐 것 하나뿐이다.
-                self.oversample_foreground_percent = 0.65
-            elif oversample_profile in {"bicm_v11_contact_roi", "bicm_v18_roi_balanced"}:
-                # [DATA][Risk:High][Scope:contact_positive_exposure]
-                # V10에서 V9/V9.1과는 다른 실패가 나타났다: support/core는 안정적이었지만
-                # contact head가 0으로 붕괴했다. 이 프로파일은 positive contact crop 노출을 늘리되,
-                # 아래의 ROI sampling 확률로 no-contact ROI도 배치 흐름에 남겨서
-                # absent-contact 학습이 유지되도록 한다.
-                self.oversample_foreground_percent = 0.80
-            else:
-                self.oversample_foreground_percent = 0.33
         elif ds_name in self.PELVIC_DATASETS_OVERSAMPLE_50:
             if oversample_profile == "weak0123":
                 self.oversample_foreground_percent = 0.66
@@ -2339,150 +2304,11 @@ class PengwinTrainer(_GroupedSplitMixin, nnUNetTrainer):
         return probs
 
     def get_dataloaders(self):
-        """기본 dataloader를 반환하되, opt-in으로 V5 sparse crop steering을 적용한다.
+        """부모 nnU-Net의 기본 dataloader를 그대로 사용한다.
 
-        [QA][Experiment:V5_sparse_sampling]
-        이 메서드는 의도적으로 `Dataset537_PelvicBICMFragmentV5` 데이터셋 +
-        `PENGWIN_OVERSAMPLE_PROFILE=bicm_v5_sparse` 조합에서만 동작한다.
-        그 외 해부학 데이터셋과 V5 plain-DC+CE baseline은 부모 nnU-Net의 dataloader를 그대로 쓴다.
+        활성 anatomy(Dataset539) 및 baseline 경로는 모두 stock nnU-Net dataloader를 쓴다.
         """
-        if (
-            self.plans_manager.dataset_name != "Dataset537_PelvicBICMFragmentV5"
-            or self._pengwin_oversample_profile not in {
-                "bicm_v5_sparse",
-                "bicm_v6_support_mixed",
-                "bicm_v7_contact_mixed",
-                "bicm_v7_contact15_mixed",
-                "bicm_v11_contact_roi",
-                "bicm_v18_roi_balanced",
-            }
-        ):
-            return super().get_dataloaders()
-        patch_size = self.configuration_manager.patch_size
-        if len(patch_size) != 3:
-            raise RuntimeError("BICM V5 sparse sampling supports only 3D fullres training.")
-        deep_supervision_scales = self._get_deep_supervision_scales()
-        rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes = (
-            self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
-        )
-        tr_transforms = self.get_training_transforms(
-            patch_size,
-            rotation_for_DA,
-            deep_supervision_scales,
-            mirror_axes,
-            do_dummy_2d_data_aug,
-            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
-            is_cascaded=self.is_cascaded,
-            foreground_labels=self.label_manager.foreground_labels,
-            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label,
-        )
-        val_transforms = self.get_validation_transforms(
-            deep_supervision_scales,
-            is_cascaded=self.is_cascaded,
-            foreground_labels=self.label_manager.foreground_labels,
-            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label,
-        )
-        tr_keys, val_keys = self.do_split()
-        dataset_tr = nnUNetDataset(
-            self.preprocessed_dataset_folder,
-            tr_keys,
-            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-            num_images_properties_loading_threshold=0,
-        )
-        dataset_val = nnUNetDataset(
-            self.preprocessed_dataset_folder,
-            val_keys,
-            folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-            num_images_properties_loading_threshold=0,
-        )
-        if self._pengwin_oversample_profile == "bicm_v6_support_mixed":
-            forced_distribution = PengwinBICMV5DataLoader3D.SUPPORT_MIXED_CLASS_DISTRIBUTION
-        elif self._pengwin_oversample_profile == "bicm_v7_contact_mixed":
-            forced_distribution = PengwinBICMV5DataLoader3D.CONTACT_MIXED_CLASS_DISTRIBUTION
-        elif self._pengwin_oversample_profile == "bicm_v7_contact15_mixed":
-            forced_distribution = PengwinBICMV5DataLoader3D.CONTACT15_MIXED_CLASS_DISTRIBUTION
-        elif self._pengwin_oversample_profile in {"bicm_v11_contact_roi", "bicm_v18_roi_balanced"}:
-            forced_distribution = PengwinBICMV5DataLoader3D.CONTACT_ROI_CLASS_DISTRIBUTION
-        else:
-            forced_distribution = PengwinBICMV5DataLoader3D.SPARSE_CLASS_DISTRIBUTION
-        self.print_to_log_file(
-            "[PengwinTrainer] BICM train forced class distribution",
-            [(int(k), float(v)) for k, v in forced_distribution],
-        )
-        sampling_probabilities = (
-            self._bicm_contact_roi_sampling_probabilities(dataset_tr)
-            if self._pengwin_oversample_profile == "bicm_v11_contact_roi"
-            else None
-        )
-        if self._pengwin_oversample_profile == "bicm_v18_roi_balanced":
-            # [AUDIT][Risk:High][Scope:single_variable_ablation]
-            # V17은 V11 sampler를 그대로 썼는데, 그 sampler는 contact-positive ROI에
-            # 6배의 case weight를 부여한다. case003에서는 LeftHip contact ROI 하나가
-            # Sacrum/RightHip의 absent-contact 학습을 지배하게 된다.
-            # V18은 ROI case sampling만 uniform으로 되돌리고, V17 분기·V16 loss·
-            # 고정된 target/decoder/threshold/forced class distribution은 그대로 유지한다.
-            #
-            # [QA][Gate:003_roi_absence]
-            # 통과 근거는 full-volume eval에서 와야 한다. 즉 부재해야 할 Sacrum/RightHip
-            # ROI 점수는 0.5 미만으로 떨어지면서 LeftHip contact recall은 무너지지 않아야 한다.
-            self.print_to_log_file(
-                "[PengwinTrainer] BICM V18 ROI sampling = uniform over case/anatomy keys "
-                "(contact-positive ROI weighting disabled)"
-            )
-        dl_tr = PengwinBICMV5DataLoader3D(
-            dataset_tr,
-            self.batch_size,
-            initial_patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            oversample_foreground_percent=self.oversample_foreground_percent,
-            sampling_probabilities=sampling_probabilities,
-            pad_sides=None,
-            transforms=tr_transforms,
-            forced_class_distribution=forced_distribution,
-        )
-        dl_val = nnUNetDataLoader3D(
-            dataset_val,
-            self.batch_size,
-            self.configuration_manager.patch_size,
-            self.configuration_manager.patch_size,
-            self.label_manager,
-            # [DATA][Validation]
-            # Validation은 편향 없이 유지한다. Patch validation은 단순 health check일 뿐,
-            # 진짜 판단 기준은 full-volume bicm-v5-eval JSON이다.
-            oversample_foreground_percent=0.0,
-            sampling_probabilities=None,
-            pad_sides=None,
-            transforms=val_transforms,
-        )
-        allowed_num_processes = get_allowed_n_proc_DA()
-        if allowed_num_processes == 0:
-            mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
-            mt_gen_val = SingleThreadedAugmenter(dl_val, None)
-        else:
-            mt_gen_train = NonDetMultiThreadedAugmenter(
-                data_loader=dl_tr,
-                transform=None,
-                num_processes=allowed_num_processes,
-                num_cached=max(6, allowed_num_processes // 2),
-                seeds=None,
-                pin_memory=self.device.type == "cuda",
-                wait_time=0.002,
-            )
-            mt_gen_val = NonDetMultiThreadedAugmenter(
-                data_loader=dl_val,
-                transform=None,
-                num_processes=max(1, allowed_num_processes // 2),
-                num_cached=max(3, allowed_num_processes // 4),
-                seeds=None,
-                pin_memory=self.device.type == "cuda",
-                wait_time=0.002,
-            )
-        _ = next(mt_gen_train)
-        _ = next(mt_gen_val)
-        return mt_gen_train, mt_gen_val
+        return super().get_dataloaders()
 
     def configure_optimizers(self):
         """SGD + Cosine annealing + warmup (PENGWIN 2024 표준)."""
@@ -3296,7 +3122,10 @@ class PengwinTrainerBoundaryFragmentV3(_GroupedSplitMixin, nnUNetTrainer):
     DEFAULT_LOSS_PROFILE = "boundary_fragment_v3"
     DEFAULT_CE_CLASS_WEIGHTS = "auto"
     DEFAULT_OVERSAMPLE_PROFILE = "boundary_fragment_v3"
-    DISABLE_X_MIRROR_DATASETS = {"Dataset537_PelvicBoundaryFragmentV3"}
+    # [cleanup 2026-06-12] Dataset537 (retired) removed; empty for the active
+    # 538/539 path (neither is 537, so this BoundaryFragmentV3 override never
+    # disabled their mirror anyway). Re-add a row to re-enable for a dataset.
+    DISABLE_X_MIRROR_DATASETS: set[str] = set()
     BOUNDARY_FRAGMENT_USE_STABLE_SCORE = False
     BOUNDARY_FRAGMENT_SAVE_STABLE_CHECKPOINT = False
 
@@ -6130,7 +5959,7 @@ def _build_stunet_from_plan(variant: str, arch_init_kwargs: dict,
     그대로 로드된다.
     """
     if not _STUNET_AVAILABLE:
-        raise RuntimeError("STUNet 백본 import 실패 — stunet.py 확인 필요")
+        raise RuntimeError("STUNet 백본 import 실패 — model.py 의 STUNet 정의 확인 필요")
     strides = [list(s) for s in arch_init_kwargs["strides"][1:]]
     if len(strides) > 5:
         strides = strides[:5]
@@ -6166,7 +5995,7 @@ def _maybe_apply_stunet_warmstart(trainer):
     if not _STUNET_AVAILABLE:
         trainer.print_to_log_file("[STU-Net warm-start] stunet 모듈 없음 — 스킵")
         return
-    from stunet import load_stunet_pretrained_weights
+    from model import load_stunet_pretrained_weights
     inflate = _os.environ.get("PENGWIN_STUNET_INFLATE", "ct0")
     stats = load_stunet_pretrained_weights(trainer.network, path, inflate=inflate)
     trainer._stunet_warmstart_done = True
@@ -6553,5 +6382,172 @@ class PengwinTrainerBoundaryFragmentSidecarCoreRecallDenseCandidateCore025Strong
             boundary_channel_index=2,  # ABBC: 0=background, 1=border, 2=boundary, 3=core
         )
         return wrapped
+
+
+class PengwinTrainerSTUNetBaseABBCPhase1V302(_StunetCleanTrainerMixin, PengwinTrainer):
+    """[PHASE-1 CLEAN] Ds538 leak-free instance-label ABBC 4-class STU-Net-B trainer.
+
+    Successor to the FAILED InstanceConnectivity V301. The loss-level topology penalty there was
+    mis-scaled (~25x the base loss: raw conn ~8.5 vs base ~0.32 from boost=8) and collapsed training
+    the instant it ramped in (epoch 9: train_loss 0.32→1.04, n_pred 3→10, recall/precision→0). The
+    warmup only delayed the collapse. Worse, its premise was a measurement artifact: the per-epoch
+    "recall problem" came from a core-ONLY proxy decode (no regrow), while the REAL submission decoder
+    (watershed regrow) already yields held-out instance-F1 ~0.85. So #1 (topology-in-loss) is retired.
+
+    This trainer trains the plain boundary-weighted ABBC head and lets the real decoder make instances:
+    - Backbone STU-Net-B. Head 4ch ABBC [bg,border,boundary,core], FORCED to 4 (plan num_classes=24).
+    - Input CT-only (1ch). Target = the nnUNet seg-label IS the per-anatomy fragment instance map
+      (relabeled 1..K; -1=ignore, 0=bg) — NO sidecar. The loss builds the ABBC target on the fly.
+    - Loss V291 boundary-weighted ABBC (boundary class CE+Dice ×5; boundary is only ~5% of support).
+    - Validation/ES: the REAL submission decoder decode_task1_v288_abbc (core-seed watershed REGROW +
+      small-CC merge), NOT the old core-only proxy — so the per-epoch instance metrics and the
+      F1-driven ES match the eval/leaderboard decode. pseudo-Dice DISABLED (head=4 != num_classes=24).
+    - Grouped 5-fold split + ES-enforce run_training + warm-start hook inherited (PENGWIN_STUNET_PRETRAINED
+      = 97pt anatomy ckpt, 1ch→1ch, head-skip). See [[pengwin-instance-label-nosidecar]].
+    """
+
+    NUM_EPOCHS_DEFAULT = 1000
+    ES_PATIENCE = 25
+    ES_MIN_DELTA = 5e-3
+    ES_MIN_EPOCHS = 30
+    BG, BORDER, BOUNDARY, CORE = 0, 1, 2, 3
+
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, unpack_dataset: bool = True,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json,
+                         unpack_dataset=unpack_dataset, device=device)
+        self.initial_lr = float(os.environ.get("PENGWIN_INITIAL_LR", "1e-3"))
+        self.ES_MIN_EPOCHS = int(os.environ.get("PENGWIN_ES_MIN_EPOCHS", str(self.ES_MIN_EPOCHS)))
+        self.ES_PATIENCE = int(os.environ.get("PENGWIN_ES_PATIENCE", str(self.ES_PATIENCE)))
+        self.ES_MIN_DELTA = float(os.environ.get("PENGWIN_ES_MIN_DELTA", str(self.ES_MIN_DELTA)))
+        self.print_to_log_file(
+            "[ABBCPhase1V302] backbone=STUNetB out=4 loss=LeakFreeInstanceABBCLoss(boundary-weighted) "
+            f"decode=real-watershed-regrow ds=off num_epochs={self.num_epochs} initial_lr={self.initial_lr} "
+            f"ES(min={self.ES_MIN_EPOCHS},pat={self.ES_PATIENCE},delta={self.ES_MIN_DELTA}) "
+            "warmstart_env=PENGWIN_STUNET_PRETRAINED"
+        )
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name, arch_init_kwargs,
+                                   arch_init_kwargs_req_import, num_input_channels,
+                                   num_output_channels, enable_deep_supervision: bool = True):
+        # plan declares ~24 fragment labels -> num_output_channels arrives as 24; the ABBC head is 4.
+        return _build_stunet_from_plan(
+            "base", arch_init_kwargs, num_input_channels,
+            num_output_channels=4, enable_deep_supervision=False,
+        )
+
+    def _build_loss(self):
+        # Leak-free boundary-weighted ABBC: reads the nnUNet seg-label directly as the per-anatomy
+        # fragment instance map (1..K; -1 ignore, 0 bg), builds the ABBC class target on the fly,
+        # CE+Dice over [bg,border,boundary,core] with boundary class up-weighted ×5 and the nnUNet
+        # ignore region masked out. NO connectivity term (retired #1 collapsed training).
+        return LeakFreeInstanceABBCLoss()
+
+    @staticmethod
+    def _decode_instances(logits: torch.Tensor) -> np.ndarray:
+        """4ch ABBC logits [B,4,Z,Y,X] -> instance map [B,Z,Y,X] via the REAL submission decoder:
+        core(ch3)>=thr CC seeds -> skimage watershed REGROW over support(bg<thr) -> small-CC merge.
+        This is decode_task1_v288_abbc (eval/leaderboard decode) — NOT the old core-only proxy that
+        left fragments eroded and tanked the per-epoch recall. Lazy import avoids the eval<->core cycle."""
+        from eval import decode_task1_v288_abbc, task1_v288_probabilities_from_logits
+        min_vox = int(os.environ.get("PENGWIN_MIN_CC_VOX", "100"))
+        bg_thr = float(os.environ.get("PENGWIN_BG_THRESH", "0.5"))
+        core_thr = float(os.environ.get("PENGWIN_CORE_THRESH", "0.5"))
+        arr = logits.detach().float().cpu().numpy()
+        out = np.zeros((arr.shape[0],) + arr.shape[2:], dtype=np.int32)
+        for b in range(arr.shape[0]):
+            probs = task1_v288_probabilities_from_logits(arr[b])  # [4,Z,Y,X] softmax
+            decoded, _ = decode_task1_v288_abbc(
+                probs, background_threshold=bg_thr, core_threshold=core_thr,
+                min_component_voxels=min_vox)
+            out[b] = decoded.astype(np.int32)
+        return out
+
+    def validation_step(self, batch: dict) -> dict:
+        from utils import instance_iouf
+        data = batch["data"].to(self.device, non_blocking=True)
+        target = batch["target"]
+        if isinstance(target, list):
+            target = [t.to(self.device, non_blocking=True) for t in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
+        with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
+            output = self.network(data)
+            del data
+            loss = self.loss(output, target)
+        logits = output[0] if isinstance(output, (list, tuple)) else output
+        if logits.ndim != 5 or int(logits.shape[1]) != 4:
+            raise ValueError(f"Phase-1 ABBC expects val logits [B,4,Z,Y,X], got {tuple(logits.shape)}")
+        gt = target[0] if isinstance(target, list) else target
+        if gt.ndim == 5 and int(gt.shape[1]) == 1:
+            gt = gt[:, 0]
+        gt = gt.long().clamp_min(0).cpu().numpy()
+        pred_inst = self._decode_instances(logits)
+        iou, rec, prec, npred, ngt = [], [], [], [], []
+        for b in range(gt.shape[0]):
+            try:
+                r = instance_iouf(pred_inst[b], gt[b])
+                ng = max(int(r["n_gt_fragments"]), 0)
+                npd = max(int(r["n_pred_fragments"]), 0)
+                rows = r.get("per_gt", []) or []
+                # match at IoU>=0.5 (standard instance match)
+                matched = [row for row in rows if float(row.get("best_iou", 0.0)) >= 0.5]
+                matched_pred = len({row["best_pred_id"] for row in matched if row.get("best_pred_id") is not None})
+                iou.append(float(r["iou_f_mean"]))
+                rec.append(len(matched) / ng if ng else 0.0)          # recall = matched GT / all GT (under-seg)
+                prec.append(matched_pred / npd if npd else 0.0)       # precision = matched pred / all pred (over-seg)
+                npred.append(float(npd)); ngt.append(float(ng))
+            except Exception:
+                iou.append(0.0); rec.append(0.0); prec.append(0.0); npred.append(0.0); ngt.append(0.0)
+        a = lambda v: np.asarray([float(np.mean(v)) if v else 0.0], dtype=np.float64)
+        return {"loss": loss.detach().cpu().numpy(), "iouf": a(iou), "recall": a(rec),
+                "precision": a(prec), "npred": a(npred), "ngt": a(ngt)}
+
+    def on_validation_epoch_end(self, val_outputs):
+        outputs = collate_outputs(val_outputs)
+        loss_here = float(np.mean(outputs["loss"]))
+        score = float(np.mean(outputs["iouf"]))      # ES driver = instance IoU-F
+        recall = float(np.mean(outputs["recall"])) if "recall" in outputs else 0.0
+        precision = float(np.mean(outputs["precision"])) if "precision" in outputs else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        npred = float(np.mean(outputs["npred"])) if "npred" in outputs else 0.0
+        ngt = float(np.mean(outputs["ngt"])) if "ngt" in outputs else 0.0
+        # ES + checkpoint_best now driven by F1 (balances recall vs precision -> SEES over-seg),
+        # not IoU-F alone which is count-blind. IoU-F still shown in the [instance] line below.
+        self.logger.log("mean_fg_dice", f1, self.current_epoch)
+        self.logger.log("dice_per_class_or_region", [score, recall, precision, f1], self.current_epoch)
+        self.logger.log("val_losses", loss_here, self.current_epoch)
+        # multi-angle instance metrics (recall=under-seg, precision=over-seg, n_pred/n_gt=merge signal)
+        self.print_to_log_file(
+            f"[instance] IoU-F={score:.4f} recall={recall:.4f} precision={precision:.4f} "
+            f"F1={f1:.4f} | n_pred/n_gt={npred:.1f}/{ngt:.1f}"
+        )
+        completed = self.current_epoch + 1
+        if completed >= self.ES_MIN_EPOCHS:
+            ema = float(self.logger.my_fantastic_logging["ema_fg_dice"][-1])
+            if ema > self._es_best_dice + self.ES_MIN_DELTA:
+                self._es_best_dice = ema
+                self._es_no_improve = 0
+            else:
+                self._es_no_improve += 1
+                if self._es_no_improve >= self.ES_PATIENCE and not self._es_triggered:
+                    self._es_triggered = True
+                    self.print_to_log_file(
+                        f"Early stopping: no instance F1 improvement for {self.ES_PATIENCE} epochs. "
+                        f"Best EMA F1={self._es_best_dice:.4f}. Stopping at epoch {completed}."
+                    )
+                    self.num_epochs = completed
+
+    def perform_actual_validation(self, save_probabilities: bool = False):
+        # nnUNet's end-of-training sliding-window validation allocates a num_classes(=24)-channel logits
+        # buffer (predicted_logits[sl] += prediction) but our ABBC head outputs 4 -> 24-vs-4 mismatch.
+        # The per-epoch instance_iouf already drives ES + checkpoint_best selection; the proper full
+        # instance evaluation is run separately via eval.py / experiments tooling (Plan Phase 1.5).
+        self.print_to_log_file(
+            "[Phase1] perform_actual_validation SKIPPED (head=4 != plan num_classes=24; "
+            "ES/checkpoint driven by per-epoch instance_iouf; full instance eval via eval.py)."
+        )
 
 

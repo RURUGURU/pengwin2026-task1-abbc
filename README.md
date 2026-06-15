@@ -99,13 +99,13 @@ github_repo/
 ├── inference/
 │   ├── inference.py                 # Container entrypoint (STU-Net 2-stage + femur + 4-layer robust)
 │   └── pengwin_trainers_shim.py     # nnUNetv2 trainer-discovery shim (re-exports core trainers)
-├── code_task1/
+├── code_task1/                      # 8 modules — single source of truth (mirror of live)
 │   ├── core.py                      # STU-Net trainers + grouped do_split + nnUNet env
-│   ├── stunet.py                    # STU-Net-B backbone (Apache-2.0)
-│   ├── anatomy_registry.py          # anatomy ID-range single source of truth
-│   ├── utils.py, preprocessing.py   # V5 target/decoder + dataset builds
-│   ├── loss.py, model.py, eval.py   # training/eval helpers
-│   └── train.py, visualize.py, run_finetuning_stunet.py
+│   ├── model.py                     # STU-Net-B backbone + warm-start loader (absorbed stunet.py)
+│   ├── utils.py                     # V5 target/decoder + anatomy ID registry (absorbed anatomy_registry.py)
+│   ├── preprocessing.py             # dataset builds + anatomy-prob context (generate-anatomy-prob)
+│   ├── loss.py, eval.py             # ABBC head loss / core-seed watershed decode + official metrics
+│   └── train.py, visualize.py       # train.py = nnUNet entry + `stunet-finetune` (absorbed run_finetuning_stunet.py)
 ├── docs/                            # description.md/.pdf, Comment.txt, AlgorithmRegistration.txt
 ├── LICENSE
 └── README.md
@@ -123,9 +123,9 @@ github_repo/
 ```bash
 # 1. Push + tag the release
 git push origin main
-git tag v1.3.3 && git push origin v1.3.3
+git tag v1.4 && git push origin v1.4
 
-# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.3.3
+# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.4
 #    → wait for the server build to reach "Active"
 
 # 3. Upload model.tar.gz to the algorithm's "Models" tab
@@ -201,6 +201,7 @@ are identical to the baseline — only the algorithm differs.
 | **v1.3.1** | 2026-06-06 | Routing fix (v1.3.0) **plus self-diagnostic logging** — the container now logs the loaded network type (STUNet vs ResEnc), input raw-HU distribution, and each Ds539 anatomy's volume fraction with a GARBAGE flag, so a 0-score GC run self-diagnoses from the build/run log. | **0.799** | **0.919** |
 | **v1.3.2** | 2026-06-07 | **ROOT-CAUSE FIX of the prior ~0 GC scores.** The container pins `nnunetv2==2.5.1`, whose `initialize_from_trained_model_folder()` does **not** load the checkpoint into `predictor.network` (it defers to `perform_actual_prediction()`); our custom predict path bypasses that, so both stages ran with **random weights** → speckle anatomy → ~0. `build_predictor` now loads the weights explicitly (version-independent). Reproduced + verified on 2.5.1: `w0sum` 82.9 (random) → 104.03, Ds539 6812 → 2 CCs. Model unchanged. | **0.799** | **0.919** |
 | **v1.3.3** | 2026-06-07 | **Under-segmentation fix (inference-only, model unchanged).** Disable the non-Sacrum size-ratio merge (0.05→0.0) that collapsed real 1-11cm³ fragments (it had diverged from the validated offline eval). Sacrum keeps its 0.10 precision guard. Local instance proxy: recall 0.46→0.51, F1 0.50→0.55, split_error 0, precision held. Also removed a "bbox>50%" band-aid (ROB-3) + ~120 dead lines. | **0.799** | **0.919** |
+| **v1.4** | 2026-06-15 | **NEW leak-free Stage-B model (V302).** Stage-B fracture model retrained CT-ONLY (1-channel) — removes the V1.3.x Stage-A→B leakage where the old 3-channel input `[CT, Ds539-anatomy-prob, SDF]` fed the Stage-A anatomy probability into Stage-B as an input channel. Leak-free instance-label ABBC training (no sidecar), 97pt warm-start, converged. Dev held-out (132 ROI, official-aligned v2 proxy): Instance F1 **0.896** (vs v1.3.3 0.550 — the fragment-merge weakness is fixed, recall 0.90), Dice 0.824, HD95 13.65mm. Also retired the failed #1 loss-level connectivity-penalty experiment + all legacy. Stage-A anatomy (Ds539 97pt) + cascade + decode UNCHANGED. | _pending_ | _pending_ |
 
 ---
 

@@ -14,17 +14,228 @@ from skimage.measure import regionprops
 from skimage.morphology import ball
 from skimage.segmentation import watershed
 
-from core import ANATOMY_RANGES, DATA_RAW, PAD
-from anatomy_registry import (
-    ANATOMY_REGISTRY,
-    MIN_INSTANCE_ID,
-    MAX_INSTANCE_ID,
-    anatomy_of_id,
-    id_range,
-    valid_instance_mask,
-    anatomy_ranges_by_name,
-    anatomy_start_ids,
-)
+# NOTE [consolidation 2026-06-12]: `DATA_RAW` is imported lazily inside the two
+# functions that use it (find_case_dir / list_cases), and the previously-unused
+# `PAD` import was dropped. This keeps `utils` importable STANDALONE: the anatomy
+# registry below is now defined here and re-exported by `core`, so a module-level
+# `from core import ...` would create a core<->utils import cycle (utils is loaded
+# while core is still partway through defining itself). Deferring core access to
+# call time avoids that entirely (same pattern already used by `list_cases`).
+
+# =============================================================================
+# Anatomy <-> instance-ID registry (consolidated here from the former
+# anatomy_registry.py module — 2026-06-12). This is the single source of truth
+# for the PENGWIN anatomy <-> instance-ID encoding.
+#
+# PENGWIN encodes anatomy identity into each fragment's *global* instance ID via
+# a fixed per-anatomy offset (capacity 50 IDs each)::
+#
+#     Sacrum 1-50,  LeftHip 51-100,  RightHip 101-150,  Femur 151-200
+#
+# Internally the model and loss only ever need ``(anatomy_group, local_id)``; the
+# global ID is purely an *I/O encoding* at the evaluation boundary (the PENGWIN
+# ``.mha`` submission format requires global IDs). All instance-ID arithmetic in
+# ``loss.py`` / ``eval.py`` / ``core.py`` / ``preprocessing.py`` / ``utils.py`` /
+# ``visualize.py`` derives from these definitions so that:
+#
+#   * adding an anatomy (or changing a range) is a one-row edit here, and
+#   * "did we cover every anatomy?" is answerable by inspection rather than by
+#     hunting scattered magic numbers (150, range(1,151), {1:1,2:51,3:101}, ...).
+#
+# DECOY WARNING -- these are *instance* IDs. They are a DIFFERENT namespace from:
+#   * CASE IDs (``is_pelvic``/``is_femur`` in core.py: 1-120 / 151-200 / 251-420),
+#   * HU / CT-clip thresholds (e.g. 150.0, 2000),
+#   * probability thresholds (e.g. 0.50).
+# The same digits (150, 200, 50) appear in all of these. Do NOT route those
+# through this registry; only route true instance-ID arithmetic here.
+#
+# PELVIC-ONLY vs FULL -- some code paths are *deliberately* pelvic-scoped (the raw
+# Dataset537 pelvic source, the 3-anatomy decode proxy). For those, pass
+# ``pelvic_only=True`` so the Femur exclusion is an explicit, reviewable choice
+# instead of a hidden ``<= 150``.
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class Anatomy:
+    """One anatomy's global instance-ID block."""
+
+    name: str
+    index: int  # 1-indexed semantic class (background = 0)
+    id_lo: int
+    id_hi: int
+
+    @property
+    def capacity(self) -> int:
+        return self.id_hi - self.id_lo + 1
+
+
+# THE single source of truth.  Add an anatomy = add one row.
+ANATOMY_REGISTRY: list[Anatomy] = [
+    Anatomy("Sacrum", 1, 1, 50),
+    Anatomy("LeftHip", 2, 51, 100),
+    Anatomy("RightHip", 3, 101, 150),
+    Anatomy("Femur", 4, 151, 200),
+]
+
+# Pelvic-only subset (Sacrum / LeftHip / RightHip). Used by code that is
+# *intentionally* pelvic-scoped; the Femur exclusion there is a semantic choice,
+# made explicit here rather than hidden behind a magic 150.
+PELVIC_ANATOMY_INDICES: tuple[int, ...] = (1, 2, 3)
+
+# -----------------------------------------------------------------------------
+# Derived scalars (never hardcode these downstream).
+# -----------------------------------------------------------------------------
+NUM_ANATOMIES: int = len(ANATOMY_REGISTRY)  # 4 (max semantic anatomy class index)
+MIN_INSTANCE_ID: int = min(a.id_lo for a in ANATOMY_REGISTRY)  # 1
+MAX_INSTANCE_ID: int = max(a.id_hi for a in ANATOMY_REGISTRY)  # 200
+PELVIC_MAX_INSTANCE_ID: int = max(
+    a.id_hi for a in ANATOMY_REGISTRY if a.index in PELVIC_ANATOMY_INDICES
+)  # 150
+INSTANCE_CAPACITY: int = max(a.capacity for a in ANATOMY_REGISTRY)  # 50 (uniform today)
+
+# -----------------------------------------------------------------------------
+# Legacy-compatible views so existing `from core import ANATOMY_RANGES` (and the
+# retired utils.py dicts) keep resolving without behavior change.
+# -----------------------------------------------------------------------------
+ANATOMY_RANGES: list[tuple[str, int, int]] = [
+    (a.name, a.id_lo, a.id_hi) for a in ANATOMY_REGISTRY
+]
+ANATOMY_NAMES: list[str] = [a.name for a in ANATOMY_REGISTRY]
+ANATOMY_RANGE_DICT: dict[str, tuple[int, int]] = {
+    a.name: (a.id_lo, a.id_hi) for a in ANATOMY_REGISTRY
+}
+ANATOMY_TO_INDEX: dict[str, int] = {a.name: a.index for a in ANATOMY_REGISTRY}
+
+_BY_INDEX: dict[int, Anatomy] = {a.index: a for a in ANATOMY_REGISTRY}
+_BY_NAME: dict[str, Anatomy] = {a.name: a for a in ANATOMY_REGISTRY}
+
+# Vectorized id -> anatomy index lookup (slot 0 = background/invalid). Capacity-
+# agnostic: works even if anatomies have non-uniform widths.
+_ID_TO_ANATOMY = np.zeros(MAX_INSTANCE_ID + 1, dtype=np.int16)
+for _a in ANATOMY_REGISTRY:
+    _ID_TO_ANATOMY[_a.id_lo : _a.id_hi + 1] = _a.index
+del _a
+
+
+# =============================================================================
+# Anatomy registry lookups
+# =============================================================================
+def anatomy_by_index(anatomy_index: int) -> Anatomy | None:
+    return _BY_INDEX.get(int(anatomy_index))
+
+
+def anatomy_by_name(name: str) -> Anatomy | None:
+    return _BY_NAME.get(name)
+
+
+def anatomy_of_id(gid: int) -> int:
+    """Semantic anatomy index (1..N) for a global instance id; 0 if bg/invalid."""
+    g = int(gid)
+    a = _BY_INDEX.get(int(_ID_TO_ANATOMY[g])) if 0 <= g <= MAX_INSTANCE_ID else None
+    return a.index if a is not None else 0
+
+
+def id_range(anatomy_index: int) -> tuple[int, int]:
+    """(lo, hi) global-ID block for an anatomy index. Replaces V5_ANATOMY_RANGES[name]."""
+    a = _BY_INDEX[int(anatomy_index)]
+    return (a.id_lo, a.id_hi)
+
+
+def all_anatomy_ranges(pelvic_only: bool = False) -> dict[int, tuple[int, int]]:
+    """{anatomy_index: (lo, hi)}. Replaces scattered {1:(1,50),...} dicts.
+
+    pelvic_only=True omits Femur (the deliberate 3-anatomy proxy view).
+    """
+    return {
+        a.index: (a.id_lo, a.id_hi)
+        for a in ANATOMY_REGISTRY
+        if (not pelvic_only or a.index in PELVIC_ANATOMY_INDICES)
+    }
+
+
+def anatomy_start_ids(pelvic_only: bool = False) -> dict[int, int]:
+    """{anatomy_index: lo}. Replaces next_by_anatomy = {1:1, 2:51, 3:101}[, 4:151]."""
+    return {
+        a.index: a.id_lo
+        for a in ANATOMY_REGISTRY
+        if (not pelvic_only or a.index in PELVIC_ANATOMY_INDICES)
+    }
+
+
+def anatomy_ranges_by_name(pelvic_only: bool = False) -> dict[str, tuple[int, int]]:
+    """{name: (lo, hi)}. Drop-in for V5_ANATOMY_RANGES / V5_ANATOMY_RANGES_WITH_FEMUR."""
+    return {
+        a.name: (a.id_lo, a.id_hi)
+        for a in ANATOMY_REGISTRY
+        if (not pelvic_only or a.index in PELVIC_ANATOMY_INDICES)
+    }
+
+
+# =============================================================================
+# Global <-> local id conversion (capacity-aware; not hardcoded to 50)
+# =============================================================================
+def global_to_local(gid: int) -> int:
+    """Global id -> anatomy-local id (1..capacity); 0 if bg/invalid.
+
+    Replaces ``((id - 1) % 50) + 1``.
+    """
+    g = int(gid)
+    a = _BY_INDEX.get(anatomy_of_id(g))
+    return (g - a.id_lo + 1) if a is not None else 0
+
+
+def local_to_global(anatomy_index: int, local_id: int) -> int:
+    """(anatomy_index, local_id 1..capacity) -> global id.
+
+    Replaces ``id_lo + counter`` reconstruction at the decode boundary.
+    """
+    a = _BY_INDEX[int(anatomy_index)]
+    return a.id_lo + int(local_id) - 1
+
+
+# =============================================================================
+# Vectorized array helpers (replace the scattered magic-number masks)
+# =============================================================================
+def valid_instance_mask(arr: np.ndarray, pelvic_only: bool = False) -> np.ndarray:
+    """Boolean mask of voxels holding a valid global instance id.
+
+    Replaces ``(arr >= 1) & (arr <= 150)`` (and the half-migrated ``<= 200``).
+    pelvic_only=True caps at RightHip (150) for intentionally pelvic-scoped code.
+    """
+    a = np.asarray(arr)
+    hi = PELVIC_MAX_INSTANCE_ID if pelvic_only else MAX_INSTANCE_ID
+    return (a >= MIN_INSTANCE_ID) & (a <= hi)
+
+
+def clip_to_valid_instances(arr: np.ndarray, pelvic_only: bool = False) -> np.ndarray:
+    """Zero out voxels that are not valid instance ids; keep valid ones.
+
+    Replaces ``np.where((inst >= 1) & (inst <= 150), inst, 0)``.
+    """
+    a = np.asarray(arr)
+    return np.where(valid_instance_mask(a, pelvic_only=pelvic_only), a, 0)
+
+
+def anatomy_index_array(arr: np.ndarray) -> np.ndarray:
+    """Per-voxel semantic anatomy index (0 where bg/invalid/out-of-range)."""
+    a = np.asarray(arr)
+    out = np.zeros(a.shape, dtype=np.int16)
+    inb = (a >= 0) & (a <= MAX_INSTANCE_ID)
+    out[inb] = _ID_TO_ANATOMY[a[inb].astype(np.int64)]
+    return out
+
+
+def same_anatomy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Elementwise: do (foreground) global ids a, b belong to the same anatomy?
+
+    Replaces ``((a - 1) // 50) == ((b - 1) // 50)``. Note the ``// 50`` form
+    already handles all four anatomies; this helper is capacity-aware and also
+    excludes background-background matches.
+    """
+    ai = anatomy_index_array(a)
+    bi = anatomy_index_array(b)
+    return (ai == bi) & (ai > 0)
 
 try:
     import SimpleITK as sitk
@@ -71,6 +282,7 @@ def canonicalize_sitk(img: sitk.Image,
 
 def find_case_dir(case_id: str) -> Path | None:
     """Locate case folder under data/task1_2/extracted/<part>/<case_id>/."""
+    from core import DATA_RAW
     cid = str(case_id).zfill(3)
     for part in sorted(DATA_RAW.iterdir()):
         if not part.is_dir():
@@ -83,7 +295,7 @@ def find_case_dir(case_id: str) -> Path | None:
 
 def list_cases(case_filter: str | None = None) -> list[Path]:
     """Return all case dirs, optionally filtered by `pelvic` or `femur`."""
-    from core import is_femur, is_pelvic
+    from core import DATA_RAW, is_femur, is_pelvic
 
     out = []
     for part in sorted(DATA_RAW.iterdir()):
@@ -271,6 +483,17 @@ class BoundaryFragmentParams:
     external_band_mm: float = 3.0
     shell_mm: float = 8.0
     tiny_core_radius_mm: float = 1.5
+    # [2026-06-10] core representation. CANONICAL = "erosion" (the MEASURED winner).
+    # "erosion" = fixed shell_mm erosion (8mm). Hypothesis was it EMPTIES the core for thin
+    # fragments -> point-seed fallback -> speckled core. "medial_skeleton" = medial-axis dynamic
+    # boundary (skeletonize+dilate) was tried to fix that speckle. BUT the held-out eval REFUTED
+    # the hypothesis: medial REGRESSED official metrics (dev IoU-F 0.772 -> 0.711, HD95 19.0 ->
+    # 22.74) despite lowering split_err. The deployed/best model + the canonical
+    # boundary_fragment_v3_targets sidecar are EROSION, so the default is erosion to reproduce the
+    # winner on any sidecar regen. The medial_skeleton branch is retained (below) for revisiting,
+    # not as the default. See analysis/ab_medial_iouf_20260609_checkpoint_best.json.
+    core_mode: str = "erosion"
+    core_dilate_iter: int = 2
 
 
 def pelvic_instance_mask(inst: np.ndarray) -> np.ndarray:
@@ -281,7 +504,8 @@ def pelvic_instance_mask(inst: np.ndarray) -> np.ndarray:
     holds no 151-200 voxels (so the mask is identical there), while per-anatomy
     Femur ROIs are correctly included instead of silently zeroed. Callers that
     genuinely need a 3-anatomy pelvic subset must use the explicit pelvic_only
-    helpers in anatomy_registry, not this function.
+    helpers in the anatomy registry (defined above in this module), not this
+    function.
     """
 
     return valid_instance_mask(inst)
@@ -504,13 +728,30 @@ def compute_boundary_fragment_target(inst: np.ndarray,
         frag_crop = frag[box]
         barrier_crop = barrier[box]
         dist_inside = ndi.distance_transform_edt(frag_crop, sampling=spacing_zyx)
-        core_crop = frag_crop & (dist_inside > float(params.shell_mm)) & ~barrier_crop
-        if core_crop.any():
-            core_cc, n_core_cc = ndi.label(core_crop)
-            if n_core_cc > 1:
-                keep_point = np.unravel_index(int(np.argmax(dist_inside * core_crop)), core_crop.shape)
-                keep_id = int(core_cc[keep_point])
-                core_crop = core_cc == keep_id
+        if params.core_mode == "medial_skeleton":
+            # winner's medial-axis dynamic boundary: core = skeleton (connected centerline,
+            # 1 CC per fragment CC) dilated by core_dilate_iter -> connected, non-empty,
+            # shape-following core for thin AND thick fragments (no fixed-erosion emptying).
+            from skimage.morphology import skeletonize
+            skel = skeletonize(frag_crop)
+            if skel.any():
+                core_crop = (ndi.binary_dilation(skel, iterations=int(params.core_dilate_iter))
+                             & frag_crop & ~barrier_crop)
+            else:
+                core_crop = np.zeros_like(frag_crop)
+            if core_crop.any():
+                core_cc, n_core_cc = ndi.label(core_crop)
+                if n_core_cc > 1:
+                    sizes = np.bincount(core_cc.ravel()); sizes[0] = 0
+                    core_crop = core_cc == int(sizes.argmax())  # keep largest connected tube
+        else:  # legacy "erosion": fixed shell_mm interior (empties thin fragments -> speckle)
+            core_crop = frag_crop & (dist_inside > float(params.shell_mm)) & ~barrier_crop
+            if core_crop.any():
+                core_cc, n_core_cc = ndi.label(core_crop)
+                if n_core_cc > 1:
+                    keep_point = np.unravel_index(int(np.argmax(dist_inside * core_crop)), core_crop.shape)
+                    keep_id = int(core_cc[keep_point])
+                    core_crop = core_cc == keep_id
         core = np.zeros_like(frag)
         core[box] = core_crop
         if not core.any():
@@ -2207,7 +2448,7 @@ def audit_official_target(instances: np.ndarray,
 
 def smoke_test() -> int:
     """Run lightweight checks for the active split anatomy + V68 fragment path."""
-    print("\n=== PENGWIN 2026 code_task1 smoke tests (active V73) ===")
+    print("\n=== PENGWIN 2026 code_task1 smoke tests (active: Ds539 anatomy + Ds538 ABBC, STU-Net-B) ===")
     passed = 0
 
     def _t(name, fn):
@@ -2220,42 +2461,47 @@ def smoke_test() -> int:
             print(f"  FAIL {name}: {e}")
             raise
 
+    # [cleanup 2026-06-07] The previous smoke test asserted a RETIRED contract — Dataset537
+    # active with a phantom "PengwinTrainerBICMInstanceTopologyV73" (no such class), and
+    # DATASETS == [532,533,537]. The active deployed pipeline is Ds539 (anatomy, STU-Net-B)
+    # + Ds538 (fracture ABBC, STU-Net-B). These tests now assert that current reality so a
+    # reader is not misled and `python utils.py test` passes.
+    DS539_TRAINER = "PengwinTrainerSTUNetBaseAnatomyV301"
+    DS538_TRAINER = ("PengwinTrainerBoundaryFragmentSidecarCoreRecall"
+                     "DenseCandidateCore025StrongPeakNoContactABBCSTUNetBV301")
+
     def t01_imports():
         import core, preprocessing, model, train  # noqa: F401
 
     def t02_core_active_registry():
         from core import DATASETS
-        assert sorted(DATASETS) == [532, 533, 537]
-        assert DATASETS[532]["name"] == "Dataset532_PelvicAnatomyV2"
-        assert DATASETS[533]["name"] == "Dataset533_FemurAnatomyV2"
-        assert DATASETS[537]["name"] == "Dataset537_PelvicBICMFragmentV5"
-        assert DATASETS[532]["kind"] == "anatomy_semantic"
-        assert DATASETS[533]["kind"] == "anatomy_semantic"
-        assert DATASETS[537]["kind"] == "bicm_v5"
-        assert DATASETS[537]["trainer"] == "PengwinTrainerBICMInstanceTopologyV73"
+        assert set(DATASETS) == {538, 539}, sorted(DATASETS)  # retired 532/533/537 removed 2026-06-12
+        # active deployed datasets + their REAL trainers:
+        assert DATASETS[539]["name"] == "Dataset539_PelvicFemurAnatomyV3"
+        assert DATASETS[539]["kind"] == "anatomy_semantic"
+        assert DATASETS[539]["trainer"] == DS539_TRAINER
+        assert DATASETS[538]["name"] == "Dataset538_PelvicFemurBICMFragmentV5"
+        assert DATASETS[538]["kind"] == "bicm_v5"
+        assert DATASETS[538]["trainer"] == DS538_TRAINER
 
     def t03_label_map():
         arr = np.array([0, 1, 50, 51, 100, 101, 150, 151, 200, 250])
         assert inst_to_anat(arr).tolist() == [0, 1, 1, 2, 2, 3, 3, 4, 4, 0]
 
     def t04_trainer_attrs():
-        from nnunetv2.training.nnUNetTrainer.variants.pengwin.PengwinTrainer import (
-            PengwinTrainer,
-            PengwinTrainerBICMInstanceTopologyV73,
-        )
-        # [QA][Contract:active_trainer][Status:smoke]
-        # Dataset537 defaults to V73 now. If this test falls back to V72/V71/V70/V69/V68,
-        # V6 factorized support, or the stock V5 softmax trainer, it can silently
-        # repeat a measured failure mode instead of testing the current
-        # instance-aware topology diagnostic.
-        assert PengwinTrainer.DISABLE_X_MIRROR_DATASETS == {"Dataset532_PelvicAnatomyV2"}
-        assert PengwinTrainerBICMInstanceTopologyV73.DEFAULT_LOSS_PROFILE == "bicm_v73_instance_topology"
+        import core
+        # the ACTIVE deployed trainers exist as REAL classes (this used to import a phantom V73).
+        assert hasattr(core, DS539_TRAINER), DS539_TRAINER
+        assert hasattr(core, DS538_TRAINER), DS538_TRAINER
+        # x-mirror is disabled for the L/R-asymmetric anatomy datasets (532 retired, 539 active)
+        assert "Dataset539_PelvicFemurAnatomyV3" in core.PengwinTrainer.DISABLE_X_MIRROR_DATASETS
 
     def t05_train_model_contract():
-        import model, train
-        assert train.DEFAULT_FOLD0_ORDER == [532, 533]
-        assert train.NEED_INIT_FROM_PELVIC == set()
-        assert sorted(model.PENGWIN_PLAN_CONFIGS) == [532, 533, 537]
+        import train
+        # TRAINERS is now derived dynamically from core (no hand-maintained phantom list);
+        # the active trainers must therefore be present.
+        assert DS539_TRAINER in train.TRAINERS
+        assert DS538_TRAINER in train.TRAINERS
 
     tests = [
         ("imports", t01_imports),

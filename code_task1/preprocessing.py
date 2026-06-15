@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""PENGWIN 2026 Task 1 — Dataset preprocessing.
+"""PENGWIN 2026 Task 1 — Dataset preprocessing & sidecar builders.
 
-Active builders:
-    Ds532 PelvicAnatomyV2          — Sacrum/LH/RH semantic target
-    Ds533 FemurAnatomyV2           — Femur semantic target
-    Ds537 PelvicBICMFragmentV5       — per-anatomy BICM fragment specialist
+Active datasets: Ds539 (PelvicFemurAnatomyV3, 5-class anatomy) + Ds538
+(PelvicFemurBICMFragmentV5, per-anatomy ABBC fracture). 532/533/537 retired.
 
-`--dataset all` rebuilds active split anatomy and V5 BICM targets.
+Dataset builder functions (driven by preprocessing/gen_nnunet_dataset.py stages):
+    generate_anatomy_probability_context  — Stage-A anatomy-prob cache (the only inference step)
+    build_anatomy_semantic_dataset(539)   — whole-CT 5-class anatomy target
+    build_bicm_v5_dataset(538)            — per-anatomy 3ch ABBC fragment ROIs
 
-Usage:
-    python preprocessing.py build --dataset 532         # PelvicAnatomyV2
-    python preprocessing.py build --dataset 533         # FemurAnatomyV2
-    python preprocessing.py build --dataset 537
-    python preprocessing.py build --dataset all         # active datasets
-    python preprocessing.py stats                       # data statistics
+CLI (sidecars on the preprocessed grid):
+    python preprocessing.py build-instance-sidecars --dataset 538
+    python preprocessing.py build-boundary-fragment-v3-sidecars --dataset 538
 """
 from __future__ import annotations
 import argparse, json, os, tempfile, time
@@ -47,7 +45,7 @@ from utils import (
 # Registry single source. The per-anatomy BICM V5 sidecar builder handles Femur
 # ROIs (151-200) so it uses the FULL view; legacy pelvic-only V3/V4 builders keep
 # the explicit pelvic_only=True view (their "drop femur" intent stays visible).
-from anatomy_registry import (
+from utils import (
     MAX_INSTANCE_ID,
     PELVIC_MAX_INSTANCE_ID,
     valid_instance_mask,
@@ -56,13 +54,13 @@ configure_nnunet_env()
 log = get_logger(__name__)
 
 
-
-
+V5_INPUT_VARIANTS = ("ct_lut", "ct_lut_anat_sdf")
 # [V0.x][FIX:B1+B2][2026-05-31] Dataset539 5-class anatomy 의 softmax 채널 인덱스.
 # Ds532 4-class (Sacrum=1/LeftHip=2/RightHip=3) 는 그대로 호환되고, Dataset539 의
 # 5-class (Femur=4) 채널이 추가된다. 본 dict 는 Dataset537 (3-anatomy) 과
 # Dataset538 (4-anatomy) 모두에서 anatomy-specific Ds532/539 prob 채널을 찾을 때
 # 사용된다.
+V5_DATASET532_PROB_CHANNEL = {"Sacrum": 1, "LeftHip": 2, "RightHip": 3, "Femur": 4}
 
 
 def _bone_lut_normalize(arr: np.ndarray) -> np.ndarray:
@@ -119,15 +117,37 @@ def canonicalize_and_clip_image(img: sitk.Image) -> tuple[sitk.Image, np.ndarray
     return img_lps, arr
 
 
-def _spacing_zyx(spacing_xyz: tuple[float, float, float] | list[float]) -> tuple[float, float, float]:
-    """Return spacing in numpy array order.
+def assert_lps_image(img: sitk.Image, context: str) -> None:
+    """Fail fast if a generated image is not in the canonical LPS orientation."""
+    code = orientation_code(img)
+    if code != "LPS":
+        raise RuntimeError(f"{context}: expected LPS orientation, got {code}")
 
-    SimpleITK exposes spacing as x/y/z, while `GetArrayFromImage` returns
-    z/y/x. ABBC core generation uses Euclidean distance in millimetres; mixing
-    the order would silently bias seed placement in anisotropic scans.
-    """
-    sx, sy, sz = [float(v) for v in spacing_xyz]
-    return (sz, sy, sx)
+
+def assert_matching_geometry(img: sitk.Image, lbl: sitk.Image, context: str) -> None:
+    """Fail fast if CT/label geometry diverges after canonicalization."""
+    if img.GetSize() != lbl.GetSize():
+        raise RuntimeError(f"{context}: image/label size mismatch {img.GetSize()} != {lbl.GetSize()}")
+    if not np.allclose(img.GetSpacing(), lbl.GetSpacing(), rtol=0, atol=1e-5):
+        raise RuntimeError(f"{context}: image/label spacing mismatch {img.GetSpacing()} != {lbl.GetSpacing()}")
+    if not np.allclose(img.GetOrigin(), lbl.GetOrigin(), rtol=0, atol=1e-4):
+        raise RuntimeError(f"{context}: image/label origin mismatch {img.GetOrigin()} != {lbl.GetOrigin()}")
+    if not np.allclose(img.GetDirection(), lbl.GetDirection(), rtol=0, atol=1e-5):
+        raise RuntimeError(f"{context}: image/label direction mismatch")
+
+
+def _select_case_subset(cases: list[Path], case_subset: list[str] | None) -> list[Path]:
+    """Filter source case directories by zero-padded case IDs."""
+    if not case_subset:
+        return cases
+    wanted = {str(c).zfill(3) for c in case_subset}
+    selected = [cd for cd in cases if cd.name.zfill(3) in wanted]
+    missing = sorted(wanted - {cd.name.zfill(3) for cd in selected})
+    if missing:
+        raise FileNotFoundError(f"case subset missing source cases: {missing}")
+    return selected
+
+
 
 
 
@@ -160,6 +180,560 @@ def ndi_distance_transform(mask: np.ndarray,
     from scipy import ndimage as ndi
 
     return ndi.distance_transform_edt(mask, sampling=spacing_zyx).astype(np.float32, copy=False)
+
+
+def _selected_anatomy_sdf_from_prob(prob: np.ndarray,
+                                    spacing_zyx: tuple[float, float, float],
+                                    clip_mm: float = 40.0) -> np.ndarray:
+    """Signed distance for one Dataset532 anatomy probability channel.
+
+    [AUDIT][Risk:Major][Scope:v7_input_context]
+    This channel is deterministic inference context, not a target-derived
+    feature. It may come from a trained Dataset532 checkpoint, so the build
+    report records the checkpoint and input profile. For production validation,
+    this must be regenerated out-of-fold; six-case root-cause overfits use it
+    only to test whether anatomy support context fixes CT-only support leakage.
+
+    [QC][Invariant:range]
+    Values are clipped/scaled to [-1, 1] and saved as nnU-Net `nonorm`
+    channels. Keeping the range bounded prevents the SDF from dominating the
+    CT-LUT channel solely by numeric scale.
+    """
+    arr = np.asarray(prob, dtype=np.float32)
+    mask = arr >= 0.5
+    if not mask.any():
+        return np.zeros_like(arr, dtype=np.float32)
+    inside = ndi_distance_transform(mask, spacing_zyx)
+    outside = ndi_distance_transform(~mask, spacing_zyx)
+    sdf = np.clip(inside - outside, -float(clip_mm), float(clip_mm)) / float(clip_mm)
+    return sdf.astype(np.float32, copy=False)
+
+
+def _anatomy_context_root(foundation_ds_id: int = 532) -> Path:
+    """[V0.x][FIX:C2][2026-06-01] anatomy-prob 캐시 경로를 foundation_ds_id 로 키잉.
+
+    이전: 경로가 항상 ".../anatomy_context_ds532_checkpoint_best" 로 고정되어, Ds537
+    빌드(foundation=Ds532, 4-class)와 Ds538 빌드(foundation=Ds539, 5-class w/ Femur)가
+    같은 캐시 dir 을 공유했다. 먼저 돈 빌드의 확률맵을 다음 빌드가 (잘못된 foundation 의
+    출력임에도) image.npz 존재만 보고 조용히 재사용하는 cross-foundation 오염 위험.
+
+    현재: 기본 경로를 ".../anatomy_context_ds{foundation_ds_id}_checkpoint_best" 로 분리.
+    명시적 PENGWIN_ABBC_ANATOMY_CONTEXT_ROOT override 는 사용자 의도이므로 그대로 존중한다.
+    """
+    override = os.environ.get("PENGWIN_ABBC_ANATOMY_CONTEXT_ROOT", "").strip()
+    if override:
+        return Path(override)
+    return Path(str(RESULT_VISUALIZE / f"anatomy_context_ds{foundation_ds_id}_checkpoint_best"))
+
+
+def generate_anatomy_probability_context(cases: list[Path],
+                                         foundation_ds_id: int = 539,
+                                         force: bool = False,
+                                         gpu: int = 0,
+                                         checkpoint: str = "checkpoint_best.pth") -> Path:
+    """EXPLICIT Stage-A inference step — the ONLY place build-time inference runs.
+
+    Runs the foundation anatomy model (Ds532 4-class pelvic, or Ds539 5-class
+    with Femur) over `cases` and writes the per-case softmax probability cache
+    `<root>/<cid>/image.npz`. This was previously the lazy tail of
+    `_ensure_ds532_anatomy_probability_context`; it is now a standalone,
+    user-invoked step so the dataset build never infers implicitly.
+
+    인수:
+        cases: 처리할 case Path 목록.
+        foundation_ds_id: anatomy 모델의 Dataset ID. Dataset537 빌드 시 532,
+                          Dataset538 빌드 시 539 사용.
+        force: 기존 cache 무시하고 재생성.
+        gpu: CUDA 디바이스 인덱스.
+        checkpoint: nnUNet checkpoint 파일 이름.
+
+    반환: 캐시 root 경로.
+    """
+    out_root = _anatomy_context_root(foundation_ds_id)
+    missing = []
+    for cd in cases:
+        cid = cd.name.zfill(3)
+        if force or not (out_root / cid / "image.npz").exists():
+            missing.append(cd)
+    if not missing:
+        print(f"  anatomy context cache ready (foundation_ds={foundation_ds_id}): {out_root}")
+        return out_root
+
+    from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+    import torch
+
+    # [FIX:B3] DATASETS[532] 하드코딩 → DATASETS[foundation_ds_id] 동적 lookup.
+    foundation_cfg = DATASETS[foundation_ds_id]
+    # [V0.x][FIX:FT][2026-06-02] foundation trainer 이름을 env 로 override 가능하게.
+    # registry 의 DATASETS[539]["trainer"]="PengwinTrainer" 와 달리, STU-Net 백본 전환 후엔
+    # 실제 학습 trainer 가 PengwinTrainerSTUNetBaseAnatomyV301 이다. checkpoint 경로는
+    # {trainer}__nnUNetResEncUNetLPlans__3d_fullres 로 구성되므로 trainer 이름이 맞아야 한다.
+    # PENGWIN_FOUNDATION_TRAINER 로 지정(없으면 registry 기본값).
+    foundation_trainer = os.environ.get(
+        "PENGWIN_FOUNDATION_TRAINER", foundation_cfg["trainer"]
+    )
+    model_root = (
+        NN_RES / foundation_cfg["name"]
+        / f"{foundation_trainer}__nnUNetResEncUNetLPlans__3d_fullres"
+    )
+    if not (model_root / "fold_0" / checkpoint).exists():
+        raise FileNotFoundError(
+            f"Foundation dataset {foundation_ds_id} ({foundation_cfg['name']}) checkpoint missing: "
+            f"{model_root / 'fold_0' / checkpoint}"
+        )
+    device = torch.device("cuda", int(gpu)) if torch.cuda.is_available() else torch.device("cpu")
+    predictor = nnUNetPredictor(
+        tile_step_size=0.5,
+        use_gaussian=True,
+        use_mirroring=False,
+        perform_everything_on_device=True,
+        device=device,
+        verbose=False,
+        verbose_preprocessing=False,
+        allow_tqdm=False,
+    )
+    predictor.initialize_from_trained_model_folder(
+        str(model_root), use_folds=(0,), checkpoint_name=checkpoint,
+    )
+    print(f"  generating Ds{foundation_ds_id} probability context for {len(missing)} cases -> {out_root}")
+    source_lists = []
+    output_truncated = []
+    meta_rows = []
+    foundation_raw = NN_RAW / foundation_cfg["name"] / "imagesTr"
+    for cd in missing:
+        cid = cd.name.zfill(3)
+        out_dir = out_root / cid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        raw_input = foundation_raw / f"PENGWIN_{cid}_0000.mha"
+        if not raw_input.exists():
+            # [DATA][Scope:anatomy_context][Risk:Major]
+            # Aggressive cleanup may remove nnU-Net raw Dataset532 while keeping
+            # the trained checkpoint. Rebuilding the full anatomy raw dataset
+            # just to run a six-case V7 diagnostic wastes disk. Materialize only
+            # the canonicalized CT required by this context cache; labels are not
+            # needed for inference and no Dataset537 target is derived from this
+            # temporary input.
+            img, arr_img = canonicalize_and_clip_image(sitk.ReadImage(str(cd / "image.mha")))
+            raw_input.parent.mkdir(parents=True, exist_ok=True)
+            save_full_mha(arr_img, img, raw_input, dtype=arr_img.dtype)
+        source_lists.append([str(raw_input)])
+        output_truncated.append(str(out_dir / "image"))
+        meta_rows.append((cid, cd, raw_input, out_dir))
+    predictor.predict_from_files(
+        source_lists,
+        output_truncated,
+        save_probabilities=True,
+        overwrite=True,
+        num_processes_preprocessing=max(1, min(8, int(os.environ.get("PENGWIN_ABBC_CONTEXT_PREPROC", "4")))),
+        num_processes_segmentation_export=max(1, min(4, int(os.environ.get("PENGWIN_ABBC_CONTEXT_EXPORT", "2")))),
+    )
+    for cid, cd, raw_input, out_dir in meta_rows:
+        (out_dir / "context_meta.json").write_text(json.dumps({
+            "case": cid,
+            "source_image": str(cd / "image.mha"),
+            "prepared_input": str(raw_input),
+            "dataset": 532,
+            "checkpoint": checkpoint,
+            "model_root": str(model_root),
+            "channels": ["Sacrum", "LeftHip", "RightHip"],
+        }, indent=2))
+    return out_root
+
+
+def require_anatomy_probability_context(cases: list[Path],
+                                        foundation_ds_id: int = 539) -> Path:
+    """READ-ONLY guard — returns the anatomy-prob cache root, NEVER infers.
+
+    The build consumes this cache. If any case is missing
+    `<root>/<cid>/image.npz`, raise a clear FileNotFoundError telling the user
+    to run the explicit `generate-anatomy-prob` stage first. This function does
+    not load nnUNet, does not touch the GPU, and never writes anything.
+    """
+    out_root = _anatomy_context_root(foundation_ds_id)
+    missing = [cd.name.zfill(3) for cd in cases
+               if not (out_root / cd.name.zfill(3) / "image.npz").exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"anatomy-prob cache missing for {len(missing)} cases under {out_root}; "
+            f"run: python -m gen_nnunet_dataset --stage generate-anatomy-prob "
+            f"--foundation {foundation_ds_id}  "
+            "(the build no longer runs inference implicitly)"
+        )
+    return out_root
+
+
+def build_anatomy_semantic_dataset(ds_id: int, force: bool = False) -> int:
+    """Build a trusted CT → semantic anatomy nnU-Net raw dataset.
+
+    Contract:
+        - Use only original GT labels from `/workspace/data/task1_2/extracted`.
+        - Collapse fragment IDs into the dataset's local anatomy IDs without
+          inventing supervision.
+        - Keep background as one class; air/soft tissue/table/other-bone labels
+          are not verified in Task1/2.
+        - Canonicalize both CT and label to LPS so LH/RH semantics are stable.
+    """
+    cfg = DATASETS[ds_id]
+    dst = NN_RAW / cfg["name"]
+    (dst / "imagesTr").mkdir(parents=True, exist_ok=True)
+    (dst / "labelsTr").mkdir(parents=True, exist_ok=True)
+    cases = list_cases(case_filter=None if cfg["filter"] == "all" else cfg["filter"])
+    local_label_map = {
+        anat: local_idx for local_idx, anat in enumerate(cfg["anatomies"], start=1)
+    }
+    global_label_map = {
+        anat: ANATOMY_NAMES.index(anat) + 1 for anat in cfg["anatomies"]
+    }
+    print(
+        f"[anatomy] Ds{ds_id} {cfg['name']} — {len(cases)} trusted labeled CT cases "
+        f"anatomies={cfg['anatomies']}"
+    )
+
+    # [V0.x][FIX:W1][2026-06-01] --overwrite(force) 시 현재 case 집합에 없는 orphan
+    # 파일만 정리한다. force 는 기존엔 case 파일을 덮어쓰기만 하고 이전 빌드의 다른
+    # case 집합에서 남은 파일은 그대로 두어, "깨끗한 rebuild" 가 아니었다. blanket
+    # rmtree 대신 expected 파일명에 없는 것만 제거해 안전하게 stale 만 지운다.
+    if force:
+        expected_imgs = {f"PENGWIN_{int(cd.name):03d}_0000.mha" for cd in cases}
+        expected_lbls = {f"PENGWIN_{int(cd.name):03d}.mha" for cd in cases}
+        removed = 0
+        for f in (dst / "imagesTr").glob("*.mha"):
+            if f.name not in expected_imgs:
+                f.unlink(); removed += 1
+        for f in (dst / "labelsTr").glob("*.mha"):
+            if f.name not in expected_lbls:
+                f.unlink(); removed += 1
+        if removed:
+            print(f"  [overwrite] removed {removed} stale orphan file(s) from {cfg['name']}")
+
+    for i, cd in enumerate(cases):
+        cid = int(cd.name)
+        out_img = dst / "imagesTr" / f"PENGWIN_{cid:03d}_0000.mha"
+        out_lbl = dst / "labelsTr" / f"PENGWIN_{cid:03d}.mha"
+        if out_img.exists() and out_lbl.exists() and not force:
+            continue
+
+        img, arr_img = canonicalize_and_clip_image(sitk.ReadImage(str(cd / "image.mha")))
+        lbl_img = canonicalize_sitk(sitk.ReadImage(str(cd / "label.mha")))
+        assert_lps_image(img, f"Ds{ds_id} case {cid:03d} CT")
+        assert_lps_image(lbl_img, f"Ds{ds_id} case {cid:03d} label")
+        assert_matching_geometry(img, lbl_img, f"Ds{ds_id} case {cid:03d}")
+
+        inst = sitk.GetArrayFromImage(lbl_img)
+        global_anat = inst_to_anat(inst)
+        anat = np.zeros_like(global_anat, dtype=np.uint8)
+        for name in cfg["anatomies"]:
+            anat[global_anat == global_label_map[name]] = local_label_map[name]
+        values = set(int(v) for v in np.unique(anat))
+        allowed = set(range(int(cfg["n_classes"])))
+        if not values.issubset(allowed):
+            raise RuntimeError(
+                f"Ds{ds_id} case {cid:03d}: labels {sorted(values)} outside {sorted(allowed)}"
+            )
+        if not (anat > 0).any():
+            raise RuntimeError(f"Ds{ds_id} case {cid:03d}: empty foreground after anatomy remap")
+
+        save_full_mha(arr_img, img, out_img, dtype=arr_img.dtype)
+        save_full_mha(anat, lbl_img, out_lbl, dtype=np.uint8)
+        if (i + 1) % 50 == 0:
+            print(f"  [{i+1}/{len(cases)}]")
+
+    labels = {"background": 0}
+    labels.update({name: idx for name, idx in local_label_map.items()})
+    ds_json = {
+        "channel_names": {"0": "CT"},
+        "labels": labels,
+        "numTraining": len(cases),
+        "file_ending": ".mha",
+        "description": (
+            f"PENGWIN 2026 — {cfg['name']} split semantic anatomy target. "
+            f"Original fragment IDs are collapsed to background/{'/'.join(cfg['anatomies'])}; "
+            "no TotalSegmentator, Task3, pseudo-label, or unlabeled source is included."
+        ),
+    }
+    (dst / "dataset.json").write_text(json.dumps(ds_json, indent=2))
+    print(f"  ✅ {cfg['name']} ready")
+    return len(cases)
+
+
+def build_bicm_v5_dataset(ds_id: int,
+                          force: bool = False,
+                          v5_input: str = "ct_lut",
+                          v5_target_profile: str = "v5_tiny_marker",
+                          v5_core_ball_radius_mm: float = 2.5,
+                          v5_core_body_mm: float = 3.0,
+                          v5_contact_band_mm: float = 2.0,
+                          label_mode: str = "instance",
+                          case_subset: list[str] | None = None) -> int:
+    """Dataset537 per-anatomy BICM V5 raw 데이터를 만든다.
+
+    [AUDIT][Risk:High][Scope:pipeline_reset]
+    V5에서는 V4의 factorized / global-pelvis 경로를 더 이상 쓰지 않는다.
+    대신 anatomy 정보를 이용해 Sacrum / LeftHip / RightHip 각각에 대해
+    샘플당 ROI를 하나씩 crop한다. 기본 모델 입력은 CT-LUT 단일 채널이고,
+    V7 진단용 입력 프로파일에서는 target과 trainer는 그대로 둔 채
+    선택된 Dataset532 anatomy probability / SDF 채널을 추가할 수 있다.
+
+    [DATA][Leakage]
+    라벨은 오직 원본 Task1 GT instance map에서만 생성된다. `ct_lut_anat_sdf`
+    가 지정되어 Dataset532 prediction이 사용될 때도, 그 값은 input context
+    로만 저장될 뿐 라벨 생성이나 케이스 선정에는 절대 영향을 주지 않는다.
+
+    [DECOUPLE][2026-06-12]
+    빌드는 더 이상 build-time 추론을 실행하지 않는다. anatomy-prob 캐시는
+    require_anatomy_probability_context() 로 READ-ONLY 소비되며, 캐시가 없으면
+    명확한 FileNotFoundError 로 generate-anatomy-prob 스테이지 실행을 안내한다.
+    """
+    if v5_input not in V5_INPUT_VARIANTS:
+        raise ValueError(f"--v5-input must be one of {V5_INPUT_VARIANTS}, got {v5_input!r}")
+    if v5_target_profile not in V5_TARGET_PROFILES:
+        raise ValueError(f"--v5-target-profile must be one of {V5_TARGET_PROFILES}, got {v5_target_profile!r}")
+    cfg = DATASETS[ds_id]
+    if cfg["kind"] != "bicm_v5":
+        raise ValueError(f"Dataset{ds_id} is not a BICM V5 dataset")
+    dst = NN_RAW / cfg["name"]
+    images_dir = dst / "imagesTr"
+    labels_dir = dst / "labelsTr"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    labels_dir.mkdir(parents=True, exist_ok=True)
+    # [V0.x][FIX:B2][2026-05-31] cfg["filter"] 을 반영한 case 선정.
+    # 이전: 하드코딩 list_cases("pelvic") — 170 femur-only 케이스 누락.
+    # 현재: cfg.filter ("all" / "pelvic" / "femur") 을 그대로 list_cases 에 전달.
+    cases = _select_case_subset(list_cases(cfg["filter"]), case_subset)
+    params = BICMV5Params(
+        target_profile=v5_target_profile,
+        core_ball_radius_mm=float(v5_core_ball_radius_mm),
+        core_body_mm=float(v5_core_body_mm),
+        contact_band_mm=float(v5_contact_band_mm),
+    )
+    pad_vox = int(os.environ.get("PENGWIN_V5_ROI_PAD_VOX", "24"))
+    uses_anatomy_context = (v5_input == "ct_lut_anat_sdf") and label_mode != "instance"
+    context_checkpoint = os.environ.get("PENGWIN_V7_CONTEXT_CHECKPOINT", "checkpoint_best.pth")
+    context_root = None
+    if uses_anatomy_context:
+        # [AUDIT][Risk:High][Scope:input_ablation]
+        # V7 root-cause 실험에서 이 변수 하나만 바꾼다. target, decoder, trainer,
+        # loss, ROI 샘플은 그대로 고정한 채, 모델만 선택된 Dataset532 support
+        # context를 추가로 받는다. 캐시 경로와 checkpoint를 아래에 기록해 두면,
+        # 이후 fold0 작업에서 fold0를 몰래 재사용하는 일 없이 이 부분을
+        # out-of-fold anatomy probability로 교체할 수 있다.
+        # [V0.x][FIX:B3][2026-05-31] cfg["foundation_dataset"] 전달.
+        # Ds537 (foundation=532) → Ds532 anatomy prob 사용 (기존 동작).
+        # Ds538 (foundation=539) → Ds539 anatomy prob 사용 (Femur 포함 5-class).
+        # [DECOUPLE][2026-06-12] _ensure_ds532_anatomy_probability_context(...) 호출을
+        # require_anatomy_probability_context(...) 로 교체 — 빌드는 캐시를 READ-ONLY 로만
+        # 소비하고 절대 추론하지 않는다. 캐시 생성은 generate-anatomy-prob 스테이지가 담당.
+        foundation_ds = int(cfg["foundation_dataset"] or 532)
+        context_root = require_anatomy_probability_context(cases, foundation_ds_id=foundation_ds)
+    if uses_anatomy_context:
+        channel_names = {"0": "nonorm", "1": "nonorm", "2": "nonorm"}
+        input_contract = [
+            "ct_lut",
+            "Dataset532_selected_anatomy_probability",
+            "Dataset532_selected_anatomy_sdf",
+        ]
+    else:
+        channel_names = {"0": "nonorm"}
+        input_contract = ["ct_lut"]
+    rows = []
+    max_k = 0  # instance 모드: dataset.json 라벨 선언용 (관측된 최대 fragment 수)
+    # [V0.x][FIX:B2][2026-05-31] anatomies 카운트는 cfg["anatomies"] 기반.
+    # 단 cfg_anatomies 는 아래 loop 안에서 정의되므로 여기선 cfg 직접 참조.
+    _cfg_anat_count = len(cfg["anatomies"]) if cfg["anatomies"] else len(V5_ANATOMY_RANGES_WITH_FEMUR)
+    _cfg_filter_desc = {"pelvic": "pelvic", "femur": "femur", "all": "pelvic+femur"}.get(cfg["filter"], cfg["filter"])
+    print(
+        f"[bicm_v5] Ds{ds_id} {cfg['name']} — {len(cases)} {_cfg_filter_desc} CT cases "
+        f"x {_cfg_anat_count} anatomy ROI samples input={v5_input} "
+        f"target={v5_target_profile}"
+    )
+    for cd in cases:
+        cid = int(cd.name)
+        img, arr_img = canonicalize_and_clip_image(sitk.ReadImage(str(cd / "image.mha")))
+        lbl_img = canonicalize_sitk(sitk.ReadImage(str(cd / "label.mha")))
+        assert_lps_image(img, f"Ds{ds_id} case {cid:03d} CT")
+        assert_lps_image(lbl_img, f"Ds{ds_id} case {cid:03d} label")
+        assert_matching_geometry(img, lbl_img, f"Ds{ds_id} case {cid:03d}")
+        inst_full = sitk.GetArrayFromImage(lbl_img).astype(np.uint16)
+        spacing_zyx = tuple(float(v) for v in lbl_img.GetSpacing()[::-1])
+        image_channel = _bone_lut_normalize(arr_img)
+        context_probs: dict[str, np.ndarray] = {}
+        if uses_anatomy_context:
+            assert context_root is not None
+            prob_path = context_root / f"{cid:03d}" / "image.npz"
+            probs = _load_probability_npz(prob_path)
+            if tuple(probs.shape[1:]) != tuple(arr_img.shape):
+                raise RuntimeError(
+                    f"Dataset532 context shape mismatch for case {cid:03d}: "
+                    f"prob={tuple(probs.shape[1:])}, ct={tuple(arr_img.shape)}"
+                )
+            # [V0.x][FIX:B1+B2][2026-05-31] cfg.anatomies 에 포함된 채널만 검증.
+            # 이전: V5_DATASET532_PROB_CHANNEL 의 max (=4, Femur 채널 포함) 와 비교.
+            # 현재: cfg.anatomies 에 실제로 필요한 채널의 max 와만 비교.
+            # Ds537 (foundation=Ds532, 4-class) 는 Femur 채널 없이도 동작,
+            # Ds538 (foundation=Ds539, 5-class) 는 Femur 채널까지 검증.
+            cfg_required_anats = cfg["anatomies"] if cfg["anatomies"] else list(V5_DATASET532_PROB_CHANNEL)
+            cfg_required_channels = {a: V5_DATASET532_PROB_CHANNEL[a] for a in cfg_required_anats if a in V5_DATASET532_PROB_CHANNEL}
+            if not cfg_required_channels:
+                raise RuntimeError(f"Ds{ds_id} cfg.anatomies={cfg_required_anats} 에 해당하는 prob 채널이 없음")
+            if probs.shape[0] <= max(cfg_required_channels.values()):
+                raise RuntimeError(
+                    f"foundation dataset context for case {cid:03d} has {probs.shape[0]} channels; "
+                    f"need anatomy channels {cfg_required_channels}"
+                )
+            for anatomy, prob_channel in cfg_required_channels.items():
+                prob = np.asarray(probs[int(prob_channel)], dtype=np.float32)
+                context_probs[anatomy] = prob
+        # [V0.x][FIX:B2][2026-05-31] cfg.anatomies 기반 반복 (Femur 포함 시 4개).
+        # 이전: 하드코딩 V5_ANATOMY_RANGES (3 anatomies) — Femur 미지원.
+        # 현재: cfg["anatomies"] 의 4-anatomy (Dataset538) 또는 3-anatomy (Dataset537) 양쪽 동작.
+        # bbox 가 비어있을 경우, femur-only 케이스에서 Sacrum/LH/RH 의 빈 ROI 가 발생할 수 있으므로
+        # raise 대신 continue 로 건너뛴다 (Dataset538 "all" filter 동작).
+        cfg_anatomies = list(cfg["anatomies"]) if cfg["anatomies"] else list(V5_ANATOMY_RANGES_WITH_FEMUR)
+        for anatomy in cfg_anatomies:
+            if anatomy not in V5_ANATOMY_RANGES_WITH_FEMUR:
+                raise ValueError(f"Ds{ds_id} unknown anatomy {anatomy!r}; supported: {sorted(V5_ANATOMY_RANGES_WITH_FEMUR)}")
+            sample_id = f"PENGWIN_{cid:03d}_{anatomy}"
+            out_imgs = [images_dir / f"{sample_id}_{idx:04d}.mha" for idx in range(len(channel_names))]
+            out_lbl = labels_dir / f"{sample_id}.mha"
+            if all(p.exists() for p in out_imgs) and out_lbl.exists() and not force:
+                continue
+            anat_mask = anatomy_mask_from_instances(inst_full, anatomy)
+            bbox = bbox_from_mask(anat_mask, pad_vox=pad_vox)
+            if bbox is None:
+                # cfg.filter="all" 시 femur-only 케이스에서 pelvic 빈 ROI 발생 가능.
+                # 또는 pelvic-only 케이스에서 Femur 빈 ROI 발생 가능. 양쪽 모두 정상 skip.
+                continue
+            lo, hi = V5_ANATOMY_RANGES_WITH_FEMUR[anatomy]
+            inst_roi = inst_full[bbox]
+            inst_roi = np.where((inst_roi >= lo) & (inst_roi <= hi), inst_roi, 0).astype(np.uint16, copy=False)
+            if label_mode == "instance":
+                # leak-free target: the per-anatomy fragment instance map itself, relabeled to
+                # contiguous 1..K (bg=0). No ABBC-semantic conversion, no sidecar — the custom loss
+                # reads this label directly. Anatomy identity is carried by the ROI (sample_id), not
+                # by an input channel. See docs/Plan.md Phase 0 / [[pengwin-instance-label-nosidecar]].
+                uniq = [int(v) for v in np.unique(inst_roi) if v != 0]
+                if not uniq:
+                    continue  # this anatomy has no fragment in the ROI -> skip
+                remap = {v: i + 1 for i, v in enumerate(uniq)}
+                target = np.zeros(inst_roi.shape, dtype=np.uint8)
+                for v, n in remap.items():
+                    target[inst_roi == v] = n
+                max_k = max(max_k, len(uniq))
+            else:
+                target = compute_bicm_v5_target(inst_roi, spacing_zyx=spacing_zyx, params=params)
+                values = set(int(v) for v in np.unique(target))
+                allowed = set(V5_LABELS.values())
+                if not values.issubset(allowed):
+                    raise RuntimeError(f"{sample_id}: V5 labels {sorted(values)} outside {sorted(allowed)}")
+                if not (target == V5_LABELS["core"]).any():
+                    raise RuntimeError(f"{sample_id}: no V5 core voxels")
+            crop_save_mha(image_channel, img, bbox, out_imgs[0], dtype=np.float32)
+            row_extra = {}
+            if uses_anatomy_context:
+                prob = context_probs[anatomy]
+                # [DATA][Leakage]
+                # 선택된 anatomy 채널은 이번 6-케이스 overfit 진단을 위해 CT와
+                # 동일한 GT ROI로 crop된다. 타겟 생성에는 쓰이지 않지만, 이
+                # 프로파일을 정식 승격(promotion) 근거로 쓰려면 production
+                # fold0에서는 캐시를 out-of-fold anatomy prediction으로 반드시
+                # 교체해야 한다.
+                crop_save_mha(prob, img, bbox, out_imgs[1], dtype=np.float32)
+                prob_roi = prob[bbox]
+                # [QC][Perf:roi_sdf]
+                # 6개의 큰 CT 전체 볼륨에 대해 EDT를 돌리면 수 분이 걸리는데,
+                # 실험의 결론에는 영향을 주지 않는다. 모델은 이 crop 밖의 voxel을
+                # 절대 보지 않으므로, 실제 materialize된 ROI 내부에서만 SDF를
+                # 계산해 시간을 아낀다.
+                sdf_roi = _selected_anatomy_sdf_from_prob(prob_roi, spacing_zyx=spacing_zyx)
+                save_crop_array_mha(sdf_roi, img, bbox, out_imgs[2], dtype=np.float32)
+                row_extra = {
+                    "anatomy_prob_mean": float(np.mean(prob_roi)),
+                    "anatomy_prob_fg_fraction": float(np.mean(prob_roi >= 0.5)),
+                    "anatomy_sdf_mean": float(np.mean(sdf_roi)),
+                }
+            save_crop_array_mha(target, lbl_img, bbox, out_lbl, dtype=np.uint8)
+            row = {
+                "case": f"{cid:03d}",
+                "sample": sample_id,
+                "anatomy": anatomy,
+                "bbox_zyx": [[int(s.start), int(s.stop)] for s in bbox],
+                "labels": label_distribution(target),
+                "input_channels": len(channel_names),
+            }
+            row.update(row_extra)
+            rows.append(row)
+    ds_json = {
+        "channel_names": channel_names,
+        "labels": (
+            {"background": 0, **{f"fragment_{i:02d}": i for i in range(1, max(max_k, 1) + 1)}}
+            if label_mode == "instance" else dict(V5_LABELS)
+        ),
+        # [V0.x][FIX:NT][2026-06-03] numTraining 은 실제 written ROI 수(len(rows)).
+        # 이전: len(cases) * len(cfg_anatomies) — pelvic 케이스엔 Femur ROI 가 없고
+        # femur 케이스엔 pelvic 3-anat ROI 가 없어 빈 ROI 가 skip 되므로 과대계산되어
+        # nnUNetv2_plan_and_preprocess --verify_dataset_integrity 가 실패했다
+        # (subset 3×4=12 vs 실제 5; full 340×4=1360 vs 실제 680). rows 는 위 루프에서
+        # 실제로 기록된 ROI 샘플만 모으므로 dataset.json 의 파일 수와 정확히 일치한다.
+        "numTraining": len(rows),
+        "file_ending": ".mha",
+        "v5_contract": {
+            "input": v5_input,
+            "input_contract": input_contract,
+            "roi_source": (
+                "GT anatomy IDs for raw target/oracle ROI; Dataset532 context, "
+                "if present, is input-only and must be out-of-fold for promotion"
+            ),
+            "anatomy_context": {
+                "enabled": uses_anatomy_context,
+                # [V0.x][FIX:B3][2026-05-31] foundation_dataset 동적 기록.
+                "dataset": DATASETS[int(cfg["foundation_dataset"] or 532)]["name"] if uses_anatomy_context else None,
+                "foundation_dataset_id": int(cfg["foundation_dataset"] or 532) if uses_anatomy_context else None,
+                "checkpoint": context_checkpoint if uses_anatomy_context else None,
+                "cache_root": str(context_root) if uses_anatomy_context and context_root is not None else None,
+                "channel_map": V5_DATASET532_PROB_CHANNEL if uses_anatomy_context else None,
+                "sdf_clip_mm": 40.0 if uses_anatomy_context else None,
+            },
+            "anatomies": list(cfg_anatomies),
+            "target_params": {
+                "exterior_mm": params.exterior_mm,
+                "core_mm": params.core_mm,
+                "core_fallback_radius_vox": params.core_fallback_radius_vox,
+                "target_profile": params.target_profile,
+                "core_ball_radius_mm": params.core_ball_radius_mm,
+                "core_body_mm": params.core_body_mm,
+                "contact_band_mm": params.contact_band_mm,
+                "roi_pad_vox": pad_vox,
+            },
+            "decoder": "core connected components + contact-surface watershed, no threshold sweep",
+        },
+        "description": (
+            f"PENGWIN 2026 — {cfg['name']} V5 per-anatomy BICM target. "
+            "One sample is one CT-LUT anatomy ROI. Labels are background, "
+            "exterior context, interior shell, core, and contact surface."
+        ),
+    }
+    (dst / "dataset.json").write_text(json.dumps(ds_json, indent=2))
+    audit_path = RESULT_REPORT / f"build_bicm_v5_dataset{ds_id}_{RESULT_DATE}.json"
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    audit_path.write_text(json.dumps({
+        "dataset": cfg["name"],
+        "input_variant": v5_input,
+        "input_contract": input_contract,
+        "anatomy_context_root": str(context_root) if context_root is not None else None,
+        "anatomy_context_checkpoint": context_checkpoint if uses_anatomy_context else None,
+        "target_profile": params.target_profile,
+        "core_ball_radius_mm": params.core_ball_radius_mm,
+        "core_body_mm": params.core_body_mm,
+        "contact_band_mm": params.contact_band_mm,
+        "samples": rows,
+    }, indent=2))
+    print(f"  raw audit: {audit_path}")
+    print(f"  ✅ {cfg['name']} ready")
+    # [V0.x][FIX:B2][2026-05-31] 실제 written sample 수 (rows) 반환.
+    # 이전: len(cases) × 3 (V5_ANATOMY_RANGES 길이) — Femur 누락 + skip 미반영.
+    # 현재: 실제 빌드된 sample 수. Dataset538 "all" 시 femur-only 케이스에서
+    # pelvic 3 anat skip 되므로 정확한 count 반환.
+    return len(rows)
 
 
 
@@ -921,7 +1495,7 @@ def main(argv: list[str] | None = None) -> int:
         "build-instance-sidecars",
         help="Build BICM V5 instance sidecars under <preprocessed>/<plan>/bicm_v5_instance_targets/.",
     )
-    p_sidecar.add_argument("--dataset", type=int, default=537, help="nnUNet dataset ID (default 537).")
+    p_sidecar.add_argument("--dataset", type=int, default=538, help="nnUNet dataset ID (default 538).")
     p_sidecar.add_argument("--force", action="store_true", help="Overwrite existing sidecars.")
     p_sidecar.add_argument(
         "--case-subset",
@@ -942,7 +1516,7 @@ def main(argv: list[str] | None = None) -> int:
             "<preprocessed>/<plan>/boundary_fragment_v3_targets/."
         ),
     )
-    p_bfv3.add_argument("--dataset", type=int, default=537, help="nnUNet dataset ID (default 537).")
+    p_bfv3.add_argument("--dataset", type=int, default=538, help="nnUNet dataset ID (default 538).")
     p_bfv3.add_argument("--force", action="store_true", help="Overwrite existing sidecars.")
     p_bfv3.add_argument(
         "--case-subset",
