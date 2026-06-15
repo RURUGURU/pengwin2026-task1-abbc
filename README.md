@@ -123,9 +123,10 @@ github_repo/
 ```bash
 # 1. Push + tag the release
 git push origin main
-git tag v1.4 && git push origin v1.4
+git tag v1.4.1 && git push origin v1.4.1
 
-# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.4
+# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.4.1
+#    (v1.4.1 is an INFERENCE-ONLY patch — the model.tar.gz from v1.4 is UNCHANGED; only rebuild the container)
 #    → wait for the server build to reach "Active"
 
 # 3. Upload model.tar.gz to the algorithm's "Models" tab
@@ -202,6 +203,7 @@ are identical to the baseline — only the algorithm differs.
 | **v1.3.2** | 2026-06-07 | **ROOT-CAUSE FIX of the prior ~0 GC scores.** The container pins `nnunetv2==2.5.1`, whose `initialize_from_trained_model_folder()` does **not** load the checkpoint into `predictor.network` (it defers to `perform_actual_prediction()`); our custom predict path bypasses that, so both stages ran with **random weights** → speckle anatomy → ~0. `build_predictor` now loads the weights explicitly (version-independent). Reproduced + verified on 2.5.1: `w0sum` 82.9 (random) → 104.03, Ds539 6812 → 2 CCs. Model unchanged. | **0.799** | **0.919** |
 | **v1.3.3** | 2026-06-07 | **Under-segmentation fix (inference-only, model unchanged).** Disable the non-Sacrum size-ratio merge (0.05→0.0) that collapsed real 1-11cm³ fragments (it had diverged from the validated offline eval). Sacrum keeps its 0.10 precision guard. Local instance proxy: recall 0.46→0.51, F1 0.50→0.55, split_error 0, precision held. Also removed a "bbox>50%" band-aid (ROB-3) + ~120 dead lines. | **0.799** | **0.919** |
 | **v1.4** | 2026-06-15 | **NEW leak-free Stage-B model (V302).** Stage-B fracture model retrained CT-ONLY (1-channel) — removes the V1.3.x Stage-A→B leakage where the old 3-channel input `[CT, Ds539-anatomy-prob, SDF]` fed the Stage-A anatomy probability into Stage-B as an input channel. Leak-free instance-label ABBC training (no sidecar), 97pt warm-start, converged. Dev held-out (132 ROI, official-aligned v2 proxy): Instance F1 **0.896** (vs v1.3.3 0.550 — the fragment-merge weakness is fixed, recall 0.90), Dice 0.824, HD95 13.65mm. Also retired the failed #1 loss-level connectivity-penalty experiment + all legacy. Stage-A anatomy (Ds539 97pt) + cascade + decode UNCHANGED. | _pending_ | _pending_ |
+| **v1.4.1** | 2026-06-15 | **Inference-only paste fix (model UNCHANGED).** A true END-TO-END dev eval (Stage-A→Stage-B over full cases, not GT-bbox ROIs) revealed that on femur scans, Ds539 paints a phantom pelvic bone whose padded ROI spatially overlaps the real femur; the per-anatomy paste was first-anatomy-wins (`write only where out_slot==0`), so the phantom **blocked** the later femur paste (femur 210k→7.9k voxels, Dice 0.95→0.0). Fix: an anatomy may regrow into background but must not paint into ANOTHER bone's Ds539-argmax territory (`PENGWIN_CONFINE_TO_MASK`, default on). Full 68-case e2e: **Dice 0.706→0.833, IoU 0.659→0.797, HD95 14.9→6.46mm, ASSD 4.34→1.89, F1 0.847→0.925**; 13 weak femur cases (Dice<0.3) → 0, no pelvic regression. HD95/ASSD now ≈ the 2024 CT winner (5.87mm / 1.84). | _pending_ | _pending_ |
 
 ---
 

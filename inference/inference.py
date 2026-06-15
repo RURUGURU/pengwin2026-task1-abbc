@@ -1083,6 +1083,22 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
 
         out_slot = full_label[bbox]
         write_mask = (remapped_crop > 0) & (out_slot == 0)
+        # [v1.4.1 FIX] Do not let an anatomy paint into ANOTHER anatomy's Ds539-argmax territory. The
+        # padded ROI bboxes of two anatomies overlap in space (notably a femur-only scan where Ds539
+        # paints a phantom pelvic bone whose ROI overlaps the real femur). The phantom's watershed
+        # regrows over the shared bone support and, with first-anatomy-wins (out_slot==0), BLOCKS the
+        # later femur -> femur destroyed (210k -> 7.9k voxels, Dice 0.95 -> 0.0). A voxel-into-its-own
+        # mask clip over-clips legitimate regrow (pelvic Dice 0.90 -> 0.76); instead we only forbid
+        # painting into OTHER bones' argmax masks. An anatomy may still regrow freely into background;
+        # it just cannot invade a neighbouring bone. Ds539 argmax is 1-anatomy-per-voxel (disjoint).
+        if os.environ.get("PENGWIN_CONFINE_TO_MASK", "1") == "1":
+            other = np.zeros(img_shape, dtype=bool)
+            for _a, _inf in merged.items():
+                if _a != anatomy and _inf.get('mask') is not None:
+                    other |= np.asarray(_inf['mask']).astype(bool)
+            ob = other[bbox]
+            if ob.shape == write_mask.shape:
+                write_mask = write_mask & ~ob
         out_slot[write_mask] = remapped_crop[write_mask]
         full_label[bbox] = out_slot
         log(f"[{anatomy}] painted {int(write_mask.sum())} voxels, {len(local_ids)} fragments in range [{lo},{hi}]")
