@@ -123,10 +123,10 @@ github_repo/
 ```bash
 # 1. Push + tag the release
 git push origin main
-git tag v1.4.1 && git push origin v1.4.1
+git tag v1.4.2 && git push origin v1.4.2
 
-# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.4.1
-#    (v1.4.1 is an INFERENCE-ONLY patch — the model.tar.gz from v1.4 is UNCHANGED; only rebuild the container)
+# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.4.2
+#    (v1.4.2 is INFERENCE-EQUIVALENT to v1.4.1 — the model.tar.gz from v1.4 is UNCHANGED; only rebuild the container)
 #    → wait for the server build to reach "Active"
 
 # 3. Upload model.tar.gz to the algorithm's "Models" tab
@@ -204,6 +204,7 @@ are identical to the baseline — only the algorithm differs.
 | **v1.3.3** | 2026-06-07 | **Under-segmentation fix (inference-only, model unchanged).** Disable the non-Sacrum size-ratio merge (0.05→0.0) that collapsed real 1-11cm³ fragments (it had diverged from the validated offline eval). Sacrum keeps its 0.10 precision guard. Local instance proxy: recall 0.46→0.51, F1 0.50→0.55, split_error 0, precision held. Also removed a "bbox>50%" band-aid (ROB-3) + ~120 dead lines. | **0.799** | **0.919** |
 | **v1.4** | 2026-06-15 | **NEW leak-free Stage-B model (V302).** Stage-B fracture model retrained CT-ONLY (1-channel) — removes the V1.3.x Stage-A→B leakage where the old 3-channel input `[CT, Ds539-anatomy-prob, SDF]` fed the Stage-A anatomy probability into Stage-B as an input channel. Leak-free instance-label ABBC training (no sidecar), 97pt warm-start, converged. Dev held-out (132 ROI, official-aligned v2 proxy): Instance F1 **0.896** (vs v1.3.3 0.550 — the fragment-merge weakness is fixed, recall 0.90), Dice 0.824, HD95 13.65mm. Also retired the failed #1 loss-level connectivity-penalty experiment + all legacy. Stage-A anatomy (Ds539 97pt) + cascade + decode UNCHANGED. | _pending_ | _pending_ |
 | **v1.4.1** | 2026-06-15 | **Inference-only paste fix (model UNCHANGED).** A true END-TO-END dev eval (Stage-A→Stage-B over full cases, not GT-bbox ROIs) revealed that on femur scans, Ds539 paints a phantom pelvic bone whose padded ROI spatially overlaps the real femur; the per-anatomy paste was first-anatomy-wins (`write only where out_slot==0`), so the phantom **blocked** the later femur paste (femur 210k→7.9k voxels, Dice 0.95→0.0). Fix: an anatomy may regrow into background but must not paint into ANOTHER bone's Ds539-argmax territory (`PENGWIN_CONFINE_TO_MASK`, default on). Full 68-case e2e: **Dice 0.706→0.833, IoU 0.659→0.797, HD95 14.9→6.46mm, ASSD 4.34→1.89, F1 0.847→0.925**; 13 weak femur cases (Dice<0.3) → 0, no pelvic regression. HD95/ASSD now ≈ the 2024 CT winner (5.87mm / 1.84). | _pending_ | _pending_ |
+| **v1.4.2** | 2026-06-17 | **Repo hygiene + dormant knobs (model & inference behavior UNCHANGED from v1.4.1; fresh tag for credential rotation).** Removed ~1,580 lines of dead training code from `code_task1/core.py` (3724→2145: retired BoundaryFragment/Legacy-topology/sidecar dataloader family + helpers + a dead `PengwinTrainer` method + `_V300BoundaryAttentionRefinementNetwork` + unused import) and trimmed `utils.py`/`train.py` — all AST-verified, mirror byte-identical, full import + 5/5 registry smoke-test green. Added the `PengwinTrainerSTUNetBaseABBCXCACSoftPhase1V305` softened-X-CAC **training** trainer (not on the container runtime path). `inference.py`: `DS538_TRAINER` is now `PENGWIN_DS538_TRAINER`-overridable (**default unchanged = V302**) and a dormant `decode_abbc_fuzzy_seed_watershed` is gated by `PENGWIN_FUZZY_SPLIT` (**default OFF**). The deployed cascade, decode, and weights are byte-for-byte the v1.4.1 container → same scores. | _pending_ | _pending_ |
 
 ---
 

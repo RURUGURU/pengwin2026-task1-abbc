@@ -448,22 +448,6 @@ def _resolve_training_profiles(trainer: str,
     )
 
 
-def _dataset_input_channels(ds_id: int) -> int:
-    # core.configure_nnunet_env() normally sets nnUNet_raw on import; the fallback resolves the
-    # real layout (<root>/code_task1/result/raw) from this file's location, not a hardcoded path.
-    _raw_default = Path(__file__).resolve().parent / "result" / "raw"
-    dataset_json = Path(os.environ.get("nnUNet_raw", str(_raw_default))) / DATASETS[ds_id]["name"] / "dataset.json"
-    if not dataset_json.exists():
-        return 1
-    try:
-        payload = json.loads(dataset_json.read_text())
-        return len(payload.get("channel_names", {"0": "CT"}))
-    except Exception:
-        return 1
-
-
-
-
 # =============================================================================
 # train — wraps nnUNetv2_train CLI
 # =============================================================================

@@ -243,7 +243,6 @@ except ImportError:  # allow pure numpy tests to import the module
     sitk = None
 
 
-
 try:
     import cc3d
 except ImportError:  # pragma: no cover - 환경 QA에서 의존성 유무를 별도로 확인한다.
@@ -443,7 +442,6 @@ def prepare_lps_ct_for_nnunet(source_image: str | Path | sitk.Image,
     }
 
 
-
 # =============================================================================
 # 흡수된 BoundaryFragment V3 target/decoder primitives
 # [AUDIT][Risk:High][Scope:module_consolidation]
@@ -509,12 +507,6 @@ def pelvic_instance_mask(inst: np.ndarray) -> np.ndarray:
     """
 
     return valid_instance_mask(inst)
-
-
-def _spacing_zyx(spacing_xyz: tuple[float, float, float] | list[float]) -> tuple[float, float, float]:
-    """SimpleITK spacing is xyz, while arrays are zyx."""
-
-    return (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
 
 
 def _same_anatomy_ids(fragment_id: int) -> tuple[int, int]:
@@ -2467,8 +2459,7 @@ def smoke_test() -> int:
     # + Ds538 (fracture ABBC, STU-Net-B). These tests now assert that current reality so a
     # reader is not misled and `python utils.py test` passes.
     DS539_TRAINER = "PengwinTrainerSTUNetBaseAnatomyV301"
-    DS538_TRAINER = ("PengwinTrainerBoundaryFragmentSidecarCoreRecall"
-                     "DenseCandidateCore025StrongPeakNoContactABBCSTUNetBV301")
+    DS538_TRAINER = "PengwinTrainerSTUNetBaseABBCPhase1V302"
 
     def t01_imports():
         import core, preprocessing, model, train  # noqa: F401
