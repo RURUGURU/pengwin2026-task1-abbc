@@ -532,7 +532,6 @@ except Exception:  # pragma: no cover
 try:
     from loss import (
         LeakFreeInstanceABBCLoss,
-        LeakFreeInstanceXCACLoss,
         DC_CE_BD_loss,
         DC_CE_TV_BD_loss,
         compute_median_frequency_class_weights,
@@ -2118,47 +2117,3 @@ class PengwinTrainerSTUNetBaseABBCPhase1V302(_StunetCleanTrainerMixin, PengwinTr
         )
 
 
-class PengwinTrainerSTUNetBaseABBCXCACPhase1V304(PengwinTrainerSTUNetBaseABBCPhase1V302):
-    """[PHASE-1 X-CAC] V302 + Cross-fragment Core-Adjacency Cut loss to fix the touching-fragment MERGE.
-
-    Root cause (verified, case 294): the core-seed watershed merges touching comminuted fragments because
-    their predicted cores stay 26-connected across the true fracture interface (voxel Dice 0.98 but instance
-    Dice 0.61; topology_consistency ~0.245 systemically). Decode-only fixes failed (V303 mutex over-splits,
-    fuzzy is case-dependent) -> the fix must be in the LOSS.
-
-    IDENTICAL to V302 (STU-Net-B, 4ch ABBC head FORCED to 4, CT-only 1ch input, real watershed-regrow decode,
-    97pt warm-start, grouped split, ES on EMA-F1) EXCEPT the loss = LeakFreeInstanceXCACLoss: base
-    boundary-weighted ABBC + a decode-coupled core-separation cut (drive min(P_core) across true interfaces
-    below the 0.50 seed threshold) + a boundary-floor (fill the carved void so support/regrow are intact),
-    ramped 0->1 over [WARMUP,WARMUP+RAMP] (epoch<=WARMUP == V302 exactly). Decode + submission inference are
-    byte-compatible (head stays 4-ch). The current epoch is pushed into the loss each epoch so the ramp
-    engages. Designed via a judge-panel (X-CAC won 3/3); see docs/Experiments.md.
-    """
-
-    def _build_loss(self):
-        return LeakFreeInstanceXCACLoss()
-
-    def on_train_epoch_start(self):
-        super().on_train_epoch_start()
-        loss = getattr(self, "loss", None)
-        if loss is not None and hasattr(loss, "set_epoch"):
-            loss.set_epoch(int(self.current_epoch))
-
-
-class PengwinTrainerSTUNetBaseABBCXCACSoftPhase1V305(PengwinTrainerSTUNetBaseABBCXCACPhase1V304):
-    """[PHASE-1 X-CAC softened] V304 with a gentler core-separation cut (m=0.35, sep_w=0.7).
-
-    V304 (m=0.30, sep_w=1.0) verdict (2026-06-17, GC-aligned panoptica, femur-worst): X-CAC fixes the merge
-    root cause and improves the GC weak metrics (Instance F1 +0.067, Recall +0.100, Topology +0.060) but
-    OVER-SPLITS slightly, hurting the surface metrics (Fracture Dice -0.017, HD95 +2.11, ASSD +0.33, Split
-    +0.20). The over-split is the only regression. V305 softens the cut to keep the instance/topology gains
-    while recovering surface quality:
-      - margin 0.30 -> 0.35: still < the 0.50 decode threshold (the core CC is still cut), but the hinge stops
-        pressing core down at a higher floor -> less core erosion -> fewer spurious sub-fragments.
-      - sep_w 1.0 -> 0.7: lower separation weight relative to the base ABBC anchor -> gentler cut.
-    Everything else identical to V304 (head 4-ch, decode + submission inference byte-compatible, ramp [20,80],
-    97pt warm-start, set_epoch pushed each epoch). The softening is baked into the class (not env-dependent).
-    """
-
-    def _build_loss(self):
-        return LeakFreeInstanceXCACLoss(margin=0.35, sep_w=0.7)

@@ -41,68 +41,6 @@ from scipy import ndimage as ndi
 from utils import MAX_INSTANCE_ID
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # =============================================================================
 # 1. Boundary DoU loss (3D) — surface-aware regularizer
 # =============================================================================
@@ -372,10 +310,6 @@ class SoftTverskyLoss3D(nn.Module):
             if weight_sum <= 0:
                 return loss
             return loss / weight_sum
-
-
-
-
 
 
 class DC_CE_TV_BD_loss(nn.Module):
@@ -694,116 +628,6 @@ class LeakFreeInstanceABBCLoss(nn.Module):
         if not torch.isfinite(base):
             raise ValueError(f"LeakFreeInstanceABBCLoss produced non-finite loss: {float(base.detach().cpu())}")
         return base
-
-
-class LeakFreeInstanceXCACLoss(LeakFreeInstanceABBCLoss):
-    """ABBC base + Cross-fragment Core-Adjacency Cut (X-CAC) — fixes touching-fragment MERGE at the decode root.
-
-    Verified root cause (case 294): decode reads core=(softmax[3]>=0.50), 26-connects via ndi.label; two
-    touching fragments whose cores stay connected across their TRUE interface form ONE seed -> merge. Voxel
-    Dice+CE is blind (a 1-voxel core bridge costs ~0 overlap). X-CAC adds two leak-free, decode-coupled terms
-    derived only from the instance map, on top of the base boundary-weighted Dice/CE (anchor, weight 1.0):
-
-      L_sep  (KEY): for every 26-neighbour voxel pair straddling a TRUE same-anatomy inter-fragment interface
-                    (a!=b), drive min(P_core(src),P_core(dst)) below margin m=0.30 (< decode threshold 0.50)
-                    via relu(min-m)^2, top-k focused. Pressures the thresholded core CC to be CUT at every true
-                    interface -> correct seed count. Fires ONLY on true interfaces -> cannot split inside a real
-                    fragment (avoids the V303 mutex over-split); relu hinge -> zero grad once cut (no over-erode).
-      L_floor      : on the same edges, push max(P_boundary(src),P_boundary(dst)) above bnd_margin so the carved
-                    core void becomes class-2 boundary (support stays intact -> watershed regrow unchanged),
-                    weighted by GT core-proximity (max_pool3d proxy — NOT scipy EDT, avoids DDP host-sync).
-
-    Weights ramp 0->1 over epochs [WARMUP, WARMUP+RAMP], anchored by base=1.0 (the un-ramped-V301-collapse
-    lesson). At epoch<=WARMUP ramp=0 => identical to LeakFreeInstanceABBCLoss (regression guard). Decode and
-    4-ch head UNCHANGED. set_epoch() is pushed by the trainer's on_train_epoch_start.
-    Envs: PENGWIN_XCAC_{SEP_W,FLOOR_W,MARGIN,BND_MARGIN,WARMUP,RAMP,TOPK_SEP,TOPK_FLOOR,PROX_ALPHA}.
-    """
-
-
-    def __init__(self, margin=None, sep_w=None):
-        super().__init__()
-        g = os.environ.get
-        self.sep_w = float(g("PENGWIN_XCAC_SEP_W", "1.0"))
-        self.floor_w = float(g("PENGWIN_XCAC_FLOOR_W", "0.5"))
-        self.margin = float(g("PENGWIN_XCAC_MARGIN", "0.30"))
-        self.bnd_margin = float(g("PENGWIN_XCAC_BND_MARGIN", "0.50"))
-        self.warmup = int(g("PENGWIN_XCAC_WARMUP", "20"))
-        self.ramp = max(1, int(g("PENGWIN_XCAC_RAMP", "60")))
-        self.topk_sep = float(g("PENGWIN_XCAC_TOPK_SEP", "0.5"))
-        self.topk_floor = float(g("PENGWIN_XCAC_TOPK_FLOOR", "0.15"))
-        self.prox_alpha = float(g("PENGWIN_XCAC_PROX_ALPHA", "4.0"))
-        # explicit constructor args override env (used by the softened V305 trainer so the
-        # softening is baked into the class, not dependent on launch-time env). margin must
-        # stay < the 0.50 decode threshold to still cut the core CC; sep_w<1.0 gentles the cut.
-        if margin is not None:
-            self.margin = float(margin)
-        if sep_w is not None:
-            self.sep_w = float(sep_w)
-        self._epoch = 0
-
-    def set_epoch(self, e):
-        self._epoch = int(e)
-
-    def ramp_now(self):
-        return max(0.0, min(1.0, (self._epoch - self.warmup) / float(self.ramp)))
-
-    @staticmethod
-    def _topk_mean(vals, frac):
-        n = int(vals.numel())
-        if n == 0:
-            return None
-        k = max(1, int(n * float(frac)))
-        if k < n:
-            vals = torch.topk(vals, k=k, largest=True).values
-        return vals.mean()
-
-    def _interface_terms(self, p3, p2, instance, class_target):
-        """L_sep, L_floor over true same-anatomy inter-fragment 26-edges. None if no interface in batch."""
-        core_t = (class_target == self.CORE).float()
-        core_prox = F.max_pool3d(core_t.unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1).detach()
-        IDMAX = INSTANCE_ID_MAX
-        shape = tuple(int(v) for v in instance.shape[1:])
-        sep_vals, floor_vals = [], []
-        for off in AFFINITY13_OFFSETS_ZYX:
-            ssl_z, dsl_z = _offset_slices(shape, off)
-            ssl = (slice(None), *ssl_z)
-            dsl = (slice(None), *dsl_z)
-            a = instance[ssl]
-            b = instance[dsl]
-            a_fg = (a > 0) & (a <= IDMAX)
-            b_fg = (b > 0) & (b <= IDMAX)
-            same = a_fg & b_fg & (((a - 1) // 50) == ((b - 1) // 50))
-            diff = same & (a != b)
-            if not bool(diff.any()):
-                continue
-            mn = torch.minimum(p3[ssl], p3[dsl])[diff]
-            sep_vals.append(torch.relu(mn - self.margin) ** 2)
-            mx = torch.maximum(p2[ssl], p2[dsl])[diff]
-            w = 1.0 + self.prox_alpha * 0.5 * (core_prox[ssl] + core_prox[dsl])[diff]
-            floor_vals.append(w * torch.relu(self.bnd_margin - mx) ** 2)
-        if not sep_vals:
-            return None, None
-        return self._topk_mean(torch.cat(sep_vals), self.topk_sep), self._topk_mean(torch.cat(floor_vals), self.topk_floor)
-
-    def forward(self, pred_logits, target):
-        logits = self._as_full_res(pred_logits)
-        instance, ignore = self._split_instance(target)
-        valid = ~ignore
-        class_target, _support = abbc_class_target(
-            instance, boundary_dilate_vox=self.BOUNDARY_DILATE_VOX, core_erode_vox=self.CORE_ERODE_VOX)
-        cw = torch.ones(self.NUM_CLASSES, device=logits.device)
-        cw[self.BOUNDARY] = self.boundary_class_weight
-        base = self._dice_ce(logits, class_target, valid, cw)
-        total = base
-        ramp = self.ramp_now()
-        if ramp > 0.0:
-            probs = torch.softmax(logits.float(), dim=1)
-            L_sep, L_floor = self._interface_terms(probs[:, self.CORE], probs[:, self.BOUNDARY], instance, class_target)
-            if L_sep is not None:
-                total = base + ramp * (self.sep_w * L_sep + self.floor_w * L_floor)
-        if not torch.isfinite(total):
-            raise ValueError(f"LeakFreeInstanceXCACLoss produced non-finite loss: {float(total.detach().cpu())}")
-        return total
 
 
 if __name__ == "__main__":

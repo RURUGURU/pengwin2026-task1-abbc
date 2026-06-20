@@ -496,69 +496,6 @@ def decode_abbc_core_seed_watershed(
     return decoded.astype(np.uint16, copy=False)
 
 
-def decode_abbc_fuzzy_seed_watershed(
-    probs: np.ndarray,
-    *,
-    background_threshold: float = BACKGROUND_THRESHOLD,
-    min_component_voxels: int = MIN_COMPONENT_VOXELS,
-    fuzzy_core_low: float = None,
-    fuzzy_min_distance: int = None,
-    fuzzy_smooth_sigma: float = None,
-) -> np.ndarray:
-    """Fuzzy-membership core-seed decode for COMMINUTED (small, touching) fragments.
-
-    Root cause (verified on case 294): the hard core seed `probs[3] >= CORE_THRESHOLD (0.50)`
-    drops the weak core of a small comminuted fragment, so touching head/neck pieces share one
-    watershed seed -> they MERGE (pred 2 vs GT 4, union mask perfect, partition wrong). The plain
-    mutex-watershed (#2 / V303) over-corrects -> over-splits (split_err 4.9, topo 0.039).
-
-    Fuzzy middle ground: treat the core channel as a FUZZY membership mu = smooth(probs[3]) in
-    [0,1]. Seed at the SOFT local maxima of mu down to a LOW fuzzy floor (so a weak small-fragment
-    core still gets its own seed), then watershed the -mu landscape so the cut falls at the
-    core-probability VALLEY between two touching pieces (= the fracture surface). Specks below
-    min_component_voxels are reabsorbed into the nearest piece, which prevents the V303-style
-    over-split. Inference-only; gated by PENGWIN_FUZZY_SPLIT (default off => deployment unchanged).
-    """
-    import scipy.ndimage as ndi
-    from skimage.morphology import h_maxima
-    from skimage.segmentation import watershed as _ski_watershed
-
-    # h = prominence floor: a core-membership peak only seeds a SEPARATE fragment if it rises >= h
-    # above the saddle joining it to a higher peak. So two touching pieces split ONLY when the
-    # core-prob VALLEY between them (= the fracture surface) is deep enough; bumpy noise inside one
-    # fragment is merged automatically. This is the key fix vs naive peak_local_max (over-split).
-    h = float(os.environ.get("PENGWIN_FUZZY_H", "0.25")) if fuzzy_core_low is None else float(fuzzy_core_low)
-    sigma = float(os.environ.get("PENGWIN_FUZZY_SIGMA", "1.5")) if fuzzy_smooth_sigma is None else float(fuzzy_smooth_sigma)
-    size_ratio = float(os.environ.get("PENGWIN_FUZZY_SIZE_RATIO", "0.10"))
-
-    background = probs[0] >= float(background_threshold)
-    support = ~background
-    if not support.any():
-        return np.zeros(probs.shape[1:], dtype=np.uint16)
-
-    mu = ndi.gaussian_filter(probs[3].astype(np.float32, copy=False), sigma=sigma)
-    mu = np.where(support, mu, 0.0).astype(np.float32, copy=False)
-    # significant maxima only (morphological dynamics): suppresses shallow bumps within a fragment
-    seeds = h_maxima(mu, float(h)) > 0
-    seed_labels, n_seed = ndi.label(seeds, structure=np.ones((3, 3, 3), dtype=bool))
-    if int(n_seed) <= 0:
-        return _merge_small_components(
-            np.where(support, 1, 0).astype(np.int32), min_component_voxels=int(min_component_voxels)
-        ).astype(np.uint16, copy=False)
-    # watershed the -mu landscape: seeds are basin bottoms, core-prob valleys (fracture surfaces)
-    # become the cut lines. mask=support keeps it inside the bone.
-    labels = _ski_watershed(-mu, markers=seed_labels, mask=support).astype(np.int32, copy=False)
-    fill_mask = support & (labels == 0)
-    if fill_mask.any():
-        nearest = ndi.distance_transform_edt(labels == 0, return_indices=True)[1]
-        labels[fill_mask] = labels[tuple(idx[fill_mask] for idx in nearest)]
-    # reabsorb over-split debris: specks (< min_component_voxels) AND pieces < size_ratio x largest
-    decoded = _merge_small_components(labels, min_component_voxels=int(min_component_voxels))
-    if size_ratio > 0.0:
-        decoded = _merge_by_size_ratio(decoded, size_ratio_keep=size_ratio)
-    return decoded.astype(np.uint16, copy=False)
-
-
 def _merge_small_components(labels: np.ndarray, *, min_component_voxels: int) -> np.ndarray:
     import scipy.ndimage as ndi
 
@@ -1116,17 +1053,12 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         # inside one dominant bone -> too many fragments. Apply an anatomy-specific aggressive
         # merge (size-ratio 0.10 + min 250 voxels) for Sacrum only; femur/hips are genuine
         # multi-fragment bones and keep the defaults (a global merge collapsed their recall).
-        fuzzy_on = os.environ.get("PENGWIN_FUZZY_SPLIT", "0") == "1"
         if anatomy == "Sacrum":
             decoded_pp = decode_abbc_core_seed_watershed(
                 ds538_probs,
                 size_ratio_keep=max(float(ANATOMY_SIZE_RATIO_KEEP), 0.10),
                 min_component_voxels=max(int(MIN_COMPONENT_VOXELS), 250),
             )
-        elif fuzzy_on:
-            # [fuzzy] soft-membership seeding to split COMMINUTED touching fragments (femur/hips)
-            # that the hard core threshold merges. Reabsorbs specks => no V303-style over-split.
-            decoded_pp = decode_abbc_fuzzy_seed_watershed(ds538_probs)
         else:
             decoded_pp = decode_abbc_core_seed_watershed(ds538_probs)
         decoded_crop = resample_label_map_to_original(decoded_pp, ds538_data_props, ds538_predictor)
