@@ -2031,6 +2031,12 @@ class PengwinTrainerSTUNetBaseABBCPhase1V302(_StunetCleanTrainerMixin, PengwinTr
             out[b] = decoded.astype(np.int32)
         return out
 
+    @staticmethod
+    def _val_abbc_logits(logits):
+        """Hook: which channels feed the per-epoch instance decode + the [B,4,...] shape check.
+        The ABBC head is 4ch; affinity subclasses override to slice the ABBC channels [:, :4]."""
+        return logits
+
     def validation_step(self, batch: dict) -> dict:
         from utils import instance_iouf
         data = batch["data"].to(self.device, non_blocking=True)
@@ -2044,6 +2050,7 @@ class PengwinTrainerSTUNetBaseABBCPhase1V302(_StunetCleanTrainerMixin, PengwinTr
             del data
             loss = self.loss(output, target)
         logits = output[0] if isinstance(output, (list, tuple)) else output
+        logits = self._val_abbc_logits(logits)   # affinity trainers slice the ABBC channels [:, :4]
         if logits.ndim != 5 or int(logits.shape[1]) != 4:
             raise ValueError(f"Phase-1 ABBC expects val logits [B,4,Z,Y,X], got {tuple(logits.shape)}")
         gt = target[0] if isinstance(target, list) else target
@@ -2115,5 +2122,41 @@ class PengwinTrainerSTUNetBaseABBCPhase1V302(_StunetCleanTrainerMixin, PengwinTr
             "[Phase1] perform_actual_validation SKIPPED (head=4 != plan num_classes=24; "
             "ES/checkpoint driven by per-epoch instance_iouf; full instance eval via eval.py)."
         )
+
+
+class PengwinTrainerSTUNetBaseAffinityV307(PengwinTrainerSTUNetBaseABBCPhase1V302):
+    """[TIER-1] V302 + an AFFINITY head to break the touching-fragment MERGE ceiling.
+
+    Verified root cause (full-68 dev): recall ceiling ~0.71 = ~40% of GT fragments MERGED at decode;
+    neither loss-level (X-CAC = within-noise) nor decode tweaks (fuzzy = over-split) fixed it on V302's
+    existing ABBC core/boundary signal, which is too NOISY an affinity proxy. Deep-research verdict
+    (GASP CVPR'22): the fix is an AFFINITY head decoded by AVERAGE-LINKAGE agglomeration — mutex-watershed
+    is provably GASP-AbsMax, the least noise-robust criterion (= why V303 affinity+mutex over-split).
+
+    IDENTICAL to V302 EXCEPT: (1) head 4 -> 4+K channels (4 ABBC mask/Dice + K affinity offsets);
+    (2) loss = LeakFreeInstanceABBCAffinityLoss (ABBC + per-offset same-instance BCE from the instance
+    map); (3) the per-epoch instance proxy decodes only the ABBC channels [:4] (fast) — the affinity
+    average-linkage decode is run OFFLINE for the real eval. Warm-start: 97pt base, head reinit on
+    shape mismatch. K = len(loss.AFFINITY_HEAD_OFFSETS).
+    """
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name, arch_init_kwargs,
+                                   arch_init_kwargs_req_import, num_input_channels,
+                                   num_output_channels, enable_deep_supervision: bool = True):
+        from loss import AFFINITY_HEAD_OFFSETS
+        return _build_stunet_from_plan(
+            "base", arch_init_kwargs, num_input_channels,
+            num_output_channels=4 + len(AFFINITY_HEAD_OFFSETS), enable_deep_supervision=False,
+        )
+
+    def _build_loss(self):
+        from loss import LeakFreeInstanceABBCAffinityLoss
+        return LeakFreeInstanceABBCAffinityLoss()
+
+    @staticmethod
+    def _val_abbc_logits(logits):
+        # per-epoch instance proxy + shape-check use the ABBC channels only; affinity decode is offline.
+        return logits[:, :4]
 
 

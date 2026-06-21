@@ -630,5 +630,85 @@ class LeakFreeInstanceABBCLoss(nn.Module):
         return base
 
 
+# =============================================================================
+# Tier-1: affinity head — short+long-range same-instance affinities, decoded by
+# AVERAGE-LINKAGE agglomeration (NOT mutex). Direct instance-map supervision is a
+# DENSE separation signal vs the noisy ABBC boundary class (which both X-CAC and
+# fuzzy decode failed to exploit). Long-range repulsive offsets break the merge.
+# =============================================================================
+AFFINITY_HEAD_OFFSETS = (
+    (1, 0, 0), (0, 1, 0), (0, 0, 1),      # short / attractive (nearest neighbour)
+    (3, 0, 0), (0, 3, 0), (0, 0, 3),      # mid-range
+    (9, 0, 0), (0, 9, 0), (0, 0, 9),      # long-range / repulsive (the merge-breaking lever)
+)
+
+
+def affinity_targets(instance):
+    """instance [B,1,Z,Y,X] or [B,Z,Y,X] int -> (tgt [B,K,Z,Y,X] float, 1=same-instance;
+    msk [B,K,Z,Y,X] bool = both endpoints fg = supervised edges). nnUNet ignore (-1) -> msk 0."""
+    if instance.ndim == 5 and int(instance.shape[1]) == 1:
+        instance = instance[:, 0]
+    inst = instance.long()
+    B = inst.shape[0]
+    shape = tuple(int(v) for v in inst.shape[1:])
+    K = len(AFFINITY_HEAD_OFFSETS)
+    tgt = torch.zeros((B, K, *shape), dtype=torch.float32, device=inst.device)
+    msk = torch.zeros((B, K, *shape), dtype=torch.bool, device=inst.device)
+    for k, off in enumerate(AFFINITY_HEAD_OFFSETS):
+        ssl_z, dsl_z = _offset_slices(shape, off)
+        ssl = (slice(None), *ssl_z)
+        dsl = (slice(None), *dsl_z)
+        a = inst[ssl]
+        b = inst[dsl]
+        a_fg = (a > 0) & (a <= INSTANCE_ID_MAX)
+        b_fg = (b > 0) & (b <= INSTANCE_ID_MAX)
+        valid = a_fg & b_fg
+        tgt[(slice(None), k, *ssl_z)] = (valid & (a == b)).float()
+        msk[(slice(None), k, *ssl_z)] = valid
+    return tgt, msk
+
+
+class LeakFreeInstanceABBCAffinityLoss(LeakFreeInstanceABBCLoss):
+    """[TIER-1] multi-task: ABBC 4-class (mask/Dice, ch 0-3) + K-channel affinity head
+    (ch 4..4+K-1, per-offset same-instance BCE from the instance map). Net output = [B, 4+K, ...].
+    Decoded offline by average-linkage agglomeration on the affinities. aff_w via PENGWIN_AFF_W."""
+
+    def __init__(self, aff_w=None):
+        super().__init__()
+        self.aff_w = float(os.environ.get("PENGWIN_AFF_W", "1.0")) if aff_w is None else float(aff_w)
+        self.K = len(AFFINITY_HEAD_OFFSETS)
+
+    def forward(self, net_output, target):
+        net_output = self._as_full_res(net_output)          # nnUNet may wrap output in a list (deep sup)
+        abbc = super().forward(net_output[:, :4], target)    # ABBC 4-class on channels 0-3 (mask/Dice)
+        aff_logits = net_output[:, 4:4 + self.K]
+        inst = self._as_full_res(target)
+        if inst.ndim == 5 and int(inst.shape[1]) == 1:
+            inst = inst[:, 0]
+        inst = inst.long()
+        fg = (inst > 0) & (inst <= INSTANCE_ID_MAX)
+        shape = tuple(int(v) for v in inst.shape[1:])
+        # per-offset BCE (memory-light: never materialise all K affinity channels at once)
+        tot = aff_logits.sum() * 0.0
+        nval = 0
+        for k, off in enumerate(AFFINITY_HEAD_OFFSETS):
+            ssl_z, dsl_z = _offset_slices(shape, off)
+            ssl = (slice(None), *ssl_z)
+            dsl = (slice(None), *dsl_z)
+            valid = fg[ssl] & fg[dsl]
+            if not bool(valid.any()):
+                continue
+            same = (inst[ssl] == inst[dsl]).float()
+            logit_k = aff_logits[:, k][ssl]
+            bce = F.binary_cross_entropy_with_logits(logit_k, same, reduction="none")
+            tot = tot + bce[valid].sum()
+            nval += int(valid.sum().item())
+        aff = tot / max(nval, 1)
+        total = abbc + self.aff_w * aff
+        if not torch.isfinite(total):
+            raise ValueError(f"LeakFreeInstanceABBCAffinityLoss non-finite: abbc={float(abbc)} aff={float(aff)}")
+        return total
+
+
 if __name__ == "__main__":
     _smoke_test()
