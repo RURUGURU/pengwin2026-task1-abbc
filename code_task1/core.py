@@ -2160,3 +2160,19 @@ class PengwinTrainerSTUNetBaseAffinityV307(PengwinTrainerSTUNetBaseABBCPhase1V30
         return logits[:, :4]
 
 
+class PengwinTrainerSTUNetBaseAffinityV308(PengwinTrainerSTUNetBaseAffinityV307):
+    """[TIER-1 v2] V307 with a CLASS-BALANCED affinity loss.
+
+    V307 (unbalanced per-offset BCE) FAILED: ~95% of supervised voxel-pairs are same-instance, so the
+    affinity head collapsed to predicting same-instance≈1 everywhere (294 femur short-affinity min 0.71,
+    NEVER < 0.5) -> no fracture surfaces detected -> decode under-segments (femur=1, T-invariant).
+    V308 fixes ONLY the loss: aff = 0.5*(L_same + L_diff) (LeakFreeInstanceABBCAffinityLoss(balanced=True))
+    so the rare cross-fragment (fracture) edges weigh equally and the head must learn them. Identical
+    architecture/head/decode otherwise; distinct results dir preserves V307's failed checkpoint.
+    """
+
+    def _build_loss(self):
+        from loss import LeakFreeInstanceABBCAffinityLoss
+        return LeakFreeInstanceABBCAffinityLoss(balanced=True)
+
+

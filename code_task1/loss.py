@@ -673,10 +673,14 @@ class LeakFreeInstanceABBCAffinityLoss(LeakFreeInstanceABBCLoss):
     (ch 4..4+K-1, per-offset same-instance BCE from the instance map). Net output = [B, 4+K, ...].
     Decoded offline by average-linkage agglomeration on the affinities. aff_w via PENGWIN_AFF_W."""
 
-    def __init__(self, aff_w=None):
+    def __init__(self, aff_w=None, balanced=False):
         super().__init__()
         self.aff_w = float(os.environ.get("PENGWIN_AFF_W", "1.0")) if aff_w is None else float(aff_w)
         self.K = len(AFFINITY_HEAD_OFFSETS)
+        # balanced=True (V308): aff = 0.5*(L_same + L_diff) so the RARE cross-fragment (fracture) edges
+        # weigh equally to the ~95% same-instance pairs. V307 used unbalanced BCE -> the head collapsed
+        # to same-instance≈1 everywhere (min affinity 0.71, never detected a fracture) -> under-seg.
+        self.balanced = bool(balanced)
 
     def forward(self, net_output, target):
         net_output = self._as_full_res(net_output)          # nnUNet may wrap output in a list (deep sup)
@@ -688,9 +692,11 @@ class LeakFreeInstanceABBCAffinityLoss(LeakFreeInstanceABBCLoss):
         inst = inst.long()
         fg = (inst > 0) & (inst <= INSTANCE_ID_MAX)
         shape = tuple(int(v) for v in inst.shape[1:])
-        # per-offset BCE (memory-light: never materialise all K affinity channels at once)
-        tot = aff_logits.sum() * 0.0
-        nval = 0
+        # per-offset BCE (memory-light), accumulating same- and diff-instance edges SEPARATELY
+        same_sum = aff_logits.sum() * 0.0
+        diff_sum = aff_logits.sum() * 0.0
+        n_same = 0
+        n_diff = 0
         for k, off in enumerate(AFFINITY_HEAD_OFFSETS):
             ssl_z, dsl_z = _offset_slices(shape, off)
             ssl = (slice(None), *ssl_z)
@@ -698,12 +704,18 @@ class LeakFreeInstanceABBCAffinityLoss(LeakFreeInstanceABBCLoss):
             valid = fg[ssl] & fg[dsl]
             if not bool(valid.any()):
                 continue
-            same = (inst[ssl] == inst[dsl]).float()
-            logit_k = aff_logits[:, k][ssl]
-            bce = F.binary_cross_entropy_with_logits(logit_k, same, reduction="none")
-            tot = tot + bce[valid].sum()
-            nval += int(valid.sum().item())
-        aff = tot / max(nval, 1)
+            sm = inst[ssl] == inst[dsl]
+            bce = F.binary_cross_entropy_with_logits(aff_logits[:, k][ssl], sm.float(), reduction="none")
+            same_m = valid & sm
+            diff_m = valid & (~sm)
+            if bool(same_m.any()):
+                same_sum = same_sum + bce[same_m].sum(); n_same += int(same_m.sum().item())
+            if bool(diff_m.any()):
+                diff_sum = diff_sum + bce[diff_m].sum(); n_diff += int(diff_m.sum().item())
+        if self.balanced:
+            aff = 0.5 * (same_sum / max(n_same, 1) + diff_sum / max(n_diff, 1))
+        else:
+            aff = (same_sum + diff_sum) / max(n_same + n_diff, 1)   # V307 (unbalanced) — kept reproducible
         total = abbc + self.aff_w * aff
         if not torch.isfinite(total):
             raise ValueError(f"LeakFreeInstanceABBCAffinityLoss non-finite: abbc={float(abbc)} aff={float(aff)}")

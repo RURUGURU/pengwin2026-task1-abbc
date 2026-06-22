@@ -94,7 +94,7 @@ DS538_TRAINER = os.environ.get("PENGWIN_DS538_TRAINER", "PengwinTrainerSTUNetBas
 DS538_PLANS = "nnUNetResEncUNetLPlans"
 DS538_CONFIG = "3d_fullres"
 DS538_FOLD = 0
-DS538_OUTPUT_CHANNELS = 4  # ABBC: background, border, boundary, core
+DS538_OUTPUT_CHANNELS = int(os.environ.get("PENGWIN_DS538_OUT_CH", "4"))  # ABBC 4ch (V302); 13 for V307 affinity head (4 ABBC + 9 affinity)
 CHECKPOINT_NAME = "checkpoint_best.pth"
 
 # --- anatomy contract (anatomy_registry 와 일치).
@@ -1043,24 +1043,40 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         ds538_logits_pp, ds538_data_props = predict_logits_full(
             ds538_predictor, ds538_image_4d, ds538_props, output_channels=DS538_OUTPUT_CHANNELS,
         )
-        ds538_probs = softmax_axis0(ds538_logits_pp)
-        _dump_dir = os.environ.get("PENGWIN_DUMP_PROBS", "")
-        if _dump_dir:
-            os.makedirs(_dump_dir, exist_ok=True)
-            np.save(os.path.join(_dump_dir, f"probs_{anatomy}.npy"), ds538_probs.astype(np.float16))
-            log(f"[dump] saved ds538_probs {anatomy} -> {_dump_dir}")
-        # [2026-06-06] Sacrum over-segments — its predicted core speckles into spurious islands
-        # inside one dominant bone -> too many fragments. Apply an anatomy-specific aggressive
-        # merge (size-ratio 0.10 + min 250 voxels) for Sacrum only; femur/hips are genuine
-        # multi-fragment bones and keep the defaults (a global merge collapsed their recall).
-        if anatomy == "Sacrum":
-            decoded_pp = decode_abbc_core_seed_watershed(
-                ds538_probs,
-                size_ratio_keep=max(float(ANATOMY_SIZE_RATIO_KEEP), 0.10),
-                min_component_voxels=max(int(MIN_COMPONENT_VOXELS), 250),
-            )
+        # [TIER-1 experiment, env-gated] V307 affinity head: Ds538 output is 4 ABBC + K affinity
+        # channels. Split -> softmax(ABBC[:4]) + sigmoid(affinity[4:]) -> average-linkage
+        # agglomeration on the LEARNED affinities. Default OFF -> V302 (4ch) path unchanged.
+        if os.environ.get("PENGWIN_AFFINITY_DECODE", "0") == "1":
+            import sys as _sys
+            _ep = "/home/guest/Project/PENGWIN2026/experiments"
+            if _ep not in _sys.path:
+                _sys.path.insert(0, _ep)
+            from agglo_decode import decode_affinity_agglo
+            _abbc = softmax_axis0(ds538_logits_pp[:4])
+            _aff = 1.0 / (1.0 + np.exp(-np.asarray(ds538_logits_pp[4:], dtype=np.float32)))
+            if os.environ.get("PENGWIN_AFF_STATS", "0") == "1":
+                _sh = _aff[:3]  # short-range channels
+                log(f"[aff:{anatomy}] all: mean={float(_aff.mean()):.3f} frac<0.5={float((_aff<0.5).mean()):.4f} | short: mean={float(_sh.mean()):.3f} frac<0.5={float((_sh<0.5).mean()):.4f} min={float(_sh.min()):.3f}")
+            decoded_pp = decode_affinity_agglo(_abbc, _aff, T=float(os.environ.get("PENGWIN_AGGLO_T", "0.45")))
         else:
-            decoded_pp = decode_abbc_core_seed_watershed(ds538_probs)
+            ds538_probs = softmax_axis0(ds538_logits_pp)
+            _dump_dir = os.environ.get("PENGWIN_DUMP_PROBS", "")
+            if _dump_dir:
+                os.makedirs(_dump_dir, exist_ok=True)
+                np.save(os.path.join(_dump_dir, f"probs_{anatomy}.npy"), ds538_probs.astype(np.float16))
+                log(f"[dump] saved ds538_probs {anatomy} -> {_dump_dir}")
+            # [2026-06-06] Sacrum over-segments — its predicted core speckles into spurious islands
+            # inside one dominant bone -> too many fragments. Apply an anatomy-specific aggressive
+            # merge (size-ratio 0.10 + min 250 voxels) for Sacrum only; femur/hips are genuine
+            # multi-fragment bones and keep the defaults (a global merge collapsed their recall).
+            if anatomy == "Sacrum":
+                decoded_pp = decode_abbc_core_seed_watershed(
+                    ds538_probs,
+                    size_ratio_keep=max(float(ANATOMY_SIZE_RATIO_KEEP), 0.10),
+                    min_component_voxels=max(int(MIN_COMPONENT_VOXELS), 250),
+                )
+            else:
+                decoded_pp = decode_abbc_core_seed_watershed(ds538_probs)
         decoded_crop = resample_label_map_to_original(decoded_pp, ds538_data_props, ds538_predictor)
 
         # 라벨 재매핑 후 전체 볼륨에 paste
