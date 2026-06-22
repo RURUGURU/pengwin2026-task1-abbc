@@ -2124,20 +2124,21 @@ class PengwinTrainerSTUNetBaseABBCPhase1V302(_StunetCleanTrainerMixin, PengwinTr
         )
 
 
-class PengwinTrainerSTUNetBaseAffinityV307(PengwinTrainerSTUNetBaseABBCPhase1V302):
-    """[TIER-1] V302 + an AFFINITY head to break the touching-fragment MERGE ceiling.
+class PengwinTrainerSTUNetBaseAffinityV308(PengwinTrainerSTUNetBaseABBCPhase1V302):
+    """[TIER-1] V302 + an AFFINITY head decoded by AVERAGE-LINKAGE agglomeration, to break the
+    touching-fragment MERGE ceiling (recall ~0.71 = ~40% of GT fragments merged at decode).
 
-    Verified root cause (full-68 dev): recall ceiling ~0.71 = ~40% of GT fragments MERGED at decode;
-    neither loss-level (X-CAC = within-noise) nor decode tweaks (fuzzy = over-split) fixed it on V302's
-    existing ABBC core/boundary signal, which is too NOISY an affinity proxy. Deep-research verdict
-    (GASP CVPR'22): the fix is an AFFINITY head decoded by AVERAGE-LINKAGE agglomeration — mutex-watershed
-    is provably GASP-AbsMax, the least noise-robust criterion (= why V303 affinity+mutex over-split).
+    Deep-research (GASP CVPR'22): mutex-watershed is GASP-AbsMax = least noise-robust (= why V303 over-split);
+    average-linkage agglomeration on a LEARNED affinity is the fix. (Loss-level X-CAC = within-noise; decode
+    tweaks fuzzy = over-split; V307's UNBALANCED affinity BCE collapsed to affinity~1 everywhere because ~95%
+    of pairs are same-instance — all RETIRED, see docs/Experiments.md + [[pengwin-affinity-agglo-direction]].)
 
     IDENTICAL to V302 EXCEPT: (1) head 4 -> 4+K channels (4 ABBC mask/Dice + K affinity offsets);
-    (2) loss = LeakFreeInstanceABBCAffinityLoss (ABBC + per-offset same-instance BCE from the instance
-    map); (3) the per-epoch instance proxy decodes only the ABBC channels [:4] (fast) — the affinity
-    average-linkage decode is run OFFLINE for the real eval. Warm-start: 97pt base, head reinit on
-    shape mismatch. K = len(loss.AFFINITY_HEAD_OFFSETS).
+    (2) loss = LeakFreeInstanceABBCAffinityLoss = ABBC + CLASS-BALANCED per-offset same-instance BCE
+    (0.5*(L_same+L_diff)) so the rare cross-fragment fracture edges aren't drowned; (3) the per-epoch
+    instance proxy decodes only the ABBC channels [:4] via _val_abbc_logits (fast) — the affinity
+    average-linkage decode (PENGWIN_AFFINITY_DECODE) is run OFFLINE. Warm-start: 97pt base, head reinit
+    on shape mismatch. K = len(loss.AFFINITY_HEAD_OFFSETS).
     """
 
     @staticmethod
@@ -2158,21 +2159,5 @@ class PengwinTrainerSTUNetBaseAffinityV307(PengwinTrainerSTUNetBaseABBCPhase1V30
     def _val_abbc_logits(logits):
         # per-epoch instance proxy + shape-check use the ABBC channels only; affinity decode is offline.
         return logits[:, :4]
-
-
-class PengwinTrainerSTUNetBaseAffinityV308(PengwinTrainerSTUNetBaseAffinityV307):
-    """[TIER-1 v2] V307 with a CLASS-BALANCED affinity loss.
-
-    V307 (unbalanced per-offset BCE) FAILED: ~95% of supervised voxel-pairs are same-instance, so the
-    affinity head collapsed to predicting same-instance≈1 everywhere (294 femur short-affinity min 0.71,
-    NEVER < 0.5) -> no fracture surfaces detected -> decode under-segments (femur=1, T-invariant).
-    V308 fixes ONLY the loss: aff = 0.5*(L_same + L_diff) (LeakFreeInstanceABBCAffinityLoss(balanced=True))
-    so the rare cross-fragment (fracture) edges weigh equally and the head must learn them. Identical
-    architecture/head/decode otherwise; distinct results dir preserves V307's failed checkpoint.
-    """
-
-    def _build_loss(self):
-        from loss import LeakFreeInstanceABBCAffinityLoss
-        return LeakFreeInstanceABBCAffinityLoss(balanced=True)
 
 

@@ -673,14 +673,10 @@ class LeakFreeInstanceABBCAffinityLoss(LeakFreeInstanceABBCLoss):
     (ch 4..4+K-1, per-offset same-instance BCE from the instance map). Net output = [B, 4+K, ...].
     Decoded offline by average-linkage agglomeration on the affinities. aff_w via PENGWIN_AFF_W."""
 
-    def __init__(self, aff_w=None, balanced=False):
+    def __init__(self, aff_w=None):
         super().__init__()
         self.aff_w = float(os.environ.get("PENGWIN_AFF_W", "1.0")) if aff_w is None else float(aff_w)
         self.K = len(AFFINITY_HEAD_OFFSETS)
-        # balanced=True (V308): aff = 0.5*(L_same + L_diff) so the RARE cross-fragment (fracture) edges
-        # weigh equally to the ~95% same-instance pairs. V307 used unbalanced BCE -> the head collapsed
-        # to same-instance≈1 everywhere (min affinity 0.71, never detected a fracture) -> under-seg.
-        self.balanced = bool(balanced)
 
     def forward(self, net_output, target):
         net_output = self._as_full_res(net_output)          # nnUNet may wrap output in a list (deep sup)
@@ -712,10 +708,9 @@ class LeakFreeInstanceABBCAffinityLoss(LeakFreeInstanceABBCLoss):
                 same_sum = same_sum + bce[same_m].sum(); n_same += int(same_m.sum().item())
             if bool(diff_m.any()):
                 diff_sum = diff_sum + bce[diff_m].sum(); n_diff += int(diff_m.sum().item())
-        if self.balanced:
-            aff = 0.5 * (same_sum / max(n_same, 1) + diff_sum / max(n_diff, 1))
-        else:
-            aff = (same_sum + diff_sum) / max(n_same + n_diff, 1)   # V307 (unbalanced) — kept reproducible
+        # class-BALANCED: the RARE cross-fragment (fracture) edges weigh equally to the ~95% same-instance
+        # pairs, so the head can't collapse to all-same (the retired unbalanced V307 did exactly that).
+        aff = 0.5 * (same_sum / max(n_same, 1) + diff_sum / max(n_diff, 1))
         total = abbc + self.aff_w * aff
         if not torch.isfinite(total):
             raise ValueError(f"LeakFreeInstanceABBCAffinityLoss non-finite: abbc={float(abbc)} aff={float(aff)}")
