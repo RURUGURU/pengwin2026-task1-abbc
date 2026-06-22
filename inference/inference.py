@@ -1048,9 +1048,12 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         # agglomeration on the LEARNED affinities. Default OFF -> V302 (4ch) path unchanged.
         if os.environ.get("PENGWIN_AFFINITY_DECODE", "0") == "1":
             import sys as _sys
-            _ep = "/home/guest/Project/PENGWIN2026/experiments"
-            if _ep not in _sys.path:
-                _sys.path.insert(0, _ep)
+            # agglo_decode.py is VENDORED next to this file so it ships in the GC container; also add
+            # the dev experiments/ dir as a fallback for local runs. (numpy/scipy/skimage only.)
+            for _p in (os.path.dirname(os.path.abspath(__file__)),
+                       "/home/guest/Project/PENGWIN2026/experiments"):
+                if _p not in _sys.path:
+                    _sys.path.insert(0, _p)
             from agglo_decode import decode_affinity_agglo
             _abbc = softmax_axis0(ds538_logits_pp[:4])
             _aff = 1.0 / (1.0 + np.exp(-np.asarray(ds538_logits_pp[4:], dtype=np.float32)))
