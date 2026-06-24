@@ -71,6 +71,15 @@ ENV PENGWIN_ROOT=/opt/ml/model \
     MPLCONFIGDIR=/tmp/matplotlib \
     XDG_CACHE_HOME=/tmp/.cache
 
+# [v1.5 = V308 affinity merge-breaker] Stage-B = the class-BALANCED affinity head decoded by
+# average-linkage agglomeration -> separates touching fracture fragments V302 merged (dev recall
+# 0.707->0.747). AGGLO_T=0.45 = the recall-up operating point. The model tar ships BOTH V302 and
+# V308; to roll back to V302 rebuild from tag v1.4.3 (or comment these 4 lines).
+ENV PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308 \
+    PENGWIN_DS538_OUT_CH=13 \
+    PENGWIN_AFFINITY_DECODE=1 \
+    PENGWIN_AGGLO_T=0.45
+
 # Grand Challenge security policy: container must not run as root.
 # Create a service user with no shell, no password, no home write permissions
 # other than the default. /opt/app is owned by root but world-readable from
