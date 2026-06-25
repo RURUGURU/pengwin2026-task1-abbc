@@ -71,30 +71,23 @@ ENV PENGWIN_ROOT=/opt/ml/model \
     MPLCONFIGDIR=/tmp/matplotlib \
     XDG_CACHE_HOME=/tmp/.cache
 
-# [v1.6 = V308 affinity DECODE-FUSION] Stage-B = V308 13ch head, but decoded by FUSION: take the
-# V302 core-seed-watershed partition as a precise base, then sub-split a base instance ONLY where the
-# learned affinity shows a COHERENT high-separation surface (real-fracture gate, ridge>=3000 vox) ->
-# recovers V302's touching-fragment merges (recall 0.707->0.736, hd95 3.51->2.91, topology +0.02)
-# while keeping V308-solo's over-split/phantom precision damage to the minimum of any variant
-# (precision 0.928->0.868 vs V308's 0.837). dev proxy-F1 ~ V302 (-0.008) but improves exactly V302's
-# weak GC ranks (recall/hd95/merge/topology/assd) -> the GC Mean-Position candidate. Same V308 weight
-# tar as v1.5. Roll back to V308-solo: set AFFINITY_DECODE=1 + AGGLO_T=0.45 (remove FUSION_*). Roll
-# back to V302: rebuild from tag v1.4.3 (or comment these lines).
+# [v1.8 = ROLLBACK to v1.5 behaviour] v1.6 fusion + v1.7 Stage-A reconcile BOTH REGRESSED on GC
+# (5 prelim cases: recall 0.574->0.522, f1 0.572->0.533, dice 0.919->0.872, hd95 5.31->10.79, merge
+# 0.15->0.35). Root cause: (1) fusion only sub-splits a V302 core-seed base and CANNOT merge an
+# over-split base, so on GC's OOD/noisy ROIs the base over-splits and fusion makes it WORSE (RightHip
+# 5->8 in the prelim logs); V308-solo average-linkage CAN merge weak ridges, so it is more robust.
+# (2) the bone-skeleton reconcile added tiny sliver anatomies (bone mask ~0.1% of volume) that decoded
+# to NOTHING or to FP. The dev proxy could see neither (in-distribution cores -> fusion base did not
+# over-split; zero whole-anatomy drops on dev -> reconcile untestable). So revert to v1.5 = V308
+# affinity-solo decode = the best GC result so far. The fusion/reconcile code stays in inference.py but
+# is ENV-DISABLED here. NOTE PENGWIN_STAGEA_BONE_RECONCILE defaults to 1 in code, so it MUST be set to 0
+# explicitly. Same V308 weight tar. Equivalent to rebuilding from tag v1.5.
 ENV PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308 \
     PENGWIN_DS538_OUT_CH=13 \
-    PENGWIN_FUSION_DECODE=1 \
-    PENGWIN_FUSION_T=0.45 \
-    PENGWIN_FUSION_RIDGE_VOX=3000
-
-# [v1.7 = + Stage-A recall fix] The GC recall killer (Instance Recall 0.574 = pos 56) is whole-anatomy
-# MISS: Ds539 gives a PRESENT hip ~0 voxels (or swaps L<->R) -> the 0.20x routing gate drops it ->
-# the anatomy emits ZERO -> all its fragments become FN (and the swapped side a FP). Fix: reconcile the
-# Ds539-size routing with the GEOMETRIC bone-skeleton decomposition -- (A) add any pelvic anatomy bone-
-# skeleton found that routing dropped (uses the bone mask via the existing sanity fallback); (B) drop a
-# routed Ds539 hip that bone-skeleton did NOT find but whose mask sits on the OTHER hip's bone (= L<->R
-# swap). Verified on the 5 GC prelim-case logs: recovers the dropped/swapped anatomies, inert on healthy
-# cases + on all of dev (no drops there). Default ON; PENGWIN_STAGEA_BONE_RECONCILE=0 to disable.
-ENV PENGWIN_STAGEA_BONE_RECONCILE=1
+    PENGWIN_AFFINITY_DECODE=1 \
+    PENGWIN_AGGLO_T=0.45 \
+    PENGWIN_FUSION_DECODE=0 \
+    PENGWIN_STAGEA_BONE_RECONCILE=0
 
 # Grand Challenge security policy: container must not run as root.
 # Create a service user with no shell, no password, no home write permissions
