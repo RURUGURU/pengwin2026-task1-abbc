@@ -86,6 +86,16 @@ ENV PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308 \
     PENGWIN_FUSION_T=0.45 \
     PENGWIN_FUSION_RIDGE_VOX=3000
 
+# [v1.7 = + Stage-A recall fix] The GC recall killer (Instance Recall 0.574 = pos 56) is whole-anatomy
+# MISS: Ds539 gives a PRESENT hip ~0 voxels (or swaps L<->R) -> the 0.20x routing gate drops it ->
+# the anatomy emits ZERO -> all its fragments become FN (and the swapped side a FP). Fix: reconcile the
+# Ds539-size routing with the GEOMETRIC bone-skeleton decomposition -- (A) add any pelvic anatomy bone-
+# skeleton found that routing dropped (uses the bone mask via the existing sanity fallback); (B) drop a
+# routed Ds539 hip that bone-skeleton did NOT find but whose mask sits on the OTHER hip's bone (= L<->R
+# swap). Verified on the 5 GC prelim-case logs: recovers the dropped/swapped anatomies, inert on healthy
+# cases + on all of dev (no drops there). Default ON; PENGWIN_STAGEA_BONE_RECONCILE=0 to disable.
+ENV PENGWIN_STAGEA_BONE_RECONCILE=1
+
 # Grand Challenge security policy: container must not run as root.
 # Create a service user with no shell, no password, no home write permissions
 # other than the default. /opt/app is owned by root but world-readable from

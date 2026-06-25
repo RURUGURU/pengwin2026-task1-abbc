@@ -954,6 +954,46 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         _route, anatomies = route_from_ds539_masks(ds539_masks)
         log(f"L2b routing: auto route={_route} anatomies={anatomies}")
 
+        # [v1.7 Stage-A recall fix] Reconcile the Ds539-size routing with the GEOMETRIC bone-skeleton
+        # decomposition (robust for pelvic PRESENCE + laterality). The GC recall killer (logs: a
+        # present hip given Ds539=0 or swapped L<->R -> the 0.20x routing gate drops it -> whole-
+        # anatomy ZERO = all its fragments become FN) is fixed in two conservative steps. Default ON;
+        # PENGWIN_STAGEA_BONE_RECONCILE=0 to disable. Femur (no bone-skeleton) is untouched.
+        if os.environ.get("PENGWIN_STAGEA_BONE_RECONCILE", "1") == "1":
+            routed = list(anatomies)
+            # A femur-DOMINANT scan has incidental in-frame pelvis that is NOT a GT target (e.g. dev
+            # 294: Ds539 Femur 2.28M >> LeftHip 740k, GT = femur-only). Adding the bone-skeleton pelvis
+            # there is the femur-case FP regression the v1.3.3 note warns of. So (A) recall-recovery
+            # fires ONLY when a PELVIC anatomy is the LARGEST Ds539 mask (= a pelvic case = where the GC
+            # whole-hip miss/swap actually happens). Femur-dominant cases are left to the relative gate.
+            _sz = {a: int(ds539_masks[a].sum()) for a in ALL_ANATOMIES if ds539_masks.get(a) is not None}
+            _pelvic_dominant = bool(_sz) and max(_sz, key=_sz.get) in PELVIC_ANATOMIES
+            # (A) recall: on a PELVIC-dominant case, add any pelvic anatomy bone-skeleton found that the
+            #     Ds539 size gate dropped (recovers the GC whole-anatomy MISS)
+            if _pelvic_dominant:
+                for a in PELVIC_ANATOMIES:
+                    bm = bone_masks.get(a)
+                    if bm is not None and bm.any() and a not in routed:
+                        routed.append(a)
+                        log(f"L2b +bone-recall: {a} present in bone-skeleton but Ds539 routing dropped it")
+            # (B) laterality: a routed Ds539 hip that bone-skeleton did NOT find, whose mask mostly
+            #     overlaps the OTHER hip's bone mask, is an L<->R swap -> drop the hallucinated side
+            for a, other in (("LeftHip", "RightHip"), ("RightHip", "LeftHip")):
+                if a not in routed:
+                    continue
+                bma = bone_masks.get(a)
+                if bma is not None and bma.any():
+                    continue  # bone-skeleton confirms this side is real -> keep
+                bmo, dma = bone_masks.get(other), ds539_masks.get(a)
+                if bmo is not None and bmo.any() and dma is not None and dma.any():
+                    inter = int(np.logical_and(dma, bmo).sum())
+                    if inter > 0.5 * float(dma.sum()):
+                        routed.remove(a)
+                        log(f"L2b -laterality: drop {a} (Ds539 mask {inter/max(1,int(dma.sum()))*100:.0f}% "
+                            f"inside {other}'s bone mask = left/right swap)")
+            anatomies = tuple(x for x in ALL_ANATOMIES if x in routed)
+            log(f"L2b bone-reconciled anatomies={anatomies}")
+
     # === Layer 2+3: Ds539 mask 와 bone fallback 을 sanity check 와 함께 병합 ===
     merged = merge_masks_with_sanity(
         ds539_masks, bone_masks, img_shape,
