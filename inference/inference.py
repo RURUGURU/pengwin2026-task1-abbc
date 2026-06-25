@@ -1046,7 +1046,8 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         # [TIER-1 experiment, env-gated] V307 affinity head: Ds538 output is 4 ABBC + K affinity
         # channels. Split -> softmax(ABBC[:4]) + sigmoid(affinity[4:]) -> average-linkage
         # agglomeration on the LEARNED affinities. Default OFF -> V302 (4ch) path unchanged.
-        if os.environ.get("PENGWIN_AFFINITY_DECODE", "0") == "1":
+        _fusion = os.environ.get("PENGWIN_FUSION_DECODE", "0") == "1"
+        if os.environ.get("PENGWIN_AFFINITY_DECODE", "0") == "1" or _fusion:
             import sys as _sys
             # agglo_decode.py is VENDORED next to this file so it ships in the GC container; also add
             # the dev experiments/ dir as a fallback for local runs. (numpy/scipy/skimage only.)
@@ -1054,13 +1055,36 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
                        "/home/guest/Project/PENGWIN2026/experiments"):
                 if _p not in _sys.path:
                     _sys.path.insert(0, _p)
-            from agglo_decode import decode_affinity_agglo
+            from agglo_decode import decode_affinity_agglo, decode_fusion
             _abbc = softmax_axis0(ds538_logits_pp[:4])
             _aff = 1.0 / (1.0 + np.exp(-np.asarray(ds538_logits_pp[4:], dtype=np.float32)))
+            # [13ch raw dump] 4 ABBC softmax + 9 affinity sigmoid -> enables OFFLINE decode/fusion
+            # T-sweeps on CPU (no GPU re-run). Split offline as probs13[:4]/probs13[4:].
+            _dump_dir = os.environ.get("PENGWIN_DUMP_PROBS", "")
+            if _dump_dir:
+                os.makedirs(_dump_dir, exist_ok=True)
+                np.save(os.path.join(_dump_dir, f"probs13_{anatomy}.npy"),
+                        np.concatenate([_abbc, _aff], axis=0).astype(np.float16))
+                log(f"[dump] saved 13ch probs {anatomy} -> {_dump_dir}")
             if os.environ.get("PENGWIN_AFF_STATS", "0") == "1":
                 _sh = _aff[:3]  # short-range channels
                 log(f"[aff:{anatomy}] all: mean={float(_aff.mean()):.3f} frac<0.5={float((_aff<0.5).mean()):.4f} | short: mean={float(_sh.mean()):.3f} frac<0.5={float((_sh<0.5).mean()):.4f} min={float(_sh.min()):.3f}")
-            decoded_pp = decode_affinity_agglo(_abbc, _aff, T=float(os.environ.get("PENGWIN_AGGLO_T", "0.45")))
+            if _fusion:
+                # [FUSION] Use the EXACT deployed V302 core-seed watershed as the precise base (incl.
+                # the Sacrum-specific aggressive merge), then sub-split ONLY within a base instance
+                # where the learned affinity confirms a true fracture surface -> recall up, base
+                # boundaries never crossed = precision floor = V302.
+                if anatomy == "Sacrum":
+                    _base = decode_abbc_core_seed_watershed(
+                        _abbc, size_ratio_keep=max(float(ANATOMY_SIZE_RATIO_KEEP), 0.10),
+                        min_component_voxels=max(int(MIN_COMPONENT_VOXELS), 250))
+                else:
+                    _base = decode_abbc_core_seed_watershed(_abbc)
+                decoded_pp = decode_fusion(_base, _abbc, _aff,
+                    T=float(os.environ.get("PENGWIN_FUSION_T", os.environ.get("PENGWIN_AGGLO_T", "0.45"))),
+                    min_ridge_vox=int(os.environ.get("PENGWIN_FUSION_RIDGE_VOX", "3000")))
+            else:
+                decoded_pp = decode_affinity_agglo(_abbc, _aff, T=float(os.environ.get("PENGWIN_AGGLO_T", "0.45")))
         else:
             ds538_probs = softmax_axis0(ds538_logits_pp)
             _dump_dir = os.environ.get("PENGWIN_DUMP_PROBS", "")

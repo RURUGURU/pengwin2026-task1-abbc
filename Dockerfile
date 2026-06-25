@@ -71,14 +71,20 @@ ENV PENGWIN_ROOT=/opt/ml/model \
     MPLCONFIGDIR=/tmp/matplotlib \
     XDG_CACHE_HOME=/tmp/.cache
 
-# [v1.5 = V308 affinity merge-breaker] Stage-B = the class-BALANCED affinity head decoded by
-# average-linkage agglomeration -> separates touching fracture fragments V302 merged (dev recall
-# 0.707->0.747). AGGLO_T=0.45 = the recall-up operating point. The model tar ships BOTH V302 and
-# V308; to roll back to V302 rebuild from tag v1.4.3 (or comment these 4 lines).
+# [v1.6 = V308 affinity DECODE-FUSION] Stage-B = V308 13ch head, but decoded by FUSION: take the
+# V302 core-seed-watershed partition as a precise base, then sub-split a base instance ONLY where the
+# learned affinity shows a COHERENT high-separation surface (real-fracture gate, ridge>=3000 vox) ->
+# recovers V302's touching-fragment merges (recall 0.707->0.736, hd95 3.51->2.91, topology +0.02)
+# while keeping V308-solo's over-split/phantom precision damage to the minimum of any variant
+# (precision 0.928->0.868 vs V308's 0.837). dev proxy-F1 ~ V302 (-0.008) but improves exactly V302's
+# weak GC ranks (recall/hd95/merge/topology/assd) -> the GC Mean-Position candidate. Same V308 weight
+# tar as v1.5. Roll back to V308-solo: set AFFINITY_DECODE=1 + AGGLO_T=0.45 (remove FUSION_*). Roll
+# back to V302: rebuild from tag v1.4.3 (or comment these lines).
 ENV PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308 \
     PENGWIN_DS538_OUT_CH=13 \
-    PENGWIN_AFFINITY_DECODE=1 \
-    PENGWIN_AGGLO_T=0.45
+    PENGWIN_FUSION_DECODE=1 \
+    PENGWIN_FUSION_T=0.45 \
+    PENGWIN_FUSION_RIDGE_VOX=3000
 
 # Grand Challenge security policy: container must not run as root.
 # Create a service user with no shell, no password, no home write permissions
