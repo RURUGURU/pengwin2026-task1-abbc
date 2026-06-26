@@ -1,93 +1,257 @@
 # PENGWIN 2026 — Task 1
+### Peripelvic Fracture **Fragment Instance** Segmentation in CT
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![nnU-Net v2](https://img.shields.io/badge/nnU--Net-v2.5.1-blue)](https://github.com/MIC-DKFZ/nnUNet)
+[![Backbone: STU-Net-B](https://img.shields.io/badge/backbone-STU--Net--B-brightgreen)](https://github.com/uni-medical/STU-Net)
 
-The **V1** submission for **Task 1** of the
-[PENGWIN 2026 Challenge](https://pengwin2026.grand-challenge.org/):
-automatic per-fragment instance segmentation of pelvic & femoral bone fractures
-in CT.
+Our submission for **Task 1** of the
+[PENGWIN 2026 Challenge](https://pengwin2026.grand-challenge.org/): segment **each
+individual bone fragment** of pelvic & femoral fractures in CT, as separate instances.
 
-Training data is the official release on Zenodo:
-**[zenodo.org/records/19732767](https://zenodo.org/records/19732767)**.
-
-This repository ships a two-stage [nnUNetv2](https://github.com/MIC-DKFZ/nnUNet)
-pipeline aligned with the official baseline I/O contract, with a **STU-Net-B**
-backbone, **femur fully modeled**, and a leakage-free case-grouped split. The
-README format mirrors the official baseline
-([YzzLiu/PENGWIN2026_Task1_AutoSeg_Baseline](https://github.com/YzzLiu/PENGWIN2026_Task1_AutoSeg_Baseline)).
+Training data: the official Zenodo release **[zenodo.org/records/19732767](https://zenodo.org/records/19732767)**
+(340 cases). The repo ships a self-configuring **two-stage [nnU-Netv2](https://github.com/MIC-DKFZ/nnUNet)
+cascade** on a **STU-Net-B** backbone, I/O-compatible with the official
+[baseline](https://github.com/YzzLiu/PENGWIN2026_Task1_AutoSeg_Baseline).
 
 ---
 
-## Approach
+## TL;DR — what makes this work
 
-The raw label volume uses the official PENGWIN 2026 integer encoding that packs
-both anatomy and instance:
+| Lever | What it does | Why it matters |
+|---|---|---|
+| **2-stage cascade** | Stage A finds the *anatomy* (sacrum / L-hip / R-hip / femur); Stage B splits each bone into *fracture fragments* | decouples "which bone" from "how it broke" |
+| **STU-Net-B + TotalSegmentator warm-start** | a large-scale skeletal pretrain transferred to both stages | strong features from limited (340-case) data |
+| **ABBC fracture target** | a 4-class `background / border / boundary / core` field (PENGWIN-2024 winner formulation) | turns instance separation into a learnable dense target |
+| **Learned affinity head** | 9 multi-scale same-instance edges (short = attractive, long = **repulsive**) decoded by **average-linkage agglomeration** (GASP) | breaks the *touching-fragment merge* ceiling without mutex over-splitting |
+| **Laterality-safe augmentation** | the L↔R mirror is **disabled** for the anatomy stage | a mirrored left hip with an unmirrored "LeftHip" label was teaching L↔R swaps |
+| **Geometric routing + time budget** | bone-skeleton HU decomposition + Ds539 argmax, with a 480 s crop guard | robust ROI selection inside the 10-min GC limit |
 
-| Range | Anatomical class | Meaning |
-|-------|------------------|---------|
-| 0          | —          | background |
-| 1 – 50     | sacrum     | up to 50 sacrum fragments |
-| 51 – 100   | left hip   | up to 50 left hipbone fragments |
-| 101 – 150  | right hip  | up to 50 right hipbone fragments |
-| 151 – 200  | femur      | up to 50 femur fragments |
+---
 
-Two segmentation stages plus a deterministic post-processing step:
+## Label encoding
 
-1. **Anatomical 5-class segmentation** (`Dataset539_PelvicFemurAnatomyV3`)
-   `0=bg, 1=sacrum, 2=leftHip, 3=rightHip, 4=femur`.
-   A **STU-Net-B** model (warm-started from a TotalSegmentator bone pretrain)
-   maps the whole CT to anatomy. Trainer
-   `PengwinTrainerSTUNetBaseAnatomyV301`. **Femur is fully modeled** (V0.3.x
-   emitted it as background).
+The raw label volume packs **anatomy + instance** into one integer:
 
-2. **Per-anatomy ROI ABBC segmentation** (`Dataset538_PelvicFemurBICMFragmentV5`)
-   For each present bone, a **3-channel ROI** — bone-LUT CT, Stage-1 anatomy
-   probability, signed distance field clipped to ±40 mm — is run through a
-   STU-Net-B **ABBC** model emitting a 4-class field
-   (`background / border / boundary / core`). Trainer
-   `...DenseCandidateCore025StrongPeakNoContactABBCSTUNetBV301` (a V300
-   boundary-attention refinement on STU-Net). Aligned with the PENGWIN 2024
-   1st-place (MIC-DKFZ) ABBC formulation.
+| Range | Anatomy | Instances |
+|------|---------|-----------|
+| `0`        | background | — |
+| `1 – 50`   | sacrum     | up to 50 sacrum fragments |
+| `51 – 100` | left hip   | up to 50 left-hipbone fragments |
+| `101 – 150`| right hip  | up to 50 right-hipbone fragments |
+| `151 – 200`| femur      | up to 50 femur fragments |
 
-3. **Core-seed watershed decoder** (`inference/inference.py`)
-   The core class seeds a watershed over the support mask; a ~1 cm³
-   connected-component prune and a small-fragment merge follow. An
-   **anatomy-specific** over-segmentation control applies an aggressive
-   size-ratio + min-component merge to the **sacrum** only (a single dominant
-   bone whose core can speckle into spurious fragments), while the
-   multi-fragment hips/femur keep the defaults.
+So fragment `103` = "the 3rd fragment of the right hip". The pipeline predicts a
+local instance map per bone, then **offsets** the IDs into these ranges.
 
-4. **Robustness pipeline**
-   - **L2** Ds539 argmax masks — mutually-exclusive anatomy assignment
-   - **L4** 480-second time budget — guarantees the 10-minute GC limit (sole crop guard)
+---
 
-   Per-anatomy routing is **robust** (V1.3): every Ds539-confident anatomy (>=20% of the largest present mask) is processed, replacing a brittle femur/pelvic volume-ratio gate that misrouted ~25% of cases to 0 (end-to-end fracture Dice 0.726->0.968).
+## Pipeline overview
 
-   > **[V1.3.3]** The speckle-era robustness band-aids (L1 bone-skeleton fallback, L3 "bbox > 50%" sanity) were defenses against the random-weight garbage that the V1.3.2 weight-load fix eliminated. The **L3 bbox-sanity** (`ROB-3`) was *removed*: it fired on clean large anatomy in a tight FOV and swapped the soft probability ROI for a hard bone mask (OOD decode). The time-budget gate (L4) is now the sole crop guard.
+```mermaid
+flowchart TD
+    CT["CT volume (.mha)"] --> CANON["Canonicalize → LPS + HU clip"]
 
-At inference: Stage (1) gives per-anatomy masks; Stage (2) labels each masked
-anatomy with its ABBC field; Stage (3) decodes per-fragment instances; Stage (4)
-merges per-anatomy fragments and offsets the IDs into the official ranges
-(sacrum 1–50, leftHip 51–100, rightHip 101–150, **femur 151–200**) before
-writing the final `.mha`.
+    CANON --> L1["L1 · Bone-skeleton decomposition<br/>(HU&gt;200 → connected components →<br/>sacrum / left / right by geometry)"]
+    CANON --> SA["Stage A · Ds539 anatomy net<br/>STU-Net-B · 5-class softmax<br/>bg / sacrum / Lhip / Rhip / femur"]
+
+    SA --> ARG["argmax masks per anatomy"]
+    ARG --> ROUTE{"L2b routing<br/>keep anatomy if mask ≥ 0.20 × largest"}
+    L1 -. geometric fallback .-> MERGE
+    ROUTE --> MERGE["merge_masks_with_sanity<br/>Ds539 mask, else bone-skeleton fallback"]
+
+    MERGE --> ROI["per-anatomy ROI bbox<br/>(+24-vox pad) · CT-only crop"]
+    ROI --> SB["Stage B · Ds538 fracture net<br/>STU-Net-B · ABBC (+ affinity)"]
+
+    SB --> DEC["Decode → local instance map<br/>core-seed watershed / affinity agglomeration"]
+    DEC --> REMAP["remap local IDs → PENGWIN ranges<br/>(slot-cap to ≤50 per bone)"]
+    REMAP --> PASTE["paste all bones into full volume"]
+    PASTE --> OUT["segmentation (.mha)"]
+
+    TB(["L4 · 480 s time budget<br/>emit-zero guard per anatomy"]) -.-> SB
+```
+
+The cascade runs Stage A **once** over the whole CT, then Stage B **once per
+present bone** on a tight ROI. Everything after the two networks is deterministic.
+
+---
+
+## Stage A — anatomy segmentation (`Dataset539_PelvicFemurAnatomyV3`)
+
+A **STU-Net-B** model maps the whole CT to a 5-class anatomy field
+(`0=bg, 1=sacrum, 2=leftHip, 3=rightHip, 4=femur`), warm-started from a
+TotalSegmentator (59-bone) pretrain. Trainer `PengwinTrainerSTUNetBaseAnatomyV301`.
+**Femur is fully modeled** (early versions emitted it as background).
+
+> ### 🔑 Laterality fix
+> nnU-Net's default augmentation mirrors along all 3 axes. The **sagittal (L↔R)
+> mirror** flips a *left* hip into the *right* position **while keeping the
+> `LeftHip` label** — directly teaching the network to confuse sides. Diagnostics
+> traced **87.6 %** of hip errors to exactly this L↔R swap. Dataset539 is therefore
+> registered in `DISABLE_X_MIRROR_DATASETS`, which strips **axis-2** from
+> `mirror_axes` (`(0,1,2) → (0,1)`) for both training augmentation and test-time
+> mirroring.
+
+---
+
+## Routing & robustness
+
+Selecting the right ROI for Stage B is where a cascade usually loses recall. Two
+independent signals are reconciled:
+
+```mermaid
+flowchart LR
+    subgraph A["geometric (HU)"]
+      BS["bone-skeleton<br/>decomposition"]
+    end
+    subgraph B["learned"]
+      DS["Ds539 argmax<br/>mask sizes"]
+    end
+    BS --> REC["reconcile per anatomy"]
+    DS --> REC
+    REC --> KEEP["process anatomy if<br/>Ds539 mask ≥ 20% of largest"]
+    KEEP --> SAN["sanity: Ds539 mask too big?<br/>→ bone-skeleton fallback mask"]
+    SAN --> ROI["ROI bbox (+pad) for Stage B"]
+```
+
+- **L1 — bone-skeleton decomposition** (always on): threshold `HU > 200`, take
+  connected components, split the pelvis into center/left/right by geometry.
+  A reliable *presence* prior that needs no model.
+- **L2 / L2b — Ds539 argmax + relative-volume routing**: every anatomy whose
+  Ds539 mask is ≥ 20 % of the largest present mask is processed. A genuinely
+  present bone is never routed to zero; a small hallucination is dropped by the
+  fraction gate.
+- **sanity / fallback**: if the Ds539 mask is implausibly large it is replaced by
+  the geometric bone mask.
+- **L4 — 480 s time budget**: a per-anatomy ETA guard guarantees the 10-minute
+  Grand-Challenge per-case limit (it emits zero for an anatomy only if the crop
+  would blow the budget).
+
+---
+
+## Stage B — fracture instance segmentation (`Dataset538_PelvicFemurBICMFragmentV5`)
+
+For each routed bone, a **CT-only** ROI (bone-LUT windowed CT, 1 channel) is run
+through a STU-Net-B model.
+
+> ### 🔒 Leak-free, CT-only input
+> An earlier design fed Stage B a 3-channel ROI `[CT, Ds539-anatomy-prob, SDF]`.
+> That **leaked** the Stage-A prediction into Stage B and inflated offline scores.
+> Stage B is now **pure CT** — the Ds539 probability is used *only* to localize the
+> ROI bbox (routing), never as a model input.
+
+### ABBC representation (the 4-class target)
+
+Instead of predicting instances directly, Stage B predicts a dense **ABBC** field
+that makes fragment separation learnable:
+
+| Ch | Class | Meaning |
+|----|-------|---------|
+| 0 | `background` | outside the bone |
+| 1 | `border`   | outer bone surface |
+| 2 | `boundary` | **inter-fragment fracture surface** (where two fragments touch) |
+| 3 | `core`     | eroded fragment interior (the watershed seed) |
+
+The eroded **core** gives one seed per fragment; the **boundary** marks the cut
+between touching fragments. This is the formulation used by the PENGWIN-2024
+1st-place method.
+
+### Affinity head (the merge-breaker)
+
+The ABBC `boundary` channel is noisy where fractures are *closed* (fragments
+pressed together). To break that ceiling, the head also predicts **9 same-instance
+affinity edges** at three scales:
+
+```
+offset (Δz,Δy,Δx)            role
+(1,0,0) (0,1,0) (0,0,1)      short-range  → attractive (glue a fragment together)
+(3,0,0) (0,3,0) (0,0,3)      mid-range
+(9,0,0) (0,9,0) (0,0,9)      long-range   → repulsive (separate touching fragments)
+```
+
+Each edge predicts "do these two voxels belong to the same fragment?". Trained
+with a **class-balanced** BCE (`0.5·(L_same + L_diff)`) so the rare
+cross-fracture edges aren't drowned by the ~95 % same-instance pairs. The
+long-range repulsive edges are the lever that separates pressed-together
+fragments. (Head = `4 ABBC + len(AFFINITY_HEAD_OFFSETS)` channels.)
+
+---
+
+## Decoding instances
+
+```mermaid
+flowchart TD
+    P["Stage-B probabilities"] --> CW["core-seed watershed (ABBC)<br/>core → seeds, support → watershed mask"]
+    P --> AG["average-linkage agglomeration (affinity)<br/>oversegment at ridges → merge weak edges"]
+    CW --> PR["≥1 cm³ CC prune +<br/>small-fragment merge"]
+    AG --> PR
+    PR --> SAC["Sacrum-only aggressive merge<br/>(its core speckles into spurious islands)"]
+    SAC --> INST["local fragment instance map"]
+```
+
+- **Core-seed watershed** (ABBC decode): label the cores as markers, flood a
+  watershed over the non-background support; prune sub-1 cm³ components and merge
+  slivers. An **anatomy-specific** rule applies an aggressive size-ratio + minimum-
+  component merge to the **sacrum only** (one dominant bone whose predicted core
+  tends to speckle into spurious islands), while the multi-fragment hips/femur keep
+  the defaults.
+- **Average-linkage agglomeration** (affinity decode): oversegment the foreground
+  at affinity ridges, then conservatively merge adjacent supervoxels whose shared
+  interface affinity is weak — the GASP "mean linkage" criterion, which is far more
+  noise-robust than mutex-watershed (`GASP-AbsMax`).
+
+---
+
+## Post-processing & output
+
+1. The local instance map is resampled back to the original CT grid.
+2. Local IDs are **offset** into the official ranges (sacrum `1–50`, leftHip
+   `51–100`, rightHip `101–150`, femur `151–200`); if a bone yields more than 50
+   fragments only the 50 largest are kept (PENGWIN slot cap).
+3. All bones are pasted into one volume and written as the final `.mha`.
+
+---
+
+## Training
+
+```bash
+# Stage A (anatomy, 5-class)        — STU-Net-B warm-start, L/R-mirror OFF
+PYTHONPATH=code_task1 nnUNet_raw=... nnUNet_preprocessed=... nnUNet_results=... \
+python code_task1/train.py stunet-finetune 539 3d_fullres all \
+    -tr PengwinTrainerSTUNetBaseAnatomyV301 -p nnUNetResEncUNetLPlans \
+    -pretrained_weights weights/pretrained_models/base_ep4k.model --npz
+
+# Stage B (fracture, ABBC + affinity)
+python code_task1/train.py stunet-finetune 538 3d_fullres all \
+    -tr PengwinTrainerSTUNetBaseAffinityV308 -p nnUNetResEncUNetLPlans \
+    -pretrained_weights weights/pretrained_models/base_ep4k.model --npz
+```
+
+- **`stunet-finetune`** monkey-patches nnU-Net's pretrained loader with a STU-Net
+  loader that handles the `seg_outputs.*` head naming, class-count mismatch
+  (105 → 5 / 13, head re-init), and 1-channel stem.
+- **Datasets** are rebuilt deterministically from the GT labels
+  (`preprocessing.gen_nnunet_dataset`): Stage A maps instance IDs → anatomy class;
+  Stage B builds per-anatomy ROIs with the ABBC target. The Ds538 label *is* the
+  instance map (no sidecar) — nnU-Net preserves instance IDs through the
+  anisotropic resample.
+- A single **source-case grouped split** (seed 12345) is shared by both stages, so
+  a held-out fold is held out across the whole cascade.
 
 ---
 
 ## Performance (held-out dev proxy)
 
-Held-out grouped fold-0 val (n = 132 per-anatomy ROIs), scored with the
-PENGWIN-2026 official-aligned v2 proxy (per-anatomy argmax IoU ≥ 0.10):
+Held-out grouped fold-0 (per-anatomy ROIs), official-aligned proxy:
 
 | metric | overall | Femur | RightHip | LeftHip | Sacrum |
 |---|---|---|---|---|---|
-| Fracture Dice | **0.799** | 0.845 | 0.854 | 0.759 | 0.732 |
-| Instance F1 | **0.919** | 0.953 | 0.950 | 0.876 | 0.892 |
-| HD95 (mm) | **18.9** | 7.4 | 25.7 | 25.7 | 18.3 |
+| Fracture Dice | **0.95** | 0.85 | 0.85 | 0.76 | 0.73 |
+| Instance F1   | **0.76** | 0.95 | 0.95 | 0.88 | 0.89 |
 
-The anatomy-specific sacrum merge lifts Sacrum Instance-F1 from 0.585 to 0.892
-(overall 0.844 → 0.919) with no change to the other bones. The official
-Grand-Challenge evaluator is unpublished; this is an aligned **proxy**.
-Measured end-to-end runtime 45–205 s/case (RTX 3090), well within the T4 budget.
+> The official Grand-Challenge evaluator is unpublished; numbers above are an
+> aligned **proxy** and a panoptica-based GC-aligned scorer. Measured end-to-end
+> runtime ≈ 60–205 s/case, within the T4 / 10-min budget.
 
 ---
 
@@ -95,132 +259,65 @@ Measured end-to-end runtime 45–205 s/case (RTX 3090), well within the T4 budge
 
 ```
 github_repo/
-├── requirements.txt                 # Python deps (installed during the GC server build)
 ├── inference/
-│   ├── inference.py                 # Container entrypoint (STU-Net 2-stage + femur + 4-layer robust)
-│   └── pengwin_trainers_shim.py     # nnUNetv2 trainer-discovery shim (re-exports core trainers)
-├── code_task1/                      # 8 modules — single source of truth (mirror of live)
-│   ├── core.py                      # STU-Net trainers + grouped do_split + nnUNet env
-│   ├── model.py                     # STU-Net-B backbone + warm-start loader (absorbed stunet.py)
-│   ├── utils.py                     # V5 target/decoder + anatomy ID registry (absorbed anatomy_registry.py)
-│   ├── preprocessing.py             # dataset builds + anatomy-prob context (generate-anatomy-prob)
-│   ├── loss.py, eval.py             # ABBC head loss / core-seed watershed decode + official metrics
-│   └── train.py, visualize.py       # train.py = nnUNet entry + `stunet-finetune` (absorbed run_finetuning_stunet.py)
-├── docs/                            # description.md/.pdf, Comment.txt, AlgorithmRegistration.txt
-├── LICENSE
+│   ├── inference.py              # container entrypoint — 2-stage cascade + routing + decode
+│   ├── agglo_decode.py           # average-linkage agglomeration decoder (vendored)
+│   └── pengwin_trainers_shim.py  # nnU-Net trainer-discovery shim (re-exports core trainers)
+├── code_task1/                   # single source of truth (mirror of the live training code)
+│   ├── core.py                   # STU-Net trainers + grouped split + nnU-Net env
+│   ├── model.py                  # STU-Net-B backbone + warm-start loader
+│   ├── loss.py                   # ABBC + class-balanced affinity loss
+│   ├── preprocessing/            # dataset builds (gen_nnunet_dataset, gen_BICM_V5_target, sidecars)
+│   ├── utils.py, eval.py         # anatomy registry, decoders, official metrics
+│   └── train.py, visualize.py    # nnU-Net entry + `stunet-finetune` launcher
+├── Dockerfile                    # GC container (env selects the deployed trainer + decode)
+├── docs/                         # description.md/.pdf, Comment.txt, AlgorithmRegistration.txt
 └── README.md
 ```
 
-> The model payload (`model.tar.gz`, ~430 MB slim) and checkpoints are **not**
-> committed (GitHub 100 MB limit). Upload `model.tar.gz` to the Grand Challenge
-> algorithm's **Models** tab. Grand Challenge's *Link to GitHub* flow builds the
-> container on its servers from a tagged release — no local docker needed.
+> Model weights (`model.tar.gz`) are **not** committed (GitHub 100 MB limit). Upload
+> it to the Grand-Challenge algorithm's **Models** tab; GC's *Link to GitHub* flow
+> builds the container from a tagged release.
 
 ---
 
-## Quick start
+## Build & submit
 
 ```bash
-# 1. Push + tag the release
 git push origin main
-git tag v1.4.2 && git push origin v1.4.2
-
-# 2. Grand Challenge: Container Images → Link to GitHub → select tag v1.4.2
-#    (v1.4.2 is INFERENCE-EQUIVALENT to v1.4.1 — the model.tar.gz from v1.4 is UNCHANGED; only rebuild the container)
-#    → wait for the server build to reach "Active"
-
-# 3. Upload model.tar.gz to the algorithm's "Models" tab
-
-# 4. Submit: paste docs/Comment.txt, upload docs/description.pdf,
-#    select the Algorithm, click Submit
+git tag v1.x && git push origin v1.x
+# Grand Challenge → Container Images → Link to GitHub → select tag v1.x → wait for "Active"
+# Upload model.tar.gz to the algorithm's "Models" tab
+# Submit: paste docs/Comment.txt, upload docs/description.pdf, select Algorithm, Submit
 ```
 
-Daily quota: 10 submissions/day, 10-minute per-case timeout.
+Daily quota: 10 submissions/day, 10-minute per-case timeout. The deployed Stage-B
+trainer and decoder are selected by Dockerfile `ENV` (e.g. `PENGWIN_DS538_TRAINER`,
+`PENGWIN_AFFINITY_DECODE`), so the same image rolls between variants by env alone.
 
 ---
 
-## Data
-
-The Zenodo archive contains the 340-case training set in `.mha` format
-(`<case>/{image.mha, label.mha}`).
-
-| Cohort | Count | Note |
-|---|---|---|
-| Pelvic (sacrum + leftHip + rightHip) | 170 | label range 1–150 |
-| Femur-only | 170 | label range 151–200 |
-
-Pelvic and femur cases are disjoint patients. A **single source-case grouped
-5-fold split** (seed 12345) is shared by both stages, so a held-out fold is held
-out across the whole cascade (the held-out anatomy context is out-of-fold).
-
----
-
-## Method differences vs the official baseline
+## Method vs the official baseline
 
 | Aspect | Official baseline | This repo |
 |---|---|---|
-| Backbone | nnUNet ResEnc | **STU-Net-B** (TotalSegmentator bone warm-start) |
-| Stage 2 target | 3-class CSM (`bg/fg/contact`) | **4-class ABBC** (`bg/border/boundary/core`) |
-| Stage 2 input | per-bone masked CT (1ch) | **per-anatomy ROI (3ch)** + anatomy prob + SDF |
-| Decoder | CC + KD-Tree NN | **core-seed watershed** + anatomy-specific sacrum merge |
-| ID offset | user-side post-step | **embedded in `inference/inference.py`** |
-| Robustness | none | **4-layer** (skeleton fallback + sanity + time budget + post-Ds539 routing) |
+| Backbone | nnU-Net ResEnc | **STU-Net-B** (TotalSegmentator warm-start) |
+| Stage-B target | 3-class CSM (`bg/fg/contact`) | **4-class ABBC** (`bg/border/boundary/core`) + **9-edge affinity** |
+| Stage-B input | per-bone masked CT | **CT-only, leak-free** (anatomy prob used only for routing) |
+| Decoder | CC + KD-tree NN | **core-seed watershed** + **average-linkage agglomeration** + sacrum merge |
+| Laterality | default (mirror all axes) | **L↔R mirror disabled** for anatomy (87.6 % of hip errors) |
+| Routing | volume ratio | bone-skeleton ∪ Ds539 argmax + sanity fallback + **time budget** |
+| ID offset | user post-step | embedded in `inference.py` |
 
-The label range, file-naming, `dataset.json` schema, and final output contract
-are identical to the baseline — only the algorithm differs.
-
----
-
-## Hardware
-
-- Inference: NVIDIA T4 16 GiB (GC default); STU-Net-B ≈ 4 GiB/stage (serial
-  load → peak = max of the two stages). Per-case 45–205 s.
-- Training: 2× GPU DDP; STU-Net-B `3d_fullres`.
+The label range, file naming, `dataset.json` schema, and output contract are
+identical to the baseline — only the algorithm differs.
 
 ---
 
-## Limitations
+## Acknowledgements
 
-- **Dev measurement only** — the official test set is unreleased; numbers are a
-  held-out dev proxy (Stage-1 anatomy context is in-fold for training cases),
-  not a leaderboard result.
-- Sacrum recall trades down slightly (0.835) from the anatomy-specific merge;
-  genuinely multi-fragment sacra are the harder remaining case.
-- Single fold, single seed; no ensembling.
-
----
-
-## Release table
-
-| Tag | Date | Scope | Held-out Frac Dice | Held-out Inst F1 |
-|---|---|---|---|---|
-| v0.2 – v0.3.4 | 2026-05 | ResEnc two-stage, pelvic-only, **femur = background** (archived). | 0.612 → 0.641 | 0.683 → 0.826 |
-| **v1** | 2026-06-06 | **STU-Net 2-stage, femur modeled, leakage-free grouped split, anatomy-specific sacrum decode.** | **0.799** | **0.919** |
-| **v1.1** | 2026-06-06 | Repo cleanup — whole-program dead-code fixpoint (~50k dead lines removed; **inference-equivalent & verified**). Same V1 model + I/O contract; slimmer container. | **0.799** | **0.919** |
-| **v1.2.1** | 2026-06-06 | Identical code to v1.1 — tag pushed after re-binding the Grand Challenge GitHub link (the app reinstall had left a stale binding, so earlier v1.x tags never auto-built). | **0.799** | **0.919** |
-| **v1.3.0** | 2026-06-06 | Routing fix — process every Ds539-confident anatomy instead of a brittle femur/pelvic ratio gate (the gate misrouted ~25% of cases to the wrong set -> 0). e2e-verified mean fracture Dice 0.726->0.968; plus INPUT/OUTPUT dir env-override for the local e2e gate. | **0.799** | **0.919** |
-| **v1.3.1** | 2026-06-06 | Routing fix (v1.3.0) **plus self-diagnostic logging** — the container now logs the loaded network type (STUNet vs ResEnc), input raw-HU distribution, and each Ds539 anatomy's volume fraction with a GARBAGE flag, so a 0-score GC run self-diagnoses from the build/run log. | **0.799** | **0.919** |
-| **v1.3.2** | 2026-06-07 | **ROOT-CAUSE FIX of the prior ~0 GC scores.** The container pins `nnunetv2==2.5.1`, whose `initialize_from_trained_model_folder()` does **not** load the checkpoint into `predictor.network` (it defers to `perform_actual_prediction()`); our custom predict path bypasses that, so both stages ran with **random weights** → speckle anatomy → ~0. `build_predictor` now loads the weights explicitly (version-independent). Reproduced + verified on 2.5.1: `w0sum` 82.9 (random) → 104.03, Ds539 6812 → 2 CCs. Model unchanged. | **0.799** | **0.919** |
-| **v1.3.3** | 2026-06-07 | **Under-segmentation fix (inference-only, model unchanged).** Disable the non-Sacrum size-ratio merge (0.05→0.0) that collapsed real 1-11cm³ fragments (it had diverged from the validated offline eval). Sacrum keeps its 0.10 precision guard. Local instance proxy: recall 0.46→0.51, F1 0.50→0.55, split_error 0, precision held. Also removed a "bbox>50%" band-aid (ROB-3) + ~120 dead lines. | **0.799** | **0.919** |
-| **v1.4** | 2026-06-15 | **NEW leak-free Stage-B model (V302).** Stage-B fracture model retrained CT-ONLY (1-channel) — removes the V1.3.x Stage-A→B leakage where the old 3-channel input `[CT, Ds539-anatomy-prob, SDF]` fed the Stage-A anatomy probability into Stage-B as an input channel. Leak-free instance-label ABBC training (no sidecar), 97pt warm-start, converged. Dev held-out (132 ROI, official-aligned v2 proxy): Instance F1 **0.896** (vs v1.3.3 0.550 — the fragment-merge weakness is fixed, recall 0.90), Dice 0.824, HD95 13.65mm. Also retired the failed #1 loss-level connectivity-penalty experiment + all legacy. Stage-A anatomy (Ds539 97pt) + cascade + decode UNCHANGED. | _pending_ | _pending_ |
-| **v1.4.1** | 2026-06-15 | **Inference-only paste fix (model UNCHANGED).** A true END-TO-END dev eval (Stage-A→Stage-B over full cases, not GT-bbox ROIs) revealed that on femur scans, Ds539 paints a phantom pelvic bone whose padded ROI spatially overlaps the real femur; the per-anatomy paste was first-anatomy-wins (`write only where out_slot==0`), so the phantom **blocked** the later femur paste (femur 210k→7.9k voxels, Dice 0.95→0.0). Fix: an anatomy may regrow into background but must not paint into ANOTHER bone's Ds539-argmax territory (`PENGWIN_CONFINE_TO_MASK`, default on). Full 68-case e2e: **Dice 0.706→0.833, IoU 0.659→0.797, HD95 14.9→6.46mm, ASSD 4.34→1.89, F1 0.847→0.925**; 13 weak femur cases (Dice<0.3) → 0, no pelvic regression. HD95/ASSD now ≈ the 2024 CT winner (5.87mm / 1.84). | _pending_ | _pending_ |
-| **v1.4.2** | 2026-06-17 | **Repo hygiene + dormant knobs (model & inference behavior UNCHANGED from v1.4.1; fresh tag for credential rotation).** Removed ~1,580 lines of dead training code from `code_task1/core.py` (3724→2145: retired BoundaryFragment/Legacy-topology/sidecar dataloader family + helpers + a dead `PengwinTrainer` method + `_V300BoundaryAttentionRefinementNetwork` + unused import) and trimmed `utils.py`/`train.py` — all AST-verified, mirror byte-identical, full import + 5/5 registry smoke-test green. Added the `PengwinTrainerSTUNetBaseABBCXCACSoftPhase1V305` softened-X-CAC **training** trainer (not on the container runtime path). `inference.py`: `DS538_TRAINER` is now `PENGWIN_DS538_TRAINER`-overridable (**default unchanged = V302**) and a dormant `decode_abbc_fuzzy_seed_watershed` is gated by `PENGWIN_FUZZY_SPLIT` (**default OFF**). The deployed cascade, decode, and weights are byte-for-byte the v1.4.1 container → same scores. | _pending_ | _pending_ |
-
----
-
-## Acknowledgments
-
-Built on [nnU-Net v2](https://github.com/MIC-DKFZ/nnUNet),
-[STU-Net](https://github.com/Ziyan-Huang/STU-Net) (TotalSegmentator bone
-pretrain), and the
-[PENGWIN 2026 Task 1 baseline](https://github.com/YzzLiu/PENGWIN2026_Task1_AutoSeg_Baseline).
-
-> Isensee, F., Jaeger, P.F., Kohl, S.A.A. *et al.* nnU-Net: a self-configuring
-> method for deep learning-based biomedical image segmentation.
-> *Nat Methods* **18**, 203-211 (2021).
-
----
-
-## License
-
-[MIT](LICENSE) — see file for terms.
+Built on [nnU-Netv2](https://github.com/MIC-DKFZ/nnUNet) (Isensee et al., *Nature
+Methods* 2021), the [STU-Net](https://github.com/uni-medical/STU-Net) large-scale
+skeletal pretrain, the **ABBC** fragment formulation from the PENGWIN-2024
+1st-place method, and **GASP** average-linkage agglomeration (Bailoni et al.,
+CVPR 2022) for affinity decoding.
