@@ -191,8 +191,37 @@ flowchart TD
   - **Marginal Dice**: 각 샘플에서 **실제로 라벨된 fg 클래스에 대해서만** soft Dice 계산.
   - `labeled_mask[B,C]`는 매 배치마다 `ds539_case_labeled_classes.json`(case→labeled-class 맵)에서 설정.
 
+  **Marginal loss 도식 (부분 라벨 모순 해결):**
+
+  ```text
+   케이스 유형     라벨된 클래스            미라벨(파일상 강제 bg)
+   ───────────────────────────────────────────────────────────
+   Pelvic (170)   천골1 · 좌관골2 · 우관골3   대퇴4
+   Femur  (170)   대퇴4                     천골1 · 좌관골2 · 우관골3
+
+   ✗ 표준 DC+CE: femur 케이스에서 천골을 예측 = penalty   ← 모순(천골이 안 찍혔을 뿐)
+
+   ✓ Marginal CE:  bg_group = {0} ∪ {그 케이스의 미라벨 fg 클래스}
+        log P(bg) = logsumexp(logits[bg_group]) − logsumexp(logits[전체])
+        ⇒ 미라벨 뼈를 예측해도 bg_group에 흡수 → penalty 0
+   ✓ Marginal Dice: 실제 라벨된 fg 클래스에 대해서만 soft Dice
+  ```
+
 - **라테랄리티(좌우) mirror-off 수정 (필수)**: 초기 모델(x-mirror ON, 표준 DC+CE, best EMA 0.8211@ep95)은 좌우관골을 스왑하는 버그가 있었다. 진단 결과 **GT 우관골 voxel의 35.6%가 좌관골로 오분류, 우관골 오류의 87.6%가 L/R 스왑**이었다(r(RHip Dice, RH→LH frac) = −0.807, 전역 좌우 오배정). 원인 = patch 학습 + 골반 좌우 대칭성 + x-mirror 증강이 L↔R 교환을 가르침. 천골/대퇴는 거울 쌍이 없어 안전(0.96+).
   - **수정**: `DISABLE_X_MIRROR_DATASETS = {Ds539}` → axis-2 mirror 증강 비활성화. (천골/대퇴는 영향 없음.)
+
+  **L/R 스왑 도식 (mirror 증강이 좌우를 가르침):**
+
+  ```text
+   원본 patch                  x-mirror 증강 (axis-2)
+   ┌──────────┬──────────┐      ┌──────────┬──────────┐
+   │ 좌관골    │ 우관골    │  →   │ 우관골    │ 좌관골    │
+   │ (LHip=2) │ (RHip=3) │      │ (RHip=3) │ (LHip=2) │
+   └──────────┴──────────┘      └──────────┴──────────┘
+     골반은 좌우 대칭 → 모델이 "왼쪽 위치=좌관골"을 학습 못 하고 L↔R 혼동
+     증거: 우관골 voxel 35.6% → 좌관골 / 우관골 오류의 87.6% = L/R swap
+     수정: axis-2 mirror OFF (천골·대퇴는 거울 쌍 없음 → 무영향, Dice 0.96+ 유지)
+  ```
 
 - **Cross-region FP = 라벨링 아티팩트(모델은 정답)**: FP mass의 ~76%(femur-only)~84%(pelvic)가 실제 뼈이고 GT 뼈와 0% 겹침 → hallucination 아님. femur-only 케이스가 골반을 라벨 안 했을 뿐.
 
@@ -201,6 +230,22 @@ flowchart TD
 - **배포 V301 성능**: ES @ ep119, best EMA pseudo-Dice 0.8211@ep95(폐기본) → 재학습 V301 EMA 0.978 (deploy mirror 보호 자산, EMA Dice 0.9756). per-existence-case Dice: 천골 0.974, 대퇴 0.963, 좌관골 0.733, 우관골 0.668(약점).
 
 ### 4.2 라우팅 — anatomy prob → per-anatomy ROI bbox
+
+```mermaid
+flowchart TD
+    CT2["CT (canonical, bone-LUT)"] --> L1b["L1 bone-skeleton<br/>HU&gt;200 → opening → CC<br/>top-3을 x좌표로<br/>Sacrum/LHip/RHip 배정"]
+    CT2 --> L2x["L2 Ds539 net<br/>5ch softmax → resample<br/>→ argmax → per-anatomy 마스크"]
+    L2x --> GATE2{"L2b 게이트<br/>마스크 ≥ 0.20 × 최대?"}
+    GATE2 -->|yes| KEEP3["유지"]
+    GATE2 -->|no| DROP3["떨굼"]
+    L1b -. "(A) 떨군 골반 복구(recall)<br/>(B) L↔R swap 제거" .-> RECON2["bone reconcile<br/>(pelvic-dominant 케이스만)"]
+    KEEP3 --> RECON2
+    RECON2 --> SAN{"Ds539 마스크<br/>&lt; 볼륨 35%?"}
+    SAN -->|yes| U539["Ds539 마스크 사용(선호)"]
+    SAN -->|no| UBONE["bone-skeleton fallback"]
+    U539 --> BBOX2["tight bbox ±24vox<br/>→ Stage-B CT-only crop"]
+    UBONE --> BBOX2
+```
 
 - **Layer 1 — bone-skeleton fallback (항상 먼저, HU 기반)**: `HU > 200` 임계 → binary opening → 연결 성분 → 크기 top-3을 x좌표 기준으로 Sacrum(가장 중앙)/LeftHip(+x = LPS 환자 왼쪽)/RightHip(−x)에 할당. fallback 전용(골반만; 대퇴는 fallback 없음).
 - **Layer 2 — Ds539 추론**: 5채널 softmax → 원본 그리드로 resample(order=1) → argmax → per-anatomy 마스크 + morphological cleanup(opening 1iter, `< MIN_DS539_CC_VOXELS=500` CC drop).
@@ -224,6 +269,25 @@ ABBC = **A**round-**B**oundary-**B**oundary-**C**ore의 4-class 표현. raw inst
 1. `separator_gap_targets`: 13-offset 이웃(`AFFINITY13_OFFSETS_ZYX`)에서 **같은 해부학·다른 조각** 인접 voxel 쌍을 찾아 양 끝점을 "separator gap"으로 표시.
 2. `abbc_class_target`: separator band를 `BOUNDARY_DILATE_VOX=2`만큼 dilate → `boundary`. support를 `CORE_ERODE_VOX=2`만큼 erode → `support_eroded`. `core = support_eroded & ~boundary`, `border = support & ~core & ~boundary`.
 
+**ABBC 단면 도식 — 맞닿은 두 조각 A·B (가로 단면):**
+
+```text
+  위치      [────── 조각 A ──────][골절면][────── 조각 B ──────]
+  instance   A A A A A A A A A A A         B B B B B B B B B B B
+  ──────────────────────────────────────────────────────────────
+  ABBC       1 1 3 3 3 3 3 3 3 1 1 │2 2│ 1 1 3 3 3 3 3 3 3 1 1
+             │   └── core(3) ──┘   │ ▲ │     └── core(3) ──┘
+             └──── border(1) ──────┘ │ └──── border(1) ───────┘
+                                   boundary(2) = 골절면 "벽"
+
+  생성:  13-offset로 [같은 해부학·다른 조각] 인접쌍 = separator gap
+         → dilate(2vox)  = boundary(2)  : watershed 벽(elevation ↑)
+         → support erode(2vox) = core(3): watershed 씨앗(조각당 1)
+         → 나머지        = border(1)    : 조각 몸통
+  효과:  watershed가 각 core(씨앗)에서 자라 boundary(벽)에서 멈춤 ⇒ A·B 분리
+  한계:  두 조각이 한 core로 병합되면(seed 1개) watershed가 못 가름 = merge ceiling
+```
+
 | class | 의미 | 역할 |
 |---|---|---|
 | 0 | background | — |
@@ -245,6 +309,22 @@ Mid-range:                                     (3,0,0) (0,3,0) (0,0,3)
 Long-range (repulsive, merge-breaking lever):  (9,0,0) (0,9,0) (0,0,9)
 ```
 
+**affinity 도식 — 같은 조각 vs 골절면 가로지름:**
+
+```text
+  affinity_k(x) = P( voxel x 와 x+offset_k 가 같은 인스턴스 )   (sigmoid 0~1)
+
+   ┌──── 같은 조각 내부 ────┐        ┌──── 골절면 가로지름 ────┐
+        x ●━━━━━━━● x+off              x ●╳╳┊╳╳● x+off
+          affinity ≈ 1                      ┊ affinity ≈ 0
+     (인력: "붙여라")                  (척력: "갈라라")
+                                        분리신호 sep = 1 − affinity
+
+  • short(±1): 미세 골절면 검출   • mid(±3): 중간   • long(±9): "병합 깨는 레버"
+    long-range는 조각 폭보다 먼 거리라, 반대편이 다른 조각이면 강하게 0
+    → 큰 병합 덩어리도 감지(ABBC core 단독으로는 못 가르는 것을 가름).
+```
+
 - **손실 = `LeakFreeInstanceABBCAffinityLoss`**: ABBC(ch 0-3) + per-offset affinity BCE(ch 4-12). 각 offset에서 fg-fg edge 쌍에 대해 예측 affinity vs `(inst[a]==inst[b])` BCE.
 - **class-balanced (핵심)**: `aff = 0.5·(L_same/n_same + L_diff/n_diff)`. ~95%의 supervised pair가 same-instance라 unbalanced BCE는 "전부 연결됨"으로 붕괴(V307 실패). 균형 가중으로 sparse한 골절면 edge가 same-instance와 동등하게 학습됨 → 붕괴 불가.
 - **효과**: case 294 femur short-affinity min 0.708(V307, 붕괴) → **0.019**(V308, 골절면 검출), 디코드 → femur=4=GT(V302는 2로 병합), T-robust(0.30/0.45/0.60 모두 4).
@@ -254,6 +334,22 @@ Long-range (repulsive, merge-breaking lever):  (9,0,0) (0,9,0) (0,0,9)
 `_V300BoundaryAttentionRefinementNetwork(boundary_channel_index=2)`가 STU-Net-B를 wrap. refinement conv를 zero-init → 학습 시작 시 base와 byte-identical.
 
 ### 4.4 디코드 알고리즘
+
+Stage-B 출력(ABBC 4ch, V308+는 +affinity 9ch)을 **로컬 인스턴스 맵**으로 변환. 4가지 디코드가 merge↔split 동작점이 다르다.
+
+```mermaid
+flowchart TD
+    P["Stage-B 출력<br/>ABBC 4ch (+ affinity 9ch)"]
+    P --> D1["① core-seed watershed<br/>core CC = seed → watershed"]
+    P --> D2["② agglo (Tier-0)<br/>oversegment → RAG → merge(T)"]
+    P --> D3["③ affinity decode (Tier-1)<br/>sep=1−short.min → boundary에 splice → agglo"]
+    P --> D4["④ fusion<br/>V302 base + 내부 sub-split + real-fracture gate"]
+    D1 --> B1["병합 경향<br/>(seed 없으면 못 가름 = merge ceiling)"]
+    D2 --> B2["T로 merge↔split 조절"]
+    D3 --> B3["★배포 v1.5★ 학습된 분리신호로<br/>병합 깨기 (T=0.45)"]
+    D4 --> B4["precision floor 유지하며<br/>진짜 골절만 split"]
+    style D3 fill:#e8f5e9,stroke:#2e7d32
+```
 
 #### (기본) core-seed watershed — `decode_abbc_core_seed_watershed`
 
@@ -278,6 +374,18 @@ ABBC boundary를 elevation으로 쓰는 GASP/connectomics 패러다임. **먼저
 5. `merge_hierarchical(thresh=T)` — 가장 낮은 interface weight 쌍부터 반복 병합, 남은 weight ≥ T까지. **T 높음 = 보수적(조각 많이 유지), T 낮음 = 공격적 병합.**
 6. +1 shift, relabel, `_drop_small`.
 
+```mermaid
+flowchart LR
+    FG["fg=bg&lt;0.5<br/>elev=boundary"] --> SEED2["seed = core&gt;0.5<br/>&amp; boundary&lt;0.2"]
+    SEED2 --> WS2["watershed(elev,seed)<br/>→ 다수 supervoxel<br/>(과분할 OK)"]
+    WS2 --> RAG["RAG: node=supervoxel<br/>edge wt = 공유 interface<br/>평균 boundary prob"]
+    RAG --> MH["merge_hierarchical(T)<br/>약한 ridge부터 병합<br/>남은 weight ≥ T까지"]
+    MH --> OUT2["instance map<br/>+ drop_small"]
+```
+
+> **T(=AGGLO_T) 의미**: T↑ = 보수적(조각 많이 유지) / T↓ = 공격적 병합. 디코드 재튜닝의 핵심 노브.
+> mutex(AbsMax, V303)와 달리 **mean-linkage**라 단일 노이즈 edge에 강건(과분할 방지).
+
 #### affinity-only decode — `decode_affinity_agglo` (Tier-1)
 
 학습된 affinity를 분리 신호로 사용. `sep = 1 − short.min(axis=0)`(short-range affinity 중 하나라도 낮으면 = 골절면) → 이 `sep`를 ABBC boundary 채널(ch2)에 splice → `decode_agglo` 호출. 노이즈 많은 hand-engineered boundary 대신 dedicated 헤드의 학습된 분리 신호 사용. env `PENGWIN_AFFINITY_DECODE=1`, `PENGWIN_AGGLO_T`(default 0.45). **이것이 배포 v1.5의 활성 경로.**
@@ -290,6 +398,19 @@ V302 정밀 partition을 base(precision floor)로 두고, **base 경계를 절�
 2. **real-fracture gate (2026-06-25 핵심 진단 혁신)**: `hi = sep ≥ ridge_sep(0.5)` 마스크에서 instance 내 **최대 연결 성분 < min_ridge_vox**(env `PENGWIN_FUSION_RIDGE_VOX`, default 3000)면 유지. 진짜 병합(case 294/Femur = ~25,700 coherent voxel, frac>0.5=0.126)과 phantom(116/RightHip = <100 specks)을 high-sep mass로 구분 → ABBC core speckle 기인 phantom over-split 차단.
 3. `_affinity_subsplit`: instance 내부에서 oversegment+agglomerate. seed가 <2면 분할 안 함(보수 게이트).
 4. sub-instance ≤1이면 V302 유지, 아니면 채택. relabel.
+
+```mermaid
+flowchart TD
+    BASE2["V302 base instance<br/>(정밀 partition = precision floor)"] --> EACH{"각 base instance마다"}
+    EACH --> G1{"size &lt; 2×min_vox?"}
+    G1 -->|yes| KEEP2["그대로 유지"]
+    G1 -->|no| G2{"real-fracture gate<br/>high-sep(≥0.5) 최대 CC<br/>≥ ridge_vox(3000)?"}
+    G2 -->|"no = phantom<br/>(core speckle)"| KEEP2
+    G2 -->|"yes = 진짜 병합"| SUB["_affinity_subsplit<br/>내부만 oversegment+agglo<br/>(base 경계 절대 안 넘음)"]
+    SUB --> ADOPT["sub ≥ 2면 채택"]
+```
+
+> **real-fracture gate(핵심 진단 혁신)**: 진짜 병합(case 294/Femur ≈ 25,700 coherent voxel)과 phantom(116/RightHip &lt; 100 specks)을 **high-sep mass 크기**로 구분 → ABBC core speckle 기인 phantom over-split 차단.
 
 > 디코드별 동작 정리: **V302(hard core)=병합 / V303(mutex)=과분할 / fuzzy-peak=과분할 / fusion@g3000=현재까지 최고의 merge-fix 변형**(V308 6/9 메트릭, V302 약점 메트릭 상회).
 
