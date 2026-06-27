@@ -8,6 +8,10 @@
 >
 > 본 저장소는 **2-stage cascade**(해부학 분할 → 골절 인스턴스 분할) + **ABBC core-seed watershed / affinity average-linkage agglomeration** 디코드 파이프라인의 전체 구현, 실험 연대기, 학습 인프라 교훈을 담는다.
 
+![PENGWIN 골절 조각 instance 분할 예시 (Case 001, 골반)](assets/hero_pelvic.png)
+
+> **위 예시 — Case 001 (골반: 천골+좌/우관골)** CT의 **골절 조각 instance 분할** (axial·coronal·sagittal MIP, 색 = 조각 ID). 핵심 난점: 같은 뼈 안에서 **맞닿은 골절 조각들을 서로 다른 인스턴스로 분리**하는 것(단순 의미 분할이 아님).
+
 ---
 
 ## 목차
@@ -257,6 +261,10 @@ flowchart TD
 - **시간 예산 가드(L4)**: crop dims vs patch `[192,160,224]`, `tile_step 0.5`, ~2.5s/patch로 ETA 추정. `elapsed+ETA > TIME_BUDGET_SECONDS=480s`면 해당 해부학 skip, `elapsed > 540s`면 이후 전부 skip.
 
 ### 4.3 Stage-B — 골절 인스턴스 분할 (Dataset538)
+
+![Stage-B 알고리즘 한눈에](assets/algo_stageB.png)
+
+> **Stage-B 알고리즘** (Case 001 axial): (1) bone-window CT → (2) 조각별 instance GT → (3) **ABBC 타겟**(초록=core seed, 빨강=boundary 골절벽, 파랑=border) → (4) **affinity 분리 신호** `sep = 1 − affinity`(골절면에서 high). core seed에서 watershed가 자라 boundary(골절벽)에서 멈춰 조각이 분리된다.
 
 **입력 = leak-free CT-only 1채널** (`ct_lut_crop[bbox]`). 과거의 3채널 `[bone-LUT CT, Ds539 anatomy prob, SDF ±40mm]`은 anatomy-prob 채널이 Stage-A→B 데이터 누수라 제거. bbox 로컬라이즈는 정당한 cascade 라우팅이지만 **모델 입력 채널은 순수 CT**.
 
@@ -684,6 +692,10 @@ def decode_fusion(base, abbc_probs, affinities, T=0.45, min_vox=250, short_idx=(
 > real-fracture gate: 진짜 병합(case 294/Femur ≈ 25,700 coherent voxel)과 phantom(116/RightHip < 100 specks)을 high-sep mass 크기로 구분 → ABBC core speckle 기인 phantom over-split 차단(`min_ridge_vox` default 1500, env `PENGWIN_FUSION_RIDGE_VOX`로 3000 override).
 
 ### 4.8 Worked example — case 294 femur 분리 (단계별)
+
+![Case 294 대퇴 분쇄골절 4조각](assets/hero_femur294.png)
+
+> **Case 294 — 대퇴 분쇄골절(comminuted), GT 4 조각** (색 = 조각 ID, axial·coronal·sagittal MIP). 아래 표는 V302(2조각으로 병합) → V308 affinity(min 0.019로 골절면 검출) → **4조각 정확 분리**의 단계별 과정.
 
 case 294는 GC 제출 최악 케이스(case 001)의 로컬 dev twin이다. femur가 분쇄(comminuted)되어 **GT 4 fragment** — femoral shaft(label 151) + 맞닿은 proximal-femur 3조각(label 152/153/154, z≈450-513의 head/neck cluster). binary union mask는 거의 완벽(IoU 0.961, union HD95 0.7mm, Dice 0.980)하므로 오류는 100% partition, 0% mask다.
 
