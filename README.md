@@ -422,6 +422,333 @@ flowchart TD
 
 > **참고**: 현재 코드에 글로벌 `LARGEST_CC_KEEP_ONLY` 후처리 필터는 없다. keep_frac 동작은 per-anatomy 마스크 단계(bbox 전)의 `PENGWIN_ROUTE_CC_MODE`로 대체됨.
 
+### 4.6 손실 수식 (코드 레벨)
+
+본 절은 실제 손실 구현(Stage-A `core.py`의 `MarginalDiceCELoss`, Stage-B `loss.py`의 `LeakFreeInstanceABBCLoss` / `LeakFreeInstanceABBCAffinityLoss`)을 수식·의사코드 레벨로 정리한다.
+
+#### MarginalDiceCELoss (Stage-A, partial-label)
+
+> 코드 기준: 이 클래스는 `loss.py`가 아니라 `code_task1/core.py`(Stage-A anatomy 트레이너)에 정의돼 있다. Ds539가 pelvic(sacrum/LHip/RHip만 라벨)과 femur(femur만 라벨)의 disjoint 부분 라벨이라, 보이는데 미라벨된 뼈가 'background'로 학습돼 충돌한다. marginal loss는 케이스별 미라벨 fg 클래스를 **background marginal로 접어** 페널티를 제거한다.
+
+`labeled_mask[B, C]` (bool)는 케이스별 라벨된 클래스를 나타내며(트레이너가 매 배치 `batch['keys']` → case 라벨셋으로 설정, `None`이면 전부 labeled = 표준 동작), `c=0`(bg)은 항상 labeled로 강제된다.
+
+**marginal CE** — 미라벨 fg 클래스 logit을 `{bg} ∪ {미라벨 fg}` super-group으로 묶어 logsumexp로 marginal bg log-prob을 계산:
+
+```text
+bg_group = {0} ∪ {c : c≠0 ∧ labeled_mask[:,c]=False}
+
+log q_bg = logsumexp(logits[bg_group]) − logsumexp(logits[all])     # [B,1,...]
+
+target_logq(x) = log q_bg(x)                       if target(x)==0   (bg 영역; 미라벨 뼈 포함)
+               = log_softmax(logits)[target(x)](x) otherwise          (labeled 클래스 = 표준)
+
+CE = − mean( target_logq )
+```
+
+bg 영역(미라벨 뼈 포함)에서 미라벨 클래스 예측에 대한 페널티가 0이 된다.
+
+**marginal Dice** (`do_bg=False`, labeled fg 클래스만, per-sample):
+
+```text
+for c in 1..C-1 where labeled_mask[:,c]:
+    Dice_c = (2·Σ(p_c·g_c) + smooth) / (Σ p_c + Σ g_c + smooth)     # smooth=1e-5
+mean_dice = mean over (sample, labeled c) of Dice_c
+
+L = weight_ce · CE − weight_dice · mean_dice        # weight_ce=weight_dice=1.0
+```
+
+핵심 의사코드:
+
+```python
+mask = labeled_mask.clone(); mask[:, 0] = True       # bg 항상 labeled
+fg_unlabeled = (~mask) & (ch != 0)                   # [B, C]
+bg_group = fg_unlabeled.clone(); bg_group[:, 0] = True
+
+# --- marginal CE ---
+lse_all = logsumexp(logits, dim=1, keepdim=True)
+masked  = logits.masked_fill(~bg_group_view, -inf)
+logq_bg = logsumexp(masked, dim=1, keepdim=True) - lse_all   # log marginal bg
+gathered = gather(log_softmax(logits), tgt)
+target_logq = where(tgt == 0, logq_bg, gathered)
+ce = -(target_logq).mean()
+
+# --- marginal Dice (labeled fg only) ---
+for c in range(1, C):
+    if not labeled_mask[:, c].any(): continue        # 미라벨 클래스는 Dice에서 제외
+    ... 표준 soft-dice over labeled samples ...
+return weight_ce * ce - weight_dice * mean_dice
+```
+
+softmax를 유지해 STU-Net TotalSeg warm-start를 보존하고, nnUNet `DC_and_CE` 관례(weight 1/1, smooth 1e-5)를 따른다.
+
+#### ABBC 타겟 생성 의사코드 (Stage-B)
+
+상수(`LeakFreeInstanceABBCLoss` 클래스 레벨): `BOUNDARY_DILATE_VOX = 2`, `CORE_ERODE_VOX = 2`. 해부학 인코딩은 instance ID `1..200`에서 `anatomy = (id - 1) // 50` → `0=Sacrum(1-50), 1=LHip(51-100), 2=RHip(101-150), 3=Femur(151-200)`, `INSTANCE_ID_MAX = 200`.
+
+13-offset 이웃 스텐실 `AFFINITY13_OFFSETS_ZYX` (26-연결 격자의 half-neighbourhood):
+
+```text
+(0,0,1), (0,1,-1), (0,1,0), (0,1,1),
+(1,-1,-1), (1,-1,0), (1,-1,1), (1,0,-1), (1,0,0), (1,0,1),
+(1,1,-1), (1,1,0), (1,1,1)
+```
+
+```python
+def separator_gap_targets(inst):
+    support   = (inst > 0) & (inst <= INSTANCE_ID_MAX)   # 전체 fg
+    separator = zeros_like(support, bool)
+    for offset in AFFINITY13_OFFSETS_ZYX:
+        a, b = inst[src_slice], inst[dst_slice]          # offset만큼 shift된 두 슬라이스
+        a_fg = (a > 0) & (a <= INSTANCE_ID_MAX)
+        b_fg = (b > 0) & (b <= INSTANCE_ID_MAX)
+        # SAME ANATOMY: (id-1)//50 일치 / DIFFERENT FRAGMENT: a != b
+        diff = a_fg & b_fg & (((a-1)//50) == ((b-1)//50)) & (a != b)
+        if diff.any():
+            separator[src_slice] |= diff
+            separator[dst_slice] |= diff                 # cross-fragment edge의 양 끝점
+    return support, separator & support
+
+def abbc_class_target(inst, *, boundary_dilate_vox=2, core_erode_vox=2):
+    support, raw_between = separator_gap_targets(inst)
+    non_support = ~support
+
+    # BOUNDARY = inter-fragment band를 dilate (k = 2·2+1 = 5)
+    dilated  = max_pool3d(raw_between, kernel=2*boundary_dilate_vox+1, stride=1, pad=boundary_dilate_vox)
+    boundary = (dilated > 0.5) & support
+
+    # CORE = support를 erode (bg에서 멀어진 voxel; k = 5)
+    nsd            = max_pool3d(non_support, kernel=2*core_erode_vox+1, stride=1, pad=core_erode_vox)
+    support_eroded = support & (nsd <= 0.5)
+
+    core   = support_eroded & (~boundary)
+    border = support & (~core) & (~boundary)
+
+    # class: 0=bg, 1=border, 2=boundary, 3=core
+    class_target = zeros_like(inst, long)
+    class_target[border]   = 1
+    class_target[boundary] = 2
+    class_target[core]     = 3
+    return class_target
+```
+
+ABBC sub-loss는 `_dice_ce`로 계산되며 `class_weight = [1, 1, boundary_class_weight, 1]`, `boundary_class_weight = 5.0`(default, env `PENGWIN_ABBC_BOUNDARY_WEIGHT`), Dice는 fg 클래스 1/2/3만(`dice[1:].mean()`).
+
+#### affinity class-balanced BCE (Stage-B, V308)
+
+9 affinity offset `AFFINITY_HEAD_OFFSETS` (net 출력 ch 4-12; ch 0-3은 ABBC):
+
+```text
+(1,0,0) (0,1,0) (0,0,1)   # short-range (nearest)
+(3,0,0) (0,3,0) (0,0,3)   # mid-range
+(9,0,0) (0,9,0) (0,0,9)   # long-range (merge-breaking)
+```
+
+per-offset BCE를 same/diff 인스턴스 쌍 개수로 정규화한 뒤 **0.5씩 평균**:
+
+```text
+fg    = (inst > 0) & (inst <= INSTANCE_ID_MAX)        # ignore(-1)은 제외
+for each offset k:
+    valid = fg[src] & fg[dst]                         # 양 끝점 모두 fg
+    sm    = inst[src] == inst[dst]                    # True = 같은 인스턴스
+    bce   = BCE_with_logits( aff_logits[k][src], sm )
+    same_sum += Σ bce[valid ∧ sm];   n_same += |valid ∧ sm|
+    diff_sum += Σ bce[valid ∧ ¬sm];  n_diff += |valid ∧ ¬sm|
+
+L_aff = 0.5 · ( same_sum/max(n_same,1) + diff_sum/max(n_diff,1) )
+
+L_total = L_ABBC + aff_w · L_aff       # aff_w default 1.0 (env PENGWIN_AFF_W)
+```
+
+```python
+aff = 0.5 * (same_sum / max(n_same, 1) + diff_sum / max(n_diff, 1))   # loss.py line 713
+```
+
+**왜 balanced가 필수인가**: supervised voxel-pair의 ~95%가 same-instance(target=1)다. unweighted BCE는 "전부 연결됨" 예측으로 손실을 최소화하고, 5%의 cross-fragment(골절면) edge는 불균형을 이길 수 없다 — 이것이 **V307 붕괴**(affinity head가 same-instance ≈ 1로 collapse)의 원인이다. class-balanced 식은 RARE한 cross-fragment edge가 ~95%의 same-instance 쌍과 동등한 가중을 갖게 해 head가 all-same으로 붕괴하지 못하게 한다.
+
+### 4.7 디코드 단계별 의사코드
+
+네 가지 디코드의 핵심 연산(`skimage.segmentation.watershed`, `skimage.future.graph.rag_boundary` / `merge_hierarchical`, `scipy.ndimage`)을 의사코드로 드러낸다. 공통 merge 규칙은 average-linkage(`_weight_boundary` = 공유 interface count-가중 평균), 공통 cleanup은 `_drop_small`(erase → EDT 최근접 refill)이다.
+
+#### decode_abbc_core_seed_watershed (기본)
+
+```python
+def decode_abbc_core_seed_watershed(probs, background_threshold=0.50, core_threshold=0.50,
+                                    min_component_voxels=1820, size_ratio_keep=0.0):
+    # probs: [4,Z,Y,X]  0=bg 1=border 2=boundary 3=core
+    background = probs[0] >= background_threshold
+    support    = ~background
+    core       = (probs[3] >= core_threshold) & support
+    core_labels, n_core = ndi.label(core, structure=ones((3,3,3)))   # 26-connectivity
+
+    if n_core <= 0:
+        labels = where(support, 1, 0)                  # core 없으면 support 전체 = 인스턴스 1
+    else:
+        priority = ndi.distance_transform_edt(core_labels == 0)      # core까지의 거리
+        labels   = skimage.segmentation.watershed(priority, markers=core_labels, mask=support)
+        # 미채움 support → EDT 최근접 라벨로 fill
+        nearest = ndi.distance_transform_edt(labels == 0, return_indices=True)[1]
+        labels[support & (labels == 0)] = labels[tuple(nearest[..., support & (labels==0)])]
+
+    decoded = _merge_small_components(labels, min_component_voxels=min_component_voxels)  # <1820 병합
+    if size_ratio_keep > 0.0:                          # Sacrum override = 0.10
+        decoded = _merge_by_size_ratio(decoded, size_ratio_keep=size_ratio_keep)
+    return decoded.astype(uint16)
+```
+
+> 특성: seed(core CC)가 없으면 인스턴스를 만들 수 없음 → 병합된 core를 분리할 수 없다(merge ceiling의 구조적 원인). Sacrum만 `size_ratio_keep=0.10`, `min_component_voxels=max(1820, 250)=1820`.
+
+#### decode_agglo (Tier-0, watershed → RAG → merge_hierarchical)
+
+```python
+def decode_agglo(probs, T=0.45, min_vox=250, seed_core=0.5, seed_bnd=0.20):
+    bg, border, boundary, core = probs
+    fg   = bg < 0.5
+    elev = boundary                                    # elevation = boundary prob (HIGH = ridge)
+
+    seeds = (core > seed_core) & (boundary < seed_bnd) & fg
+    markers, nm = ndi.label(seeds)
+    if nm <= 1:                                        # fallback: low-boundary 거리장의 peak_local_max
+        d  = ndi.distance_transform_edt(boundary < seed_bnd) * fg
+        pk = peak_local_max(d, min_distance=4, labels=fg)
+        markers, nm = ndi.label(scatter(pk))
+        if nm == 0: markers, nm = ndi.label(fg)        # 최후: 전체 fg = 1 marker
+
+    sv = watershed(elev, markers, mask=fg)             # oversegment (ridge에서 분할)
+    if sv.max() <= 1:
+        out = (sv > 0).astype(int32)
+    else:
+        rag = rag_boundary(sv, elev)                   # edge wt = 공유 interface 평균 boundary
+        rag.remove_node(0)                             # background node 제거
+        merged = merge_hierarchical(sv, rag, thresh=T, rag_copy=False, in_place_merge=True,
+                                    merge_func=_merge_boundary,   # no-op
+                                    weight_func=_weight_boundary) # count-가중 평균 (average-linkage)
+        out = merged.astype(int32) + 1                 # 0-based → bg=0 안전 shift
+    out[~fg] = 0
+    out, _ = _relabel(out)
+    out = _drop_small(out, min_vox)                    # <250 erase + EDT refill
+    return out
+```
+
+> `merge_hierarchical`은 interface weight 오름차순으로 edge를 순회, 평균 interface boundary `< T`이면 병합하고 `≥ T`이면 split 유지. 병합 후 새 weight는 `_weight_boundary = (cs·ws + cd·wd)/(cs+cd)`로 갱신된다(count-가중 평균 = average-linkage). T↑ = 보수적(조각 유지), T↓ = 공격적 병합. mutex(AbsMax, V303)와 달리 단일 노이즈 edge에 강건.
+
+#### decode_affinity_agglo (Tier-1, sep = 1 − short.min)
+
+```python
+def decode_affinity_agglo(abbc_probs, affinities, T=0.45, min_vox=250, short_idx=(0,1,2)):
+    short = affinities[list(short_idx)]                # [3,Z,Y,X] short-range 채널
+    sep   = 1.0 - short.min(axis=0)                    # ANY short affinity 낮으면 = 골절면(high sep)
+
+    probs_aff = abbc_probs.copy()
+    probs_aff[2] = sep                                 # SPLICE: ABBC boundary(ch2) ← affinity sep
+    return decode_agglo(probs_aff, T=T, min_vox=min_vox)
+    # decode_agglo 내부: seed = core>0.5 ∧ sep<0.20 ∧ fg
+    #                    elevation = sep / RAG edge wt = 공유 interface 평균 sep / merge thresh = T
+```
+
+> hand-engineered boundary 대신 dedicated affinity head의 학습된 분리 신호를 elevation으로 사용. env `PENGWIN_AFFINITY_DECODE=1`, `PENGWIN_AGGLO_T`(default 0.45). 배포 v1.5의 활성 경로.
+
+#### decode_fusion (V302 base + real-fracture gate)
+
+```python
+def decode_fusion(base, abbc_probs, affinities, T=0.45, min_vox=250, short_idx=(0,1,2),
+                  seed_core=0.5, seed_bnd=0.20, ridge_sep=0.5, min_ridge_vox=1500):
+    core  = abbc_probs[3]
+    short = affinities[list(short_idx)]
+    sep   = 1.0 - short.min(axis=0)
+    hi    = sep >= ridge_sep                           # high-sep voxel mask (sep ≥ 0.5)
+
+    out, nxt = zeros_like(base), 1
+    for lab in unique(base) where lab != 0:
+        m = (base == lab)
+        if m.sum() < 2*min_vox:                        # ① size gate
+            out[m] = nxt; nxt += 1; continue
+        hi_m = hi & m
+        if hi_m.sum() < min_ridge_vox:                 # ② real-fracture gate (총 high-sep)
+            out[m] = nxt; nxt += 1; continue
+        hl, hn = ndi.label(hi_m)                        # ② high-sep 표면의 최대 CC
+        if hn == 0 or largest_cc(hl) < min_ridge_vox:  #    < ridge_vox = phantom speckle → V302 유지
+            out[m] = nxt; nxt += 1; continue
+        sub = _affinity_subsplit(m, sep, core, T, seed_core, seed_bnd, min_vox)   # base 경계 안에서만
+        sub = _drop_small(where(m, sub, 0), min_vox)
+        sub_ids = [v for v in unique(sub) if v != 0]
+        if len(sub_ids) <= 1:                          # affinity가 내부 골절 못 찾음 → V302 honour
+            out[m] = nxt; nxt += 1; continue
+        for s in sub_ids:                              # affinity 확인 split 채택
+            out[(sub == s) & m] = nxt; nxt += 1
+    out, _ = _relabel(out)
+    return out
+```
+
+`_affinity_subsplit`은 instance 마스크 내부에서만 `seeds = core>0.5 ∧ sep<0.20 ∧ fg`로 seed를 잡고(seed<2면 병합 유지 = precision-safe), `watershed(sep, markers, mask=m)` → `rag_boundary(sv, sep)` → `merge_hierarchical(thresh=T)`로 sub-split한다(base 경계를 절대 넘지 않음).
+
+> real-fracture gate: 진짜 병합(case 294/Femur ≈ 25,700 coherent voxel)과 phantom(116/RightHip < 100 specks)을 high-sep mass 크기로 구분 → ABBC core speckle 기인 phantom over-split 차단(`min_ridge_vox` default 1500, env `PENGWIN_FUSION_RIDGE_VOX`로 3000 override).
+
+### 4.8 Worked example — case 294 femur 분리 (단계별)
+
+case 294는 GC 제출 최악 케이스(case 001)의 로컬 dev twin이다. femur가 분쇄(comminuted)되어 **GT 4 fragment** — femoral shaft(label 151) + 맞닿은 proximal-femur 3조각(label 152/153/154, z≈450-513의 head/neck cluster). binary union mask는 거의 완벽(IoU 0.961, union HD95 0.7mm, Dice 0.980)하므로 오류는 100% partition, 0% mask다.
+
+```text
+GT femur (4 fragment, 맞닿음):
+   [───── shaft 151 ─────][152│153│154]   ← 152/153/154 head/neck cluster (서로 touching)
+                            ↑ 미세 골절면 (voxel overlap엔 무시되나 instance엔 결정적)
+```
+
+| 단계 | 방법 | 핵심 신호(case 294 femur) | 디코드 결과 |
+|---|---|---|---|
+| ① | **V302** (ABBC core-only) | 1-voxel 골절면이 voxel Dice/CE에 무시됨 | **femur = 2** (PR151 shaft + 152/153/154 병합 ~761k voxel blob) |
+| ② | **V307** (affinity, unbalanced BCE) | short-affinity mean 0.995 / **min 0.708** / frac<0.5 = 0.000 | **femur = 1** (붕괴; T-invariant 0.30-0.60) |
+| ③ | **V308** (class-balanced affinity) | short-affinity **min 0.019**(V307 대비 37× 붕괴) / frac<0.5(long) = 0.24 | `decode_affinity_agglo` → **femur = 4 = GT** |
+| ④ | sep-field 측정 | sep≥0.5 coherent ≈ **25,700 voxel** / frac>0.5 = 0.126 | real-fracture gate 통과(>> 3000) |
+
+**단계별 흐름:**
+
+```text
+① V302 (병합)
+   ABBC core-seed watershed: 152/153/154가 한 core CC로 병합 → seed 1개
+   → watershed가 못 가름 → PR152 = 761k blob (per-fragment IoU ~0.25-0.36)
+   Hungarian matching: 4 GT 중 2개 unmatched → recall↓, HD95 45.65mm
+        [─── 151 ───][═══════ 152 (152+153+154 merged) ═══════]
+
+② V307 (붕괴)
+   head 4→13ch, per-offset BCE, NO class weight, 200ep EMA 0.755
+   ~95% same-instance 쌍 → "전부 연결됨"으로 collapse
+   short-affinity min 0.708, frac<0.5 = 0.000 (골절면 한 번도 검출 못 함)
+   → femur = 1 (V302보다 나쁨)
+
+③ V308 (검출)
+   loss 한 줄 수정: aff = 0.5·(L_same + L_diff)  → rare 골절면 edge가 동등 가중
+   oracle sanity: perfect=2.28, collapse=5.28 / 200ep EMA 0.735(붕괴 V307보다 낮음 = 실제 학습 신호)
+   short-affinity min 0.708 → 0.019 (37× 붕괴), frac<0.5(long) = 0.24
+   sep = 1 − affinity → 골절면이 high-sep ridge로 출현
+   decode_affinity_agglo: watershed oversegment → rag_boundary + merge_hierarchical(T)
+       골절면 edge는 low affinity(high sep)라 절대 병합 안 됨
+   → femur = 4 = GT   (T-robust: T=0.30 / 0.45 / 0.60 모두 femur=4)
+        [─── 151 ───][152│153│154]   ← sep ridge에서 정확히 분리
+
+④ sep-field가 진짜 골절 vs phantom을 구분
+   case 294 femur: sep≥0.5 coherent ≈ 25,700 voxel, frac>0.5 = 0.126 (12.6%)
+   phantom(116/RHip, GT=1, core가 ~29 blob speckle): frac>0.5 = 0.000, 최대 CC < 100 specks
+   → decode_fusion real-fracture gate(min_ridge_vox, default 3000):
+       294: 25,700 >> 3000 → gate 통과(split 진행)
+       phantom: <100 << 3000 → gate 차단(split 안 함)
+```
+
+**full-68 메트릭 (V308@T=0.45 vs V302):**
+
+| metric | V302 | V308@T=0.45 |
+|---|---|---|
+| ins_recall | 0.707 | **0.747 (+0.040)** — 모든 방법 중 최초로 recall을 움직임 |
+| merge_err | 0.209 | **0.152** |
+| HD95 (mm) | 3.51 | **3.12** |
+| Dice | 0.954 | 0.954 (보존) |
+| ins_precision | **0.928** | 0.837 (−0.092) |
+| split_err | **0.045** | 0.083 |
+| ins_f1 | **0.764** | 0.743 (−0.020) |
+
+clean win: cases 159(+0.67 recall), 294, 053, 419. over-split/phantom cluster(290, 116, 324, 260, 042, 263)는 recall gain ≈ 0, precision −0.30~−0.67.
+
+> **판정**: affinity + average-linkage는 merge ceiling을 실제로 깬다(전 방법 통틀어 recall이 처음으로 +0.040 이동). 다만 T=0.45는 over-correct라 V302 대비 깨끗한 net F1 win은 없다. V302는 배포 유지(tag v1.4.3), V308은 GC 제출용 v1.5로 배포.
+
 ---
 
 ## 5. 실험 여정 (연대기)
