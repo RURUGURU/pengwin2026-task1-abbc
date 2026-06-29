@@ -76,10 +76,11 @@ os.environ.setdefault("PENGWIN_ROOT", str(MODEL_ROOT))
 #     0=background, 1=Sacrum, 2=LeftHip, 3=RightHip, 4=Femur
 #     (dataset.json labels 및 anatomy_registry.ANATOMY_REGISTRY 와 일치 확인됨).
 DS539_DATASET = "Dataset539_PelvicFemurAnatomyV3"
-DS539_TRAINER = "PengwinTrainerSTUNetBaseAnatomyV301"
+DS539_TRAINER = os.environ.get("PENGWIN_DS539_TRAINER", "PengwinTrainerSTUNetBaseAnatomyV301")
 DS539_PLANS = "nnUNetResEncUNetLPlans"
 DS539_CONFIG = "3d_fullres"
-DS539_FOLD = 0
+# fold may be an int ("0") or the string "all" (a -f all / fold_all model). Default "0" = v1.5 behavior.
+DS539_FOLD = os.environ.get("PENGWIN_DS539_FOLD", "0")
 DS539_OUTPUT_CHANNELS = 5  # background, Sacrum, LeftHip, RightHip, Femur
 
 # --- Dataset538 (STU-Net): anatomy 별 ABBC instance segmenter (V302, leak-free). ---
@@ -93,7 +94,7 @@ DS538_DATASET = "Dataset538_PelvicFemurBICMFragmentV5"
 DS538_TRAINER = os.environ.get("PENGWIN_DS538_TRAINER", "PengwinTrainerSTUNetBaseABBCPhase1V302")
 DS538_PLANS = "nnUNetResEncUNetLPlans"
 DS538_CONFIG = "3d_fullres"
-DS538_FOLD = 0
+DS538_FOLD = os.environ.get("PENGWIN_DS538_FOLD", "0")  # int-string or "all" (fold_all); default "0" = v1.5
 DS538_OUTPUT_CHANNELS = int(os.environ.get("PENGWIN_DS538_OUT_CH", "4"))  # ABBC 4ch (V302); 13 for V307 affinity head (4 ABBC + 9 affinity)
 CHECKPOINT_NAME = "checkpoint_best.pth"
 
@@ -295,7 +296,8 @@ def build_predictor(dataset: str, trainer: str, plans: str, config: str,
         raise FileNotFoundError(f"trained model folder missing: {model_dir}")
     predictor.initialize_from_trained_model_folder(
         str(model_dir),
-        use_folds=(int(fold),),
+        # accept both numeric folds ("0") and the all-data model ("all" -> fold_all dir)
+        use_folds=(("all" if str(fold).strip().lower() == "all" else int(fold)),),
         checkpoint_name=checkpoint_name,
     )
     # CRITICAL (nnUNet version-independence): nnUNet 2.5.1 — the version pinned for the GC

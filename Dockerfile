@@ -82,7 +82,16 @@ ENV PENGWIN_ROOT=/opt/ml/model \
 # affinity-solo decode = the best GC result so far. The fusion/reconcile code stays in inference.py but
 # is ENV-DISABLED here. NOTE PENGWIN_STAGEA_BONE_RECONCILE defaults to 1 in code, so it MUST be set to 0
 # explicitly. Same V308 weight tar. Equivalent to rebuilding from tag v1.5.
+#
+# [v1.9 = FULL-DATA Stage-B] Fracture weights upgraded V308 fold_0 (272 cases) -> V308 fold_all (all 340,
+# SAME 200ep transfer/base_ep4k recipe, ~18h). Uses model_v1_6.tar.gz (Stage-A V301 fold_0 routing
+# UNCHANGED + V308 fold_all + V302 fold_0 rollback). The ONLY change vs v1.5/v1.8 is +68 training cases
+# for the fracture net. MUST set PENGWIN_DS538_FOLD=all so inference loads the fold_all checkpoint.
+# Decode unchanged (AGGLO_T=0.45; full 68-case sweep is T-insensitive). Rollback: V302 -> DS538_TRAINER
+# =...V302 + DS538_FOLD=0; exact v1.5 (V308 fold_0) -> re-deploy model_v1_5.tar.gz. Dev-68 ins_f1 leaky
+# 0.7626 / honest-fold_0 0.7354; real GC is the judge.
 ENV PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308 \
+    PENGWIN_DS538_FOLD=all \
     PENGWIN_DS538_OUT_CH=13 \
     PENGWIN_AFFINITY_DECODE=1 \
     PENGWIN_AGGLO_T=0.45 \
