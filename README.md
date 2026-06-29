@@ -14,6 +14,19 @@
 
 ---
 
+## 🚀 현재 배포 상태 (2026-06-29, v1.9)
+
+| | |
+|---|---|
+| **배포 버전** | **v1.9** — git tag `v1.9` push → GC 자동 빌드 |
+| **파이프라인** | Stage-A `V301`(해부 라우팅, fold_0) → Stage-B `V308`(골절 affinity, **fold_all = 전체 340**) → affinity average-linkage agglomeration decode (`AGGLO_T=0.45`) |
+| **모델 번들** | `model_v1_9.tar.gz` (V301 fold_0 + V308 fold_all + V302 fold_0 rollback) |
+| **v1.5 → v1.9 변경** | Stage-B 골절 모델을 **fold_0(272) → fold_all(340)** 전체데이터로 (레시피 동일: 200ep, TotalSeg `base_ep4k` transfer). Stage-A 라우팅·decode 임계값 **불변** |
+| **실제 GC 점수 (v1.5 = V308 fold_0)** | instance **F1 ~0.572** / Recall 0.574 / Dice 0.919 / HD95 5.31 — **Mean Position 최고** |
+| **dev-68 참고치** | honest ins_f1 **0.735** (fold_0 held-out) / leaky 0.763 (fold_all). dev→GC 분포차 −0.16 = dev가 더 쉬움 → **GC가 진짜 심판** |
+
+> **폐기된 실험** (아래 "실험 연대기"는 history로만 보존): `V312` Stage-B cascade warm-start = V308과 **무승부(tied)** → 미채택 · `V311` Stage-A fold_all = dev wash · `V313` Large = rejected · `V304` X-CAC loss = within-noise · fusion/reconcile = GC 퇴보(v1.8 rollback). **수렴한 최선 = V308 affinity + average-linkage**. 상세: [`docs/legacy-removed-trainers.md`](docs/legacy-removed-trainers.md).
+
 ## 목차
 
 1. [프로젝트 개요](#1-프로젝트-개요)

@@ -34,4 +34,4 @@ The converged best = **V308 affinity + average-linkage agglomeration** (the depl
 
 ## Retired checkpoints
 `V311 fold_all`, `V312 fold_all`, `V313*` model weights are retired (kept only if disk permits; not in any
-shipped `model_v1_*.tar.gz`). Deployed tars use V301 fold_0 + V302 fold_0 + V308 fold_0 (v1.5) / fold_all (v1.6).
+shipped `model_v1_*.tar.gz`). Deployed tars use V301 fold_0 + V302 fold_0 + V308 fold_0 (v1.5) / fold_all (v1.9).

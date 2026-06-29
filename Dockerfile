@@ -84,7 +84,7 @@ ENV PENGWIN_ROOT=/opt/ml/model \
 # explicitly. Same V308 weight tar. Equivalent to rebuilding from tag v1.5.
 #
 # [v1.9 = FULL-DATA Stage-B] Fracture weights upgraded V308 fold_0 (272 cases) -> V308 fold_all (all 340,
-# SAME 200ep transfer/base_ep4k recipe, ~18h). Uses model_v1_6.tar.gz (Stage-A V301 fold_0 routing
+# SAME 200ep transfer/base_ep4k recipe, ~18h). Uses model_v1_9.tar.gz (Stage-A V301 fold_0 routing
 # UNCHANGED + V308 fold_all + V302 fold_0 rollback). The ONLY change vs v1.5/v1.8 is +68 training cases
 # for the fracture net. MUST set PENGWIN_DS538_FOLD=all so inference loads the fold_all checkpoint.
 # Decode unchanged (AGGLO_T=0.45; full 68-case sweep is T-insensitive). Rollback: V302 -> DS538_TRAINER
