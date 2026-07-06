@@ -1,23 +1,20 @@
-% PENGWIN 2026 Task 1 — V1.3.3 STU-Net Two-Stage Submission
+% PENGWIN 2026 Task 1 — V2.0 Target-Family-Routed STU-Net Submission
 % Algorithm Description
-% 2026-06-07
+% 2026-07-06
 
-> **V1.3.3** is an inference-only refinement on top of V1.3.2 (the model is **unchanged**).
-> V1.3.2 took the leaderboard from ~0 to **fracture Dice 0.767** by fixing a random-weight
-> bug (below); V1.3.3 then targets the dominant remaining error revealed by the official
-> per-case metrics — **under-segmentation** (instance recall 0.456, merge_error 0.65,
-> split_error 0). A multi-agent code audit with adversarial verification found the cause:
-> the deploy decoder's non-Sacrum **size-ratio merge** (0.05) was collapsing genuine
-> 1–11 cm³ fracture fragments — and had silently **diverged** from the validated offline
-> evaluator, which uses 0.0. Disabling it (Sacrum keeps its deliberate 0.10 precision guard)
-> recovers the real fragments: on a local instance-level proxy, mean recall **0.46 → 0.51**,
-> F1 **0.50 → 0.55**, with **split_error still 0 and precision held**. V1.3.3 also removes a
-> speckle-era "bbox > 50 %" band-aid that fired on *clean* large anatomy in a tight FOV
-> (swapping the soft probability ROI for a hard bone mask → out-of-distribution decode), and
-> deletes ~120 lines of dead/legacy code. A confidence-based routing guard for the
-> cross-group hallucination was prototyped and **rejected on the evidence** — Ds539 is
-> *confidently wrong* (real and phantom bones both score 0.97–0.99 softmax), so that is a
-> model-level issue for future retraining, not an inference threshold.
+> **V2.0** keeps the validated V1.5 STU-Net weights unchanged and adds a lightweight
+> target-family router between Stage A and Stage B. The router is a random forest packaged
+> with the model payload as `stage1_router/stage1_target_router_fold0.joblib`. It predicts
+> whether the CT is a pelvic case or a femur case from CT field-of-view, HU percentiles, and
+> sampled bone-geometry features. Pelvic cases forward only Sacrum+LeftHip+RightHip to the
+> fracture model; femur cases forward only Femur. This removes wrong-family false positive
+> fragments without changing the segmentation networks.
+>
+> On the local fold0 validation split (68 cases: 34 pelvic, 34 femur), V2.0 improved
+> foreground Dice **0.7757 -> 0.9761**, Prec@0.5 **0.5027 -> 0.8485**, and F1@0.5
+> **0.5568 -> 0.7699**, while IoU-F was essentially unchanged (**0.6827 -> 0.6825**).
+> This matches the intended behavior: the router suppresses non-target anatomy calls, while
+> localization quality of retained fragments is still governed by Stage A/B STU-Net.
 >
 > ---
 >

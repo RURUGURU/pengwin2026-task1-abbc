@@ -71,32 +71,22 @@ ENV PENGWIN_ROOT=/opt/ml/model \
     MPLCONFIGDIR=/tmp/matplotlib \
     XDG_CACHE_HOME=/tmp/.cache
 
-# [v1.8 = ROLLBACK to v1.5 behaviour] v1.6 fusion + v1.7 Stage-A reconcile BOTH REGRESSED on GC
-# (5 prelim cases: recall 0.574->0.522, f1 0.572->0.533, dice 0.919->0.872, hd95 5.31->10.79, merge
-# 0.15->0.35). Root cause: (1) fusion only sub-splits a V302 core-seed base and CANNOT merge an
-# over-split base, so on GC's OOD/noisy ROIs the base over-splits and fusion makes it WORSE (RightHip
-# 5->8 in the prelim logs); V308-solo average-linkage CAN merge weak ridges, so it is more robust.
-# (2) the bone-skeleton reconcile added tiny sliver anatomies (bone mask ~0.1% of volume) that decoded
-# to NOTHING or to FP. The dev proxy could see neither (in-distribution cores -> fusion base did not
-# over-split; zero whole-anatomy drops on dev -> reconcile untestable). So revert to v1.5 = V308
-# affinity-solo decode = the best GC result so far. The fusion/reconcile code stays in inference.py but
-# is ENV-DISABLED here. NOTE PENGWIN_STAGEA_BONE_RECONCILE defaults to 1 in code, so it MUST be set to 0
-# explicitly. Same V308 weight tar. Equivalent to rebuilding from tag v1.5.
-#
-# [v1.9 = FULL-DATA Stage-B] Fracture weights upgraded V308 fold_0 (272 cases) -> V308 fold_all (all 340,
-# SAME 200ep transfer/base_ep4k recipe, ~18h). Uses model_v1_9.tar.gz (Stage-A V301 fold_0 routing
-# UNCHANGED + V308 fold_all + V302 fold_0 rollback). The ONLY change vs v1.5/v1.8 is +68 training cases
-# for the fracture net. MUST set PENGWIN_DS538_FOLD=all so inference loads the fold_all checkpoint.
-# Decode unchanged (AGGLO_T=0.45; full 68-case sweep is T-insensitive). Rollback: V302 -> DS538_TRAINER
-# =...V302 + DS538_FOLD=0; exact v1.5 (V308 fold_0) -> re-deploy model_v1_5.tar.gz. Dev-68 ins_f1 leaky
-# 0.7626 / honest-fold_0 0.7354; real GC is the judge.
+# [v2.0 = v1.5 weights + target-family router]
+# Stage-A V301 fold_0 and Stage-B V308 fold_0 stay unchanged. A lightweight
+# random-forest router packaged in model.tar.gz chooses pelvic vs femur and
+# prevents non-target anatomies from reaching Stage-B. The router artifact must
+# be present at /opt/ml/model/stage1_router/stage1_target_router_fold0.joblib.
+# PENGWIN_TARGET_ROUTER=1 fails fast if the artifact is missing, which avoids a
+# silent fallback to the older Ds539 volume-ratio route.
 ENV PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308 \
-    PENGWIN_DS538_FOLD=all \
+    PENGWIN_DS538_FOLD=0 \
     PENGWIN_DS538_OUT_CH=13 \
     PENGWIN_AFFINITY_DECODE=1 \
     PENGWIN_AGGLO_T=0.45 \
     PENGWIN_FUSION_DECODE=0 \
-    PENGWIN_STAGEA_BONE_RECONCILE=0
+    PENGWIN_STAGEA_BONE_RECONCILE=0 \
+    PENGWIN_TARGET_ROUTER=1 \
+    PENGWIN_TARGET_ROUTER_PATH=/opt/ml/model/stage1_router/stage1_target_router_fold0.joblib
 
 # Grand Challenge security policy: container must not run as root.
 # Create a service user with no shell, no password, no home write permissions

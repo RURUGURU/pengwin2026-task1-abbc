@@ -302,6 +302,7 @@ github_repo/
 ├── inference/
 │   ├── inference.py              # container entrypoint — 2-stage cascade + routing + decode
 │   ├── agglo_decode.py           # average-linkage agglomeration decoder (vendored)
+│   ├── target_family_router.py   # v2.0 CT/FOV/bone-geometry router runtime
 │   └── pengwin_trainers_shim.py  # nnU-Net trainer-discovery shim (re-exports core trainers)
 ├── code_task1/                   # single source of truth (mirror of the live training code)
 │   ├── core.py                   # STU-Net trainers + grouped split + nnU-Net env
@@ -333,8 +334,10 @@ git tag v2.0 && git push origin v2.0
 ```
 
 Daily quota: 10 submissions/day, 10-minute per-case timeout. The deployed Stage-B
-trainer and decoder are selected by Dockerfile `ENV` (e.g. `PENGWIN_DS538_TRAINER`,
-`PENGWIN_AFFINITY_DECODE`), so the same image rolls between variants by env alone.
+trainer, decoder, and router are selected by Dockerfile `ENV` (for example
+`PENGWIN_DS538_TRAINER`, `PENGWIN_AFFINITY_DECODE`, and `PENGWIN_TARGET_ROUTER`).
+With `PENGWIN_TARGET_ROUTER=1`, the router joblib must be present in the model
+payload or inference fails fast.
 
 ---
 

@@ -30,6 +30,10 @@ femur ROI 는 bone-skeleton 분해(pelvic 전용)에 의존하지 않고 Ds539 a
     /opt/ml/model/nnunet/results/Dataset538_PelvicFemurBICMFragmentV5/
         PengwinTrainerSTUNetBaseABBCPhase1V302__nnUNetResEncUNetLPlans__3d_fullres/
         fold_0/checkpoint_best.pth
+        PengwinTrainerSTUNetBaseAffinityV308__nnUNetResEncUNetLPlans__3d_fullres/
+        fold_0/checkpoint_best.pth
+    /opt/ml/model/stage1_router/
+        stage1_target_router_fold0.joblib
 
 로컬 테스트: MODEL_ROOT 또는 PENGWIN_MODEL_ROOT 환경변수로 모델 루트를 덮어쓸 수
 있다 (예: /workspace/code_task1/result -> result/results/...). 컨테이너 기본값은
@@ -113,6 +117,19 @@ ANATOMY_RANGES = {
 ALL_ANATOMIES = ("Sacrum", "LeftHip", "RightHip", "Femur")
 # bone-skeleton 분해는 pelvic 전용(중앙/좌/우 CC 분류)이므로 femur 는 제외한다.
 PELVIC_ANATOMIES = ("Sacrum", "LeftHip", "RightHip")
+
+# --- v2.0 target-family router. ---
+# The code is committed, but the joblib artifact is packaged in model.tar.gz.
+# If enabled, missing/incompatible router artifacts fail fast to avoid silently
+# deploying the old Ds539 volume-ratio route.
+TARGET_ROUTER_ENABLED = os.environ.get("PENGWIN_TARGET_ROUTER", "0") == "1"
+TARGET_ROUTER_PATH = Path(
+    os.environ.get(
+        "PENGWIN_TARGET_ROUTER_PATH",
+        str(MODEL_ROOT / "stage1_router" / "stage1_target_router_fold0.joblib"),
+    )
+)
+_TARGET_ROUTER_PAYLOAD = None
 
 # --- anatomy routing: process every anatomy whose Ds539 argmax mask is a substantial
 #     fraction of the largest present mask (see route_from_ds539_masks). ---
@@ -837,6 +854,36 @@ def route_from_ds539_masks(ds539_masks: dict) -> tuple[str, tuple[str, ...]]:
     return "multi", kept
 
 
+def route_from_target_family_router(image_path: Path) -> tuple[str, tuple[str, ...]] | None:
+    if not TARGET_ROUTER_ENABLED:
+        return None
+
+    global _TARGET_ROUTER_PAYLOAD
+    if _TARGET_ROUTER_PAYLOAD is None:
+        from target_family_router import load_router
+
+        _TARGET_ROUTER_PAYLOAD = load_router(TARGET_ROUTER_PATH)
+        names = _TARGET_ROUTER_PAYLOAD.get("feature_names", [])
+        labels = _TARGET_ROUTER_PAYLOAD.get("labels", [])
+        log(f"target-router: loaded {TARGET_ROUTER_PATH} n_features={len(names)} labels={labels}")
+
+    from target_family_router import predict_family
+
+    family, p_femur = predict_family(image_path, _TARGET_ROUTER_PAYLOAD)
+    if family == "femur":
+        anatomies = ("Femur",)
+    elif family == "pelvic":
+        anatomies = PELVIC_ANATOMIES
+    else:
+        raise ValueError(f"target-router predicted unsupported family {family!r}")
+
+    if np.isfinite(p_femur):
+        log(f"target-router: family={family} p_femur={p_femur:.4f} -> anatomies={anatomies}")
+    else:
+        log(f"target-router: family={family} p_femur=nan -> anatomies={anatomies}")
+    return f"target-router:{family}", anatomies
+
+
 # ---------------------------------------------------------------------------
 # anatomy 별 Ds538 추론 파이프라인 (메인 로직).
 # ---------------------------------------------------------------------------
@@ -846,16 +893,17 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     """V0.4 STU-Net 2-stage 견고화 파이프라인 (4-layer 구조):
        Layer 1: bone-skeleton anatomy 분해 (HU>200, pelvic 전용) — fallback 확보
        Layer 2: Ds539 5-class argmax refinement       — Ds539 가 합리적이면 우선 사용
-       Layer 2b: Ds539 argmax 기반 pelvic vs femur 라우팅 (femur/pelvic 부피 비율)
+       Layer 2b: v2.0 target-family router, or Ds539 argmax volume route fallback
        Layer 3: bbox sanity + 시간 예산 점검          — 안전망 역할
        Layer 4: Ds538 per-anatomy ABBC 추론 + decode + paste
 
     Femur (151-200) 활성화: Ds539 의 channel 4 argmax mask 로 femur ROI 를 잡는다.
-    PENGWIN 케이스는 pelvic 이거나 femur (disjoint). 어느 쪽인지는 Ds539 argmax 부피
-    비율로 결정한다(spacing 룰은 femur 를 거의 전부 pelvic 으로 오라우팅하므로 사용 안 함).
+    PENGWIN 케이스는 pelvic 이거나 femur (disjoint). v2.0에서는 CT/FOV/bone-geometry
+    router가 target family를 정하고, router가 꺼져 있으면 Ds539 argmax 부피 비율로
+    결정한다(spacing 룰은 femur 를 거의 전부 pelvic 으로 오라우팅하므로 사용 안 함).
 
-    anatomies 가 None 이면 Ds539 argmax 로 자동 라우팅한다. 명시되면(테스트/디버그용)
-    그 subset 만 강제한다.
+    anatomies 가 None 이면 target-family router 또는 Ds539 argmax 로 자동 라우팅한다.
+    명시되면(테스트/디버그용) 그 subset 만 강제한다.
     """
     import time
     t_start = time.time()
@@ -949,11 +997,17 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         log(f"DIAG Ds539 health: failed ({_e})")
 
     # === Layer 2b: pelvic vs femur 라우팅 (Ds539 argmax 부피 비율) ===
+    used_target_router = False
     if forced_anatomies is not None:
         anatomies = tuple(forced_anatomies)
         log(f"L2b routing: forced anatomies={anatomies}")
     else:
-        _route, anatomies = route_from_ds539_masks(ds539_masks)
+        router_route = route_from_target_family_router(image_path)
+        if router_route is not None:
+            _route, anatomies = router_route
+            used_target_router = True
+        else:
+            _route, anatomies = route_from_ds539_masks(ds539_masks)
         log(f"L2b routing: auto route={_route} anatomies={anatomies}")
 
         # [v1.7 Stage-A recall fix] Reconcile the Ds539-size routing with the GEOMETRIC bone-skeleton
@@ -961,7 +1015,7 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         # present hip given Ds539=0 or swapped L<->R -> the 0.20x routing gate drops it -> whole-
         # anatomy ZERO = all its fragments become FN) is fixed in two conservative steps. Default ON;
         # PENGWIN_STAGEA_BONE_RECONCILE=0 to disable. Femur (no bone-skeleton) is untouched.
-        if os.environ.get("PENGWIN_STAGEA_BONE_RECONCILE", "1") == "1":
+        if (not used_target_router) and os.environ.get("PENGWIN_STAGEA_BONE_RECONCILE", "1") == "1":
             routed = list(anatomies)
             # A femur-DOMINANT scan has incidental in-frame pelvis that is NOT a GT target (e.g. dev
             # 294: Ds539 Femur 2.28M >> LeftHip 740k, GT = femur-only). Adding the bone-skeleton pelvis
@@ -1251,7 +1305,7 @@ def main() -> int:
             prerouted_bone_masks = None
 
         out_path = output_path(image_path)
-        # anatomies=None -> Ds539 argmax 부피 비율로 pelvic/femur 자동 라우팅.
+        # anatomies=None -> v2.0 target-family router when enabled, otherwise Ds539 volume route.
         label_arr = run_per_anatomy(
             image_path, ref_img, prerouted_bone_masks, anatomies=None,
         )

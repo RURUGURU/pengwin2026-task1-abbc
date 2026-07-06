@@ -1110,7 +1110,8 @@ python eval.py task1-abbc-eval --dataset-id 538 \
 ### 8.5 추론 / 배포
 
 - 추론 진입: `submission/github_repo/inference/inference.py` (GC 컨테이너 `PENGWIN_ROOT=/opt/ml/model`).
-- 모델 weight tarball = Models-tab 산출물(git 미커밋, 100MB 제한). deploy mirror `submission/github_repo/code_task1/*.py`는 `experiments/sync_deploy_mirror.sh`로 **생성** — 수동 편집 금지.
+- v2.0 router runtime: `submission/github_repo/inference/target_family_router.py`.
+- 모델 weight tarball = Models-tab 산출물(git 미커밋, 100MB 제한). v2.0은 이 tarball 안에 `stage1_router/stage1_target_router_fold0.joblib`도 포함해야 한다. deploy mirror `submission/github_repo/code_task1/*.py`는 `experiments/sync_deploy_mirror.sh`로 **생성** — 수동 편집 금지.
 
 ### 8.6 주요 env 변수
 
@@ -1118,14 +1119,16 @@ python eval.py task1-abbc-eval --dataset-id 538 \
 |---|---|---|
 | `PENGWIN_DS539_TRAINER` | `...AnatomyV301` | Stage-A trainer |
 | `PENGWIN_DS539_FOLD` | `0` | Stage-A fold (`0` / `all`) |
-| `PENGWIN_DS538_TRAINER` | `...ABBCPhase1V302` | Stage-B trainer |
-| `PENGWIN_DS538_FOLD` | `0` | Stage-B fold |
-| `PENGWIN_DS538_OUT_CH` | `4` | 4=ABBC / 13=ABBC+affinity |
+| `PENGWIN_DS538_TRAINER` | Dockerfile: `...AffinityV308` | Stage-B trainer |
+| `PENGWIN_DS538_FOLD` | Dockerfile: `0` | Stage-B fold |
+| `PENGWIN_DS538_OUT_CH` | Dockerfile: `13` | 4=ABBC / 13=ABBC+affinity |
+| `PENGWIN_TARGET_ROUTER` | Dockerfile: `1` | v2.0 target-family router 사용 |
+| `PENGWIN_TARGET_ROUTER_PATH` | `/opt/ml/model/stage1_router/stage1_target_router_fold0.joblib` | router artifact 경로 |
 | `PENGWIN_ROUTE_KEEP_FRAC` | `0.20` | anatomy 유지 게이트(× 최대) |
 | `PENGWIN_ROUTE_CC_MODE` | `largest` | `largest` / `union` / `floor` |
-| `PENGWIN_STAGEA_BONE_RECONCILE` | `1` | bone reconcile (recall + L/R deswap) |
+| `PENGWIN_STAGEA_BONE_RECONCILE` | Dockerfile: `0` | router off fallback에서만 의미 있음 |
 | `PENGWIN_CONFINE_TO_MASK` | `1` | 타 해부학 영역 침범 금지 |
-| `PENGWIN_AFFINITY_DECODE` | `0` | affinity avg-linkage decode (13ch 필요) |
+| `PENGWIN_AFFINITY_DECODE` | Dockerfile: `1` | affinity avg-linkage decode (13ch 필요) |
 | `PENGWIN_FUSION_DECODE` | `0` | fusion decode (13ch 필요) |
 | `PENGWIN_AGGLO_T` | `0.45` | agglomeration merge threshold |
 | `PENGWIN_FUSION_RIDGE_VOX` | `3000` | sub-split 트리거 최소 ridge voxel |
