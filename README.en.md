@@ -16,11 +16,28 @@ cascade** on a **STU-Net-B** backbone, I/O-compatible with the official
 
 ---
 
+## Current version — v2.0 target-family router
+
+| | |
+|---|---|
+| **Version** | **v2.0** — v1.5 cascade plus a lightweight target-family router |
+| **Stage A/B weights** | unchanged: Stage A `V301` fold0 anatomy STU-Net + Stage B `V308` fold0 ABBC-affinity STU-Net |
+| **New router** | CT-geometry random-forest router predicts `pelvic` vs `femur` after Stage A, then only forwards the target family to Stage B |
+| **Router artifact** | `stage1_router/stage1_target_router_fold0.joblib` (local artifact, ignored by git; package/upload with model payload when deploying) |
+| **Why** | prevents wrong-family Stage2 calls, e.g. femur fragments in pelvic-only cases or hip/pelvis fragments in femur-only cases |
+
+The router is not a replacement for STU-Net. It is a deterministic post-Stage-A
+gate trained on CT/FOV/bone-geometry features. STU-Net remains the anatomy and
+fragment segmentation model.
+
+---
+
 ## TL;DR — what makes this work
 
 | Lever | What it does | Why it matters |
 |---|---|---|
 | **2-stage cascade** | Stage A finds the *anatomy* (sacrum / L-hip / R-hip / femur); Stage B splits each bone into *fracture fragments* | decouples "which bone" from "how it broke" |
+| **v2.0 target-family router** | classifies the scan as `pelvic` or `femur` and suppresses non-target anatomies before Stage B | removes wrong-family false positive fragments without changing the STU-Net weights |
 | **STU-Net-B + TotalSegmentator warm-start** | a large-scale skeletal pretrain transferred to both stages | strong features from limited (340-case) data |
 | **ABBC fracture target** | a 4-class `background / border / boundary / core` field (PENGWIN-2024 winner formulation) | turns instance separation into a learnable dense target |
 | **Learned affinity head** | 9 multi-scale same-instance edges (short = attractive, long = **repulsive**) decoded by **average-linkage agglomeration** (GASP) | breaks the *touching-fragment merge* ceiling without mutex over-splitting |
@@ -126,6 +143,12 @@ flowchart LR
 - **L4 — 480 s time budget**: a per-anatomy ETA guard guarantees the 10-minute
   Grand-Challenge per-case limit (it emits zero for an anatomy only if the crop
   would blow the budget).
+- **v2.0 target-family router**: after Stage A, a small random-forest router
+  predicts the case family (`pelvic` or `femur`) from CT shape/FOV/HU and sampled
+  bone-geometry features. The router then forces Stage B to run only
+  `Sacrum+LeftHip+RightHip` for pelvic cases or `Femur` for femur cases. This
+  blocks wrong-family fragments while preserving the original Stage A and Stage B
+  STU-Net weights.
 
 ---
 
@@ -253,6 +276,23 @@ Held-out grouped fold-0 (per-anatomy ROIs), official-aligned proxy:
 > aligned **proxy** and a panoptica-based GC-aligned scorer. Measured end-to-end
 > runtime ≈ 60–205 s/case, within the T4 / 10-min budget.
 
+### v2.0 router ablation on local fold0 validation
+
+Same 68-case fold0 validation split used to evaluate the target-family router
+(34 pelvic, 34 femur; router trained on the remaining 272 cases). The baseline is
+the original v1.5 automatic Stage1 routing; the v2.0 row is the same Stage A/B
+weights with target-family routing before Stage B.
+
+| Scope | N | FG Dice v1.5 | FG Dice v2.0 | Delta | IoU-F v1.5 | IoU-F v2.0 | Delta | Prec@0.5 v1.5 | Prec@0.5 v2.0 | Delta | F1@0.5 v1.5 | F1@0.5 v2.0 | Delta |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Overall | 68 | 0.7757 | 0.9761 | +0.2005 | 0.6827 | 0.6825 | -0.0002 | 0.5027 | 0.8485 | +0.3458 | 0.5568 | 0.7699 | +0.2131 |
+| Pelvic | 34 | 0.8904 | 0.9790 | +0.0886 | 0.6274 | 0.6284 | +0.0010 | 0.6786 | 0.7918 | +0.1132 | 0.6632 | 0.7132 | +0.0500 |
+| Femur | 34 | 0.6609 | 0.9733 | +0.3124 | 0.7380 | 0.7366 | -0.0014 | 0.3268 | 0.9051 | +0.5783 | 0.4504 | 0.8266 | +0.3762 |
+
+Interpretation: v2.0 mostly removes wrong-family false positives. Fragment
+localization (`IoU-F`, `Recall@0.5`) is nearly unchanged, while foreground Dice,
+precision, and F1 improve because predicted fragments drop from 654 to 424.
+
 ---
 
 ## Repository layout
@@ -275,9 +315,10 @@ github_repo/
 └── README.md
 ```
 
-> Model weights (`model.tar.gz`) are **not** committed (GitHub 100 MB limit). Upload
-> it to the Grand-Challenge algorithm's **Models** tab; GC's *Link to GitHub* flow
-> builds the container from a tagged release.
+> Model weights (`model.tar.gz`) and router artifacts (`*.joblib`, e.g.
+> `stage1_router/stage1_target_router_fold0.joblib`) are **not** committed.
+> Upload/package them with the Grand-Challenge model payload; GC's *Link to
+> GitHub* flow builds the container from a tagged release.
 
 ---
 
@@ -285,8 +326,8 @@ github_repo/
 
 ```bash
 git push origin main
-git tag v1.x && git push origin v1.x
-# Grand Challenge → Container Images → Link to GitHub → select tag v1.x → wait for "Active"
+git tag v2.0 && git push origin v2.0
+# Grand Challenge → Container Images → Link to GitHub → select tag v2.0 → wait for "Active"
 # Upload model.tar.gz to the algorithm's "Models" tab
 # Submit: paste docs/Comment.txt, upload docs/description.pdf, select Algorithm, Submit
 ```
@@ -306,7 +347,7 @@ trainer and decoder are selected by Dockerfile `ENV` (e.g. `PENGWIN_DS538_TRAINE
 | Stage-B input | per-bone masked CT | **CT-only, leak-free** (anatomy prob used only for routing) |
 | Decoder | CC + KD-tree NN | **core-seed watershed** + **average-linkage agglomeration** + sacrum merge |
 | Laterality | default (mirror all axes) | **L↔R mirror disabled** for anatomy (87.6 % of hip errors) |
-| Routing | volume ratio | bone-skeleton ∪ Ds539 argmax + sanity fallback + **time budget** |
+| Routing | volume ratio | bone-skeleton ∪ Ds539 argmax + sanity fallback + **v2.0 target-family router** + **time budget** |
 | ID offset | user post-step | embedded in `inference.py` |
 
 The label range, file naming, `dataset.json` schema, and output contract are

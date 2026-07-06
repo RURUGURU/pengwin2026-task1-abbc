@@ -14,16 +14,17 @@
 
 ---
 
-## 🚀 현재 배포 상태 (2026-06-29, v1.9)
+## 🚀 현재 개발 상태 (2026-07-06, v2.0)
 
 | | |
 |---|---|
-| **배포 버전** | **v1.9** — git tag `v1.9` push → GC 자동 빌드 |
-| **파이프라인** | Stage-A `V301`(해부 라우팅, fold_0) → Stage-B `V308`(골절 affinity, **fold_all = 전체 340**) → affinity average-linkage agglomeration decode (`AGGLO_T=0.45`) |
-| **모델 번들** | `model_v1_9.tar.gz` (V301 fold_0 + V308 fold_all + V302 fold_0 rollback) |
-| **v1.5 → v1.9 변경** | Stage-B 골절 모델을 **fold_0(272) → fold_all(340)** 전체데이터로 (레시피 동일: 200ep, TotalSeg `base_ep4k` transfer). Stage-A 라우팅·decode 임계값 **불변** |
+| **버전** | **v2.0** — v1.5 cascade에 target-family router를 추가한 버전 |
+| **파이프라인** | Stage-A `V301`(해부 STU-Net, fold_0) → **target-family router**(`pelvic`/`femur`) → Stage-B `V308`(골절 affinity, fold_0) → affinity average-linkage agglomeration decode (`AGGLO_T=0.45`) |
+| **모델 번들** | Stage-A/Stage-B weight는 v1.5와 동일. 추가 artifact: `stage1_router/stage1_target_router_fold0.joblib` |
+| **v1.5 → v2.0 변경** | STU-Net weight는 그대로 두고, Stage-A 뒤에 CT/FOV/bone-geometry 기반 random-forest router를 붙여 target family가 아닌 anatomy를 Stage-B에 넘기지 않음 |
 | **실제 GC 점수 (v1.5 = V308 fold_0)** | instance **F1 ~0.572** / Recall 0.574 / Dice 0.919 / HD95 5.31 — **Mean Position 최고** |
-| **dev-68 참고치** | honest ins_f1 **0.735** (fold_0 held-out) / leaky 0.763 (fold_all). dev→GC 분포차 −0.16 = dev가 더 쉬움 → **GC가 진짜 심판** |
+| **local fold0 validation 참고치** | 68 cases(34 pelvic/34 femur)에서 기존 v1.5 대비 FG Dice **0.7757→0.9761**, F1@0.5 **0.5568→0.7699**. IoU-F는 거의 동일(0.6827→0.6825)하므로 개선은 주로 wrong-family FP 제거에서 발생 |
+| **router artifact 정책** | `*.joblib` 및 `stage1_router/`는 gitignore. Grand Challenge 배포 시 model payload와 함께 별도 패키징/업로드 |
 
 > **폐기된 실험** (아래 "실험 연대기"는 history로만 보존): `V312` Stage-B cascade warm-start = V308과 **무승부(tied)** → 미채택 · `V311` Stage-A fold_all = dev wash · `V313` Large = rejected · `V304` X-CAC loss = within-noise · fusion/reconcile = GC 퇴보(v1.8 rollback). **수렴한 최선 = V308 affinity + average-linkage**. 상세: [`docs/legacy-removed-trainers.md`](docs/legacy-removed-trainers.md).
 
@@ -143,7 +144,8 @@ Stage A — 해부학   Dataset539_PelvicFemurAnatomyV3
                    STU-Net-B · PengwinTrainerSTUNetBaseAnatomyV301
         │ anatomy probability
         ▼
-라우팅            anatomy argmax 마스크 → per-anatomy ROI bbox(+24vox pad)
+라우팅            target-family router + anatomy argmax 마스크
+                  → target family만 per-anatomy ROI bbox(+24vox pad)
         │
         ▼
 Stage B — 골절    Dataset538_PelvicFemurBICMFragmentV5
@@ -267,6 +269,7 @@ flowchart TD
 - **Layer 1 — bone-skeleton fallback (항상 먼저, HU 기반)**: `HU > 200` 임계 → binary opening → 연결 성분 → 크기 top-3을 x좌표 기준으로 Sacrum(가장 중앙)/LeftHip(+x = LPS 환자 왼쪽)/RightHip(−x)에 할당. fallback 전용(골반만; 대퇴는 fallback 없음).
 - **Layer 2 — Ds539 추론**: 5채널 softmax → 원본 그리드로 resample(order=1) → argmax → per-anatomy 마스크 + morphological cleanup(opening 1iter, `< MIN_DS539_CC_VOXELS=500` CC drop).
 - **Layer 2b — 라우팅(`route_from_ds539_masks`)**: 각 해부학 마스크 크기 ≥ `PENGWIN_ROUTE_KEEP_FRAC(0.20)` × 최대 마스크면 유지. return `(route_type, anatomies)`.
+- **v2.0 target-family router**: Stage-A 뒤에서 CT shape/FOV/HU percentile/표본 bone geometry feature로 케이스 family를 `pelvic` 또는 `femur`로 분류한다. `pelvic`이면 `Sacrum+LeftHip+RightHip`만, `femur`이면 `Femur`만 Stage-B에 넘긴다. 즉 STU-Net을 재학습한 것이 아니라 Stage-B 실행 대상을 제한하는 후단 router다.
 - **Layer 2b — bone-skeleton reconcile** (env `PENGWIN_STAGEA_BONE_RECONCILE`, default 1): (A) pelvic-dominant 케이스에서 bone-skeleton이 찾았으나 게이트가 떨군 골반 해부학 재추가(recall 회복); (B) routed hip 마스크가 반대편 hip bone-skeleton과 >50% 겹치면 L↔R 스왑으로 보고 제거. **pelvic-dominant 게이트 필수** — 없으면 femur-only 스캔에 가짜 골반 FP 발생.
 - **마스크 선택(`merge_masks_with_sanity`)**: Ds539 마스크가 전체 볼륨의 `SANITY_MAX_BBOX_FRACTION(35%)` 미만이면 Ds539 사용(선호), 아니면 bone-skeleton fallback. 둘 다 실패하면 0 출력.
 - **per-anatomy CC 정책** (env `PENGWIN_ROUTE_CC_MODE`, default `largest`): `largest`(최대 CC만) / `floor`(≥`PENGWIN_ROUTE_CC_MIN_VOX=1820`) / `union`(전부). **largest가 정답으로 ablation 확정** — floor/union은 recall 향상 +0.000, precision만 손해.
@@ -1015,7 +1018,19 @@ python code_task1/train.py stunet-finetune 539 3d_fullres all \
 
 > dev recall 0.707 vs GC recall 0.527의 갭 = (a) 모델 버전(V302 > v1.3.3) + (b) GC hidden test가 fold-0 dev보다 훨씬 심하게 골절됨. dev에는 전체-해부학 absence가 0건.
 
-### 7.4 v1.9 진행 (현재 활성 작업)
+### 7.4 v2.0 target-family router ablation (local fold0 validation)
+
+동일한 68-case validation split(34 pelvic, 34 femur)에서 기존 v1.5 자동 Stage1 routing과 v2.0 router+Stage2를 비교했다. `Delta = v2.0 - v1.5`.
+
+| Scope | N | FG Dice v1.5 | FG Dice v2.0 | Delta | IoU-F v1.5 | IoU-F v2.0 | Delta | Prec@0.5 v1.5 | Prec@0.5 v2.0 | Delta | F1@0.5 v1.5 | F1@0.5 v2.0 | Delta |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Overall | 68 | 0.7757 | 0.9761 | +0.2005 | 0.6827 | 0.6825 | -0.0002 | 0.5027 | 0.8485 | +0.3458 | 0.5568 | 0.7699 | +0.2131 |
+| Pelvic | 34 | 0.8904 | 0.9790 | +0.0886 | 0.6274 | 0.6284 | +0.0010 | 0.6786 | 0.7918 | +0.1132 | 0.6632 | 0.7132 | +0.0500 |
+| Femur | 34 | 0.6609 | 0.9733 | +0.3124 | 0.7380 | 0.7366 | -0.0014 | 0.3268 | 0.9051 | +0.5783 | 0.4504 | 0.8266 | +0.3762 |
+
+해석: v2.0은 fragment localization 자체를 바꾼 것이 아니라, wrong-family Stage2 호출을 막아 false positive fragment를 줄인다. 그래서 IoU-F/recall은 거의 동일하지만 foreground Dice, precision, F1이 크게 오른다. 예측 fragment 수는 654 → 424로 감소했다.
+
+### 7.5 v1.9 진행 (history)
 
 - **Stage-A V311 fold_all** 완료(EMA 0.9711).
 - **Stage-B V312 fold_all (cascade)** 수렴 중(~708s/ep, ~29h 또는 plateau 시점 best checkpoint).
@@ -1023,7 +1038,7 @@ python code_task1/train.py stunet-finetune 539 3d_fullres all \
 - **v1.9 배포**: V311 + V312 fold_all + tuned `AGGLO_T` → GC 제출 vs v1.5 (조기제출 없음, 최대 품질 우선).
 - **v1.9 deploy 체크리스트**: (a) `experiments/sync_deploy_mirror.sh`로 V311/V312 mirror 동기화; (b) Dockerfile env `DS539_TRAINER=V311`/`DS539_FOLD=all`/`DS538_TRAINER=V312`/`DS538_FOLD=all`/`AGGLO_T=<tuned>`/`AFFINITY_DECODE=1`/`DS538_OUT_CH=13`; (c) GC 제출로 전 메트릭 vs v1.5 측정.
 
-### 7.5 성공 기준
+### 7.6 성공 기준
 
 per-method: **dev `instance_iouf`(특히 instance recall) + `oracle_topology`가 v1.3.3 baseline 초과 + split_err 폭증 없음.** GC 분해에서의 구체 목표: **recall 0.53 → 0.7+ while Split 0.000(1위) 유지.**
 
@@ -1077,7 +1092,7 @@ python train.py stunet-finetune 539 3d_fullres 0 \
 python train.py stunet-finetune 538 3d_fullres 0 \
     -tr PengwinTrainerSTUNetBaseAffinityV308 -p nnUNetResEncUNetLPlans --npz
 
-# fold_all 재학습 + cascade: 6.4의 정규 launch 사용 (V311 → V312)
+# v2.0 router는 STU-Net 재학습이 아니라 별도 artifact(stage1_target_router_fold0.joblib)를 사용
 ```
 
 `--npz` 필수(Stage-A softmax 저장, anatomy-prob 채널 캐시용).

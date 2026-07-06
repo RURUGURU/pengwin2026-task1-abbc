@@ -31,11 +31,14 @@ Thumbs.db
 *.pth
 *.pt
 *.ckpt
+*.joblib
+*.pkl
 *.tar.gz
 *.tar
 
 # --- Model payload (uploaded separately to Grand Challenge Models tab) -----
 /model_payload/
+/stage1_router/
 
 # --- Medical imaging data / arrays (NEVER commit) --------------------------
 *.mha
@@ -49,6 +52,9 @@ Thumbs.db
 /predictions/
 /code_task1/result/
 /code_task1/predictions/
+/stage1_router_stage2_outputs/
+/stage1_router_stage2_val_fold0/
+/v15_val_fold0/
 
 # --- Logs / scratch --------------------------------------------------------
 *.log
