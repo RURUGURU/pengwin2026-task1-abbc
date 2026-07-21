@@ -14,7 +14,27 @@
 
 ---
 
-## 🚀 현재 개발 상태 (2026-07-06, v2.0)
+## 🚀 현재 배포 상태 (2026-07-21, **v2.2 = GC rank 10**)
+
+| | |
+|---|---|
+| **배포 버전** | **v2.2** — 예선 종료 시점 GC 리더보드 **10위**. 태그 `v2.2` (커밋 `4542487`) |
+| **파이프라인** | Stage-A `V301`(해부, fold_0) → **37-feature RF family 라우터** → Stage-B `V308`(골절 affinity, **fold_0**) → average-linkage agglomeration decode (`AGGLO_T=0.45`) |
+| **모델 번들** | `model_v2_2.tar.gz` — sha256 `ea55f284…` 핀 고정. **rank-10 floor, 절대 삭제 금지** |
+| **순위를 만든 것** | **타깃 family 라우터** — GC instance F1 **0.57 → 0.94** (≈33위 → 12위). 이후 Stage-A 체크포인트 교체로 10위 |
+| **v2.2 예선 지표** | ins_f1 0.9364 / recall 0.9433 / precision 0.9397 / dice 0.9219 / hd95 5.299 / assd 1.708 / topology 0.9333 / merge 0.2 / split 0.1333 |
+| **남은 병목** | **merge(과소분할)**. 근본원인 = 입력 대비 — 골절 계면의 87%가 CT에서 융합돼 있고 bone-LUT 상 대비가 ~5%뿐 |
+| **순위 규칙** | GC는 **10개 지표의 평균 순위(Mean Position)** 로 정렬한다. 화면의 `Score (Dice)`는 정렬 키가 **아니다** |
+
+> ⚠️ **재빌드 시 주의.** 새 태그를 push해도 GC의 Active 이미지는 자동으로 바뀌지 않는다(수동 선택).
+> 재빌드본은 반드시 스모크 검증 — `len(np.unique(output)) > 1` assert — 을 통과한 뒤에만 Active로 올릴 것.
+> **"job succeeded"는 성공의 증거가 아니다**: 가중치 로드가 실패해도 포괄 예외 처리가 all-zero를 쓰고
+> `return 0` 하므로 GC는 GREEN으로 기록하면서 전 케이스 0점이 된다. 로그에서 `w0sum ≈ 104`
+> (95 미만이면 랜덤 네트워크)와 `target-router: loaded ... n_features=37` 을 함께 확인하라.
+
+---
+
+### 이전 상태 (이력): v2.0 (2026-07-06)
 
 | | |
 |---|---|
