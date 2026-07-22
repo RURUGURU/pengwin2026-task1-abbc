@@ -27,7 +27,7 @@
 > GC F1 0.572 를 냈던 Ds539 부피 신호에 넘기게 된다. 그래서 **RF 가 스스로 불확실할 때만**
 > (margin < 0.85) rule·해부증거와 3자 투표한다. `PENGWIN_ROUTER_ABSTAIN_MARGIN=0` 으로 완전 비활성.
 
-**모델 번들 = `model_v2_2_1.tar.gz`** (`sha256 560dff90…`). 가중치는 v2.2(rank 10)와 **md5 동일**,
+**모델 번들 = `model_v3_0.tar.gz`** (`sha256 560dff90…`). 가중치는 v2.2(rank 10)와 **md5 동일**,
 Stage-1 라우터 pickle 만 sklearn **1.6.1 네이티브**로 재직렬화(1.7.2 판은 컨테이너 sklearn 1.6.1 에서
 로드 시 경고 302건 → 0건). 300개 트리·`predict_proba` 소수점 6자리까지 동일 검증. GC val 재현 PASS
 (인스턴스 6지표 v2.2 와 비트 동일).
