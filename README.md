@@ -27,6 +27,28 @@
 > GC F1 0.572 를 냈던 Ds539 부피 신호에 넘기게 된다. 그래서 **RF 가 스스로 불확실할 때만**
 > (margin < 0.85) rule·해부증거와 3자 투표한다. `PENGWIN_ROUTER_ABSTAIN_MARGIN=0` 으로 완전 비활성.
 
+**모델 번들 = `model_v2_2_1.tar.gz`** (`sha256 560dff90…`). 가중치는 v2.2(rank 10)와 **md5 동일**,
+Stage-1 라우터 pickle 만 sklearn **1.6.1 네이티브**로 재직렬화(1.7.2 판은 컨테이너 sklearn 1.6.1 에서
+로드 시 경고 302건 → 0건). 300개 트리·`predict_proba` 소수점 6자리까지 동일 검증. GC val 재현 PASS
+(인스턴스 6지표 v2.2 와 비트 동일).
+
+### ⚰️ v2.3 (Stage-2 fold_all) — GC val 에서 REFUTED, **rank 10 → 44**
+`model_v2_3.tar.gz` = v2.2 에서 Stage-2 V308 fold_0(272케이스) → fold_all(340) 만 교체. **올리지 말 것.**
+
+| 지표 | v2.2 | v2.3 | Δ |
+|---|--:|--:|--:|
+| ins_f1 | 0.9364 | 0.8862 | −0.0502 |
+| ins_recall | 0.9433 | 0.8967 | −0.0467 |
+| merge_error_count | 0.2000 | 0.2000 | 0.0000 |
+| topology_consistency | 0.9333 | 0.8667 | **−0.0667** |
+| fracture_hd95 | 5.2987 | 7.0969 | **+1.80 mm** |
+
+**10개 지표 중 개선 0개.** Stage-1 fold_all 은 v2.2 의 rank 13→10 을 만들었지만 **Stage-2 fold_all 은
+정반대로 해롭다** — fold_all 은 held-out 이 없어 checkpoint 를 자기 학습 데이터로 고르고, 인스턴스
+분할이 그 오염에 훨씬 민감하다. 또한 이 실측으로 **`topology_consistency`(병합된 PART 수)와
+`merge_error_count`(병합 EVENT 수)가 독립**임이 확인됐다(case 001: topology 0.667→0.333 인데 merge 불변).
+상세: `docs/task1/v2_3_verdict.md`(로컬 저장소).
+
 ## 🚀 이전 배포 상태 (v2.2 = GC rank 10)
 
 | | |
