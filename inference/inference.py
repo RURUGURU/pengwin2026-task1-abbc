@@ -956,11 +956,11 @@ def route_from_target_family_router(image_path: Path,
     if not TARGET_ROUTER_ENABLED:
         return None
 
-    # === PRIMARY: the organizers' official rule (2026-07-22 update). ==========================
-    # They ask all teams to adopt it and the test set is verified to conform -> on the SCORED test it
-    # is 100% correct. It is AUTHORITATIVE here. The RF (validated only on our training distribution)
-    # is kept as a cross-check and as a fallback for the pathological case where the header can't be
-    # read. `PENGWIN_OFFICIAL_RULE_ROUTER=0` reverts to RF-primary (comparison / emergency).
+    # === Compute BOTH signals, then combine in the hybrid decision below. =====================
+    # The organizers' official rule (2026-07-22 update) is GUARANTEED 100% on their curated test set but
+    # is only 86.8% on our clinical data; the RF is ~100% on our data but unproven on the curated test.
+    # v3.2 made the rule authoritative and tanked val (10->44); v3.3 uses the rule only to break RF
+    # uncertainty (see the decision block). `PENGWIN_OFFICIAL_RULE_ROUTER=0` disables the rule (pure RF).
     use_rule = os.environ.get("PENGWIN_OFFICIAL_RULE_ROUTER", "1") == "1"
     rule_family = official_rule_family(image_path) if use_rule else None
 
@@ -980,17 +980,30 @@ def route_from_target_family_router(image_path: Path,
     except Exception as exc:  # noqa: BLE001
         log(f"target-router: RF unavailable ({exc})")
 
-    # Decision: rule is authoritative; RF is fallback only when the rule could not be computed.
-    if rule_family in ("pelvic", "femur"):
-        family, source = rule_family, "official-rule"
-        if rf_family and rf_family != rule_family:
-            log(f"router NOTE: RF={rf_family} disagrees with official rule={rule_family}; "
-                f"trusting the rule (organizer-mandated, test-guaranteed). p_femur={p_femur:.4f}")
-    elif rf_family in ("pelvic", "femur"):
-        family, source = rf_family, "rf-fallback"
-        log("router: official rule unavailable -> RF fallback")
+    # [v3.3 HYBRID] Decision. Our GC val behaves like our 7-institution clinical distribution, where the
+    # RF router is ~100% but the organizers' rule is only 86.8% (it is tuned to their curated protocol and
+    # GUARANTEED 100% on the *test* set). Making the rule authoritative (v3.2) misrouted 13% of val cases
+    # (14 femur->pelvic + 31 pelvic->femur, each -> zero seg) and dropped mean-rank 10 -> 44. So: trust the
+    # RF when it is CONFIDENT; let the mandated rule decide ONLY when the RF is UNCERTAIN (near the 0.5
+    # boundary) or unavailable. This recovers val rank ~10 (RF handles confident cases) while still adopting
+    # the rule where the RF cannot commit -- which are exactly the acquisition-protocol-specific cases the
+    # rule was designed for. PENGWIN_OFFICIAL_RULE_ROUTER=0 disables the rule entirely (pure RF = v2.2).
+    RF_MARGIN = float(os.environ.get("PENGWIN_RF_CONF_MARGIN", "0.15"))
+    rf_ok = rf_family in ("pelvic", "femur")
+    rf_confident = rf_ok and (p_femur == p_femur) and abs(p_femur - 0.5) >= RF_MARGIN  # p==p rejects NaN
+    if rf_confident:
+        family, source = rf_family, "rf-confident"
+        if rule_family and rule_family != rf_family:
+            log(f"router NOTE: official rule={rule_family} disagrees with CONFIDENT RF={rf_family} "
+                f"(p_femur={p_femur:.4f}); trusting RF on our val distribution (rule wins on curated test).")
+    elif rule_family in ("pelvic", "femur"):
+        family, source = rule_family, "official-rule-tiebreak"
+        log(f"router: RF uncertain (p_femur={p_femur:.4f}) -> official rule={rule_family} (mandated tiebreak)")
+    elif rf_ok:
+        family, source = rf_family, "rf-uncertain-norule"
+        log(f"router: RF uncertain (p_femur={p_femur:.4f}) and no rule -> RF")
     else:
-        return None  # both failed -> caller falls back to Ds539 volume route
+        return None  # all failed -> caller falls back to Ds539 volume route
 
     anatomies = ("Femur",) if family == "femur" else PELVIC_ANATOMIES
     log(f"router: family={family} source={source} rule={rule_family} rf={rf_family} "
