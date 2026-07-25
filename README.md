@@ -14,7 +14,23 @@
 
 ---
 
-## 🚀 현재 배포 상태 (2026-07-22, **v3.0** 통합 릴리스 — 런타임 = v2.4, 기준 v2.2 = GC rank 10)
+## 🚀 현재 배포 상태 (2026-07-25, **model_v3_0** — 라우터 v3.3 HYBRID · TEST phase F1 0.898 ≈ rank 13)
+
+> **DEPLOYED Active = `model_v3_0`** = Stage-A `V301`(Ds539, 5-class) → **v3.3 하이브리드 family 라우터**
+> → per-anatomy ROI → Stage-B `V308`(Ds538, 13ch = 4 ABBC + 9 affinity) → `decode_affinity_agglo`
+> (`AGGLO_T=0.45`). 배포 env: `DS538_FOLD=0`, `OUT_CH=13`, `AFFINITY_DECODE=1`, `TARGET_ROUTER=1`,
+> `CHECKPOINT=checkpoint_best.pth`.
+>
+> **v3.3 HYBRID 라우터.** RF(RandomForest joblib)가 **확신할 때(|p_femur−0.5| ≥ 0.15) PRIMARY**,
+> 조직위 공식 pelvic/femur rule 은 RF 가 불확실할 때만 **TIEBREAK**. 이력: v2.2 = 예선 rank 10;
+> **v3.2**(공식 rule 을 AUTHORITATIVE 로 승격)는 우리 분포에서 13% 오라우팅으로 val rank 44 로 REGRESS;
+> **v3.3 하이브리드**가 이를 FIX(val rank 30). TEST phase 실측: **F1 0.898, ≈ rank 13**.
+>
+> **REFUTED/dead 레버(배포 금지)**: V371/V370(from-scratch full-budget, val rank 45 — 예산은 병목이 아님),
+> V360(synth-on-affinity), V340(amplified LUT), V352/V353(synth-aug), MAT/medial_skeleton(precision 퇴보),
+> X-CAC/V304, embedding/V320, V303 mutex, v2.3 Stage-2 fold_all(rank 44).
+
+### 🗄️ 이전 상태 (이력): v3.0 통합 릴리스 (2026-07-22, 런타임 = v2.4, 기준 v2.2 = GC rank 10)
 
 > **v2.4 = v2.2 + 라우터 OOD abstention 게이트.** 기본 설정에서 **알려진 모든 데이터에 대해 동작이
 > 동일함이 증명됨**: 340 학습케이스 전수 측정에서 RF 결정 margin 최소값이 **0.9052**(0.90 미만 0건)이고

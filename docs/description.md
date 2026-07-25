@@ -1,16 +1,28 @@
-% PENGWIN 2026 Task 1 — V2.0 Target-Family-Routed STU-Net Submission
+% PENGWIN 2026 Task 1 — model_v3_0 Hybrid-Routed STU-Net Submission
 % Algorithm Description
-% 2026-07-06
+% 2026-07-25
 
-> **V2.0** keeps the validated V1.5 STU-Net weights unchanged and adds a lightweight
-> target-family router between Stage A and Stage B. The router is a random forest packaged
-> with the model payload as `stage1_router/stage1_target_router_fold0.joblib`. It predicts
-> whether the CT is a pelvic case or a femur case from CT field-of-view, HU percentiles, and
-> sampled bone-geometry features. Pelvic cases forward only Sacrum+LeftHip+RightHip to the
-> fracture model; femur cases forward only Femur. This removes wrong-family false positive
-> fragments without changing the segmentation networks.
+> **NOTE:** `docs/description.pdf` is a binary render of this file and is now STALE — it must
+> be regenerated from this Markdown before the next submission upload.
+
+> **model_v3_0 (v3.3 hybrid router)** keeps the validated STU-Net weights unchanged and routes
+> the case family with a **hybrid family router** between Stage A and Stage B. A random forest
+> packaged with the model payload as `stage1_router/stage1_target_router_fold0.joblib` predicts
+> pelvic vs femur from CT field-of-view, HU percentiles, and sampled bone-geometry features;
+> the RF is **primary when confident** (`|p_femur−0.5| ≥ 0.15`) and the organizers' official
+> pelvic/femur rule is a **tiebreak only** on RF-uncertainty. Pelvic cases forward only
+> Sacrum+LeftHip+RightHip to the fracture model; femur cases forward only Femur. This removes
+> wrong-family false positive fragments without changing the segmentation networks.
 >
-> On the local fold0 validation split (68 cases: 34 pelvic, 34 femur), V2.0 improved
+> Deployment: Stage-A `V301` (Ds539, 5-class) → v3.3 hybrid router → Stage-B `V308`
+> (Ds538, 13ch = 4 ABBC + 9 affinity) → `decode_affinity_agglo` (`AGGLO_T=0.45`). History:
+> v2.2 = prelim rank 10; v3.2 (official-rule made authoritative) regressed to val rank 44 via
+> a 13% misroute; v3.3 hybrid fixed it (val rank 30). TEST phase: F1 0.898, ≈ rank 13.
+>
+> ---
+>
+> **V2.0 (history, 2026-07-06)** added the original target-family router (RF only, no rule
+> tiebreak). On the local fold0 validation split (68 cases: 34 pelvic, 34 femur), it improved
 > foreground Dice **0.7757 -> 0.9761**, Prec@0.5 **0.5027 -> 0.8485**, and F1@0.5
 > **0.5568 -> 0.7699**, while IoU-F was essentially unchanged (**0.6827 -> 0.6825**).
 > This matches the intended behavior: the router suppresses non-target anatomy calls, while
