@@ -1444,7 +1444,9 @@ def _predict_custom_logits_from_preprocessed_data(predictor: Any,
     # dead V-version channel counts; the active call (run_task1_abbc_eval, output_channels=
     # TASK1_V288_OUTPUT_CHANNELS=4) passed ONLY because BICM_V6_OUTPUT_CHANNELS also == 4.
     # Pin it explicitly to the active ABBC contract so removing the dead constants cannot break it.
-    # 4 = ABBC export (the only active head; the retired 9-channel affinity arm was removed 2026-06-10).
+    # 4 = ABBC export. The active V308 network appends affinity channels after
+    # these four logits; Task1's watershed decoder intentionally consumes only
+    # the leading ABBC channels, matching V308._val_abbc_logits.
     allowed = {int(TASK1_V288_OUTPUT_CHANNELS)}
     if int(output_channels) not in allowed:
         raise ValueError(f"unsupported custom output_channels={output_channels}; allowed={sorted(allowed)}")
@@ -1471,11 +1473,14 @@ def _predict_custom_logits_from_preprocessed_data(predictor: Any,
             for sl in tqdm(slicers, disable=not predictor.allow_tqdm):
                 workon = data_work[sl][None].to(predictor.device)
                 prediction = predictor._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
-                if int(prediction.shape[0]) != int(output_channels):
+                if int(prediction.shape[0]) < int(output_channels):
                     raise RuntimeError(
                         "Custom nnU-Net head mismatch during inference: "
-                        f"expected {output_channels} channels, got {tuple(prediction.shape)}"
+                        f"expected at least {output_channels} channels, got {tuple(prediction.shape)}"
                     )
+                # V308: [4 ABBC logits, K affinity logits]. The deployed Task1
+                # ABBC decoder and per-epoch validation both use the first four.
+                prediction = prediction[:int(output_channels)]
                 if predictor.use_gaussian:
                     prediction *= gaussian
                 predicted_logits[sl] += prediction
