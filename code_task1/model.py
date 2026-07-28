@@ -232,7 +232,9 @@ def load_stunet_pretrained_weights(network, fname, verbose=False, inflate="ct0")
        원본 로더는 비-seg 키 전부가 pretrained 에 존재한다고 assert 하여 신규 모듈에서
        깨진다.
     3. **seg head skip** — STUNet 의 출력 head 는 `seg_outputs.*` 네이밍(nnU-Net 의
-       `.seg_layers.` 가 아님). 클래스 수가 다르므로(105 → 5/4) 항상 reinit.
+       `.seg_layers.` 가 아님). 기본적으로 클래스 수가 다른 전이를 위해 reinit한다.
+       같은 task/checkpoint를 재학습하는 경우에는
+       `PENGWIN_LOAD_PRETRAINED_SEG_LAYERS=1`로 shape-compatible head도 전이한다.
     4. **입력 stem inflate** — pretrained 는 1ch(CT). 우리 입력이 N>1 채널이면:
          - inflate="ct0"  (기본): 채널0 = pretrained CT 가중치, 나머지 채널 = 0.
            우리 입력(ct_lut, anatprob, sdf)은 CT modality 복제가 아니므로 tiling 보다
@@ -260,8 +262,16 @@ def load_stunet_pretrained_weights(network, fname, verbose=False, inflate="ct0")
         try:
             import numpy as _np
             import torch.serialization as _ts
-            _safe = [_np.ndarray, _np.dtype,
-                     _np.core.multiarray.scalar, _np.core.multiarray._reconstruct]
+            # PyTorch 2.6 resolves the legacy nnU-Net v1 checkpoint globals by
+            # their serialized NumPy 1.x names. NumPy 2.x exposes the same
+            # objects from ``numpy._core``, so register explicit legacy names
+            # instead of falling back to unsafe pickle loading.
+            _safe = [
+                _np.ndarray,
+                (_np.dtype, "numpy.dtype"),
+                (_np.core.multiarray.scalar, "numpy.core.multiarray.scalar"),
+                (_np.core.multiarray._reconstruct, "numpy.core.multiarray._reconstruct"),
+            ]
             try:
                 import numpy.dtypes as _ndt
                 _safe += [getattr(_ndt, _n) for _n in dir(_ndt) if _n.endswith("DType")]
@@ -290,6 +300,7 @@ def load_stunet_pretrained_weights(network, fname, verbose=False, inflate="ct0")
     if OptimizedModule and isinstance(mod, OptimizedModule):
         mod = mod._orig_mod
     model_dict = mod.state_dict()
+    load_seg_layers = _os.environ.get("PENGWIN_LOAD_PRETRAINED_SEG_LAYERS", "") == "1"
 
     # STUNet 키 prefix 탐지 (anatomy: "" / fracture BADB: "base.")
     anchor = "conv_blocks_context.0.0.conv1.weight"
@@ -321,7 +332,7 @@ def load_stunet_pretrained_weights(network, fname, verbose=False, inflate="ct0")
     loaded, skipped_seg, kept_init = [], [], []
     use = {}
     for k, v in model_dict.items():
-        if skip_token in k:
+        if skip_token in k and not load_seg_layers:
             skipped_seg.append(k)
             continue
         if k in pretrained and pretrained[k].shape == v.shape:
@@ -349,5 +360,3 @@ def load_stunet_pretrained_weights(network, fname, verbose=False, inflate="ct0")
         for k in kept_init:
             print("  kept-init(new module):", k)
     return stats
-
-
