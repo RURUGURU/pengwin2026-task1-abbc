@@ -16,6 +16,32 @@ cascade** on a **STU-Net-B** backbone, I/O-compatible with the official
 
 ---
 
+## Upload candidate — v3.4 TotalSegmentator-init V308 (`T=0.75`)
+
+This is a candidate submission, not yet an Active replacement for the
+rollback-safe `model_v3_0`.
+
+| | |
+|---|---|
+| **Stage A** | refreshed-data scratch `V301`, fold 0, `checkpoint_best.pth` |
+| **Stage B** | `PengwinTrainerSTUNetBaseAffinityV308DeployedVal`, fold 0, initialized from the official TotalSegmentator `base_ep4k` backbone |
+| **Decoder** | affinity average-linkage with validation-selected `AGGLO_T=0.75` |
+| **Router** | unchanged v3.3 hybrid family router |
+| **Bundle** | `model_v3_4_totalpretrain_t075_20260728.tar.gz` |
+
+On the same refreshed 68-case fold-0 official-aligned proxy, the candidate at
+`T=0.75` reached instance F1 `0.930066`, HD95 `3.260951 mm`, ASSD
+`0.774668 mm`, and 426 split errors. The existing release scored F1 `0.933582`,
+HD95 `3.857464 mm`, ASSD `1.039815 mm`, and 457 split errors. Because `T=0.75`
+was selected on this validation set, the challenge upload is the independent
+generalization check.
+
+The Stage-B run stopped after completing epoch 180, at the beginning of epoch
+181; the bundle therefore uses its valid `checkpoint_best.pth`, not a
+`checkpoint_final.pth`.
+
+---
+
 ## Current version — model_v3_0 (v3.3 hybrid family router)
 
 | | |
