@@ -24,7 +24,18 @@ from typing import Literal
 # from this file's location (core.py lives at <root>/code_task1/core.py), so the tree is
 # portable across machines without hardcoding /workspace.
 ROOT = Path(os.environ.get("PENGWIN_ROOT") or Path(__file__).resolve().parents[1])
-DATA_RAW = ROOT / "data/task1_2/extracted"
+# Keep source data independently configurable from model/results storage.  This
+# matters on the training host, where the canonical challenge download lives
+# under PENGWIN/data while deploy artifacts live in a separate repository.
+DATA_ROOT = Path(os.environ.get("PENGWIN_DATA_ROOT") or ROOT / "data")
+DATA_RAW = Path(
+    os.environ.get("PENGWIN_TASK12_ROOT")
+    or DATA_ROOT / "task1_2" / "extracted"
+)
+TASK3_RAW = Path(
+    os.environ.get("PENGWIN_TASK3_ROOT")
+    or DATA_ROOT / "task3" / "extracted"
+)
 # nnUNet 출력 root 를 code_task1/result/ 아래로 통합 (2026-05-31 정리).
 # 이전: ROOT/nnunet/{raw,preprocessed,results} — workspace 루트에 분산.
 # 현재: ROOT/code_task1/result/{raw,preprocessed,results} — code_task1 내부에서 자급자족.
@@ -1821,7 +1832,7 @@ class PengwinTrainerSTUNetBaseAnatomyV301(_StunetCleanTrainerMixin, PengwinTrain
         super().__init__(plans, configuration, fold, dataset_json,
                          unpack_dataset=unpack_dataset, device=device)
         self.initial_lr = 1e-3
-        self.num_epochs = 1000
+        self.num_epochs = int(os.environ.get("PENGWIN_NUM_EPOCHS", "1000"))
         # [V0.x][ES][2026-06-01] warm-start 용 early-stop 재튜닝.
         # 상속 기본값(PengwinTrainer: MIN_EPOCHS=100, PATIENCE=50)은 from-scratch 기준이다.
         # STU-Net 뼈 사전학습 warm-start 는 수십 epoch 안에 수렴하므로, 수렴 후 낭비 학습을
@@ -2161,3 +2172,123 @@ class PengwinTrainerSTUNetBaseAffinityV308(PengwinTrainerSTUNetBaseABBCPhase1V30
         return logits[:, :4]
 
 
+class PengwinTrainerSTUNetBaseAffinityV308DeployedVal(
+    PengwinTrainerSTUNetBaseAffinityV308
+):
+    """V308 trained normally but selected with the deployed affinity decoder.
+
+    The original V308 validation slices ``logits[:, :4]`` and therefore chooses
+    ``checkpoint_best`` without measuring the nine affinity channels used at
+    inference. This experiment keeps the network, target and loss unchanged,
+    while making validation/early stopping decode the full 13-channel output
+    with the same average-linkage implementation used by the submission.
+    """
+
+    def __init__(self, plans: dict, configuration: str, fold: int,
+                 dataset_json: dict, unpack_dataset: bool = True,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(
+            plans, configuration, fold, dataset_json,
+            unpack_dataset=unpack_dataset, device=device,
+        )
+        self.print_to_log_file(
+            "[V308DeployedVal] checkpoint/ES metric uses full 13ch affinity "
+            "average-linkage decode "
+            f"T={float(os.environ.get('PENGWIN_TRAIN_AGGLO_T', '0.45')):.3f}"
+        )
+
+    @staticmethod
+    def _decode_deployed_affinity(logits: torch.Tensor) -> np.ndarray:
+        if logits.ndim != 5 or int(logits.shape[1]) != 13:
+            raise ValueError(
+                "V308 deployed validation expects logits [B,13,Z,Y,X], "
+                f"got {tuple(logits.shape)}"
+            )
+        inference_dir = Path(__file__).resolve().parents[1] / "inference"
+        if str(inference_dir) not in sys.path:
+            sys.path.insert(0, str(inference_dir))
+        from agglo_decode import decode_affinity_agglo
+
+        abbc = torch.softmax(logits[:, :4].detach().float(), dim=1).cpu().numpy()
+        affinity = torch.sigmoid(logits[:, 4:13].detach().float()).cpu().numpy()
+        threshold = float(os.environ.get("PENGWIN_TRAIN_AGGLO_T", "0.45"))
+        min_vox = int(os.environ.get("PENGWIN_TRAIN_MIN_CC_VOX", "250"))
+        out = np.zeros(
+            (int(logits.shape[0]), *tuple(int(v) for v in logits.shape[2:])),
+            dtype=np.int32,
+        )
+        for batch_index in range(int(logits.shape[0])):
+            out[batch_index] = decode_affinity_agglo(
+                abbc[batch_index],
+                affinity[batch_index],
+                T=threshold,
+                min_vox=min_vox,
+            )
+        return out
+
+    def validation_step(self, batch: dict) -> dict:
+        from utils import instance_iouf
+
+        data = batch["data"].to(self.device, non_blocking=True)
+        target = batch["target"]
+        if isinstance(target, list):
+            target = [item.to(self.device, non_blocking=True) for item in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
+        with (
+            autocast(self.device.type, enabled=True)
+            if self.device.type == "cuda"
+            else dummy_context()
+        ):
+            output = self.network(data)
+            del data
+            loss = self.loss(output, target)
+
+        logits = output[0] if isinstance(output, (list, tuple)) else output
+        gt = target[0] if isinstance(target, list) else target
+        if gt.ndim == 5 and int(gt.shape[1]) == 1:
+            gt = gt[:, 0]
+        gt = gt.long().clamp_min(0).cpu().numpy()
+        pred_inst = self._decode_deployed_affinity(logits)
+
+        iou, recall, precision, n_pred, n_gt = [], [], [], [], []
+        for batch_index in range(gt.shape[0]):
+            try:
+                result = instance_iouf(pred_inst[batch_index], gt[batch_index])
+                gt_count = max(int(result["n_gt_fragments"]), 0)
+                pred_count = max(int(result["n_pred_fragments"]), 0)
+                rows = result.get("per_gt", []) or []
+                matched = [
+                    row for row in rows
+                    if float(row.get("best_iou", 0.0)) >= 0.5
+                ]
+                matched_pred = len({
+                    row["best_pred_id"]
+                    for row in matched
+                    if row.get("best_pred_id") is not None
+                })
+                iou.append(float(result["iou_f_mean"]))
+                recall.append(len(matched) / gt_count if gt_count else 0.0)
+                precision.append(
+                    matched_pred / pred_count if pred_count else 0.0
+                )
+                n_pred.append(float(pred_count))
+                n_gt.append(float(gt_count))
+            except Exception:
+                iou.append(0.0)
+                recall.append(0.0)
+                precision.append(0.0)
+                n_pred.append(0.0)
+                n_gt.append(0.0)
+
+        aggregate = lambda values: np.asarray(
+            [float(np.mean(values)) if values else 0.0], dtype=np.float64
+        )
+        return {
+            "loss": loss.detach().cpu().numpy(),
+            "iouf": aggregate(iou),
+            "recall": aggregate(recall),
+            "precision": aggregate(precision),
+            "npred": aggregate(n_pred),
+            "ngt": aggregate(n_gt),
+        }
