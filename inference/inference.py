@@ -32,6 +32,8 @@ femur ROI 는 bone-skeleton 분해(pelvic 전용)에 의존하지 않고 Ds539 a
         fold_0/checkpoint_best.pth
         PengwinTrainerSTUNetBaseAffinityV308__nnUNetResEncUNetLPlans__3d_fullres/
         fold_0/checkpoint_best.pth
+        PengwinTrainerSTUNetBaseAffinityV308DeployedVal__nnUNetResEncUNetLPlans__3d_fullres/
+        fold_0/checkpoint_best.pth
     /opt/ml/model/stage1_router/
         stage1_target_router_fold0.joblib
 

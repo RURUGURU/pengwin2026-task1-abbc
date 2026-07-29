@@ -41,6 +41,11 @@ RUN pip install --upgrade pip && \
 COPY inference /opt/app/inference
 COPY code_task1 /opt/app/code_task1
 
+# Build contexts can preserve restrictive host modes (for example 0600). The
+# Grand Challenge image runs as a non-root service user, so normalize copied
+# source permissions instead of relying on the checkout umask.
+RUN chmod -R a+rX /opt/app/inference /opt/app/code_task1
+
 # --- nnUNet trainer-discovery shim -----------------------------------------
 # nnUNet v2 discovers trainer classes by walking
 # `nnunetv2/training/nnUNetTrainer/`. Our PengwinTrainer*ABBCV291 lives in
@@ -71,21 +76,22 @@ ENV PENGWIN_ROOT=/opt/ml/model \
     MPLCONFIGDIR=/tmp/matplotlib \
     XDG_CACHE_HOME=/tmp/.cache
 
-# [v2.0 = v1.5 weights + target-family router]
-# Stage-A V301 fold_0 and Stage-B V308 fold_0 stay unchanged. A lightweight
-# random-forest router packaged in model.tar.gz chooses pelvic vs femur and
-# prevents non-target anatomies from reaching Stage-B. The router artifact must
-# be present at /opt/ml/model/stage1_router/stage1_target_router_fold0.joblib.
-# PENGWIN_TARGET_ROUTER=1 fails fast if the artifact is missing, which avoids a
-# silent fallback to the older Ds539 volume-ratio route.
-ENV PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308 \
+# [v3.4 candidate = refreshed-data scratch V301 + TotalSegmentator-init V308]
+# Stage-A uses the refreshed-data scratch fold_0 checkpoint. Stage-B uses the
+# TotalSegmentator base_ep4k-initialized V308 checkpoint selected with the full
+# deployed 13-channel affinity decoder. The v3.3 hybrid family router remains
+# enabled and its joblib artifact is packaged beside the nnU-Net weights.
+ENV PENGWIN_DS539_TRAINER=PengwinTrainerSTUNetBaseAnatomyV301 \
+    PENGWIN_DS539_FOLD=0 \
+    PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308DeployedVal \
     PENGWIN_DS538_FOLD=0 \
     PENGWIN_DS538_OUT_CH=13 \
     PENGWIN_AFFINITY_DECODE=1 \
-    PENGWIN_AGGLO_T=0.45 \
+    PENGWIN_AGGLO_T=0.75 \
     PENGWIN_FUSION_DECODE=0 \
     PENGWIN_STAGEA_BONE_RECONCILE=0 \
     PENGWIN_TARGET_ROUTER=1 \
+    PENGWIN_RF_CONF_MARGIN=0.15 \
     PENGWIN_TARGET_ROUTER_PATH=/opt/ml/model/stage1_router/stage1_target_router_fold0.joblib
 
 # Grand Challenge security policy: container must not run as root.

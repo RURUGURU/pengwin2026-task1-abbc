@@ -4,12 +4,11 @@
 Active datasets: Ds539 (PelvicFemurAnatomyV3, 5-class anatomy) + Ds538
 (PelvicFemurBICMFragmentV5, per-anatomy ABBC fracture). 532/533/537 retired.
 
-Dataset builder functions (driven by preprocessing/gen_nnunet_dataset.py stages):
-    generate_anatomy_probability_context  — Stage-A anatomy-prob cache (the only inference step)
+Active dataset builder functions:
     build_anatomy_semantic_dataset(539)   — whole-CT 5-class anatomy target
-    build_bicm_v5_dataset(538)            — per-anatomy 3ch ABBC fragment ROIs
+    build_bicm_v5_dataset(538)            — per-anatomy CT-only instance-label ROIs
 
-CLI (sidecars on the preprocessed grid):
+Legacy/experimental sidecar CLIs (not used by the deployed V308 contract):
     python preprocessing.py build-instance-sidecars --dataset 538
     python preprocessing.py build-boundary-fragment-v3-sidecars --dataset 538
 """
@@ -362,7 +361,11 @@ def require_anatomy_probability_context(cases: list[Path],
     return out_root
 
 
-def build_anatomy_semantic_dataset(ds_id: int, force: bool = False) -> int:
+def build_anatomy_semantic_dataset(
+    ds_id: int,
+    force: bool = False,
+    case_subset: list[str] | None = None,
+) -> int:
     """Build a trusted CT → semantic anatomy nnU-Net raw dataset.
 
     Contract:
@@ -377,7 +380,10 @@ def build_anatomy_semantic_dataset(ds_id: int, force: bool = False) -> int:
     dst = NN_RAW / cfg["name"]
     (dst / "imagesTr").mkdir(parents=True, exist_ok=True)
     (dst / "labelsTr").mkdir(parents=True, exist_ok=True)
-    cases = list_cases(case_filter=None if cfg["filter"] == "all" else cfg["filter"])
+    cases = _select_case_subset(
+        list_cases(case_filter=None if cfg["filter"] == "all" else cfg["filter"]),
+        case_subset,
+    )
     local_label_map = {
         anat: local_idx for local_idx, anat in enumerate(cfg["anatomies"], start=1)
     }
@@ -452,6 +458,33 @@ def build_anatomy_semantic_dataset(ds_id: int, force: bool = False) -> int:
         ),
     }
     (dst / "dataset.json").write_text(json.dumps(ds_json, indent=2))
+
+    # The anatomy dataset combines two disjoint partial-label cohorts:
+    # pelvic cases supervise classes 1/2/3, while femur cases supervise class 4.
+    # The active marginal loss must know that the absent cohort classes are
+    # unlabeled rather than true background. Keep this map next to the other
+    # reproducibility reports and regenerate it even when case files are reused.
+    case_labeled_map: dict[str, list[int]] = {}
+    for cd in cases:
+        cid = int(cd.name)
+        if is_pelvic(cid):
+            labeled_names = ("Sacrum", "LeftHip", "RightHip")
+        elif is_femur(cid):
+            labeled_names = ("Femur",)
+        else:
+            raise RuntimeError(
+                f"Ds{ds_id} case {cid:03d}: cannot determine partial-label cohort"
+            )
+        case_labeled_map[f"{cid:03d}"] = [
+            int(local_label_map[name])
+            for name in labeled_names
+            if name in local_label_map
+        ]
+    labeled_map_path = RESULT_REPORT / f"ds{ds_id}_case_labeled_classes.json"
+    labeled_map_path.parent.mkdir(parents=True, exist_ok=True)
+    labeled_map_path.write_text(json.dumps(case_labeled_map, indent=2))
+    print(f"  partial-label map: {labeled_map_path}")
+
     print(f"  ✅ {cfg['name']} ready")
     return len(cases)
 
@@ -1509,6 +1542,38 @@ def main(argv: list[str] | None = None) -> int:
         help="Preprocessed plan configuration subfolder (default nnUNetPlans_3d_fullres).",
     )
 
+    p_anatomy = sub.add_parser(
+        "build-anatomy",
+        help="Build the active whole-CT anatomy raw dataset (default Dataset539).",
+    )
+    p_anatomy.add_argument("--dataset", type=int, default=539)
+    p_anatomy.add_argument("--force", action="store_true")
+    p_anatomy.add_argument(
+        "--case-subset",
+        nargs="*",
+        default=None,
+        help="Optional source case IDs for a smoke/subset build.",
+    )
+
+    p_bicm = sub.add_parser(
+        "build-bicm-v5",
+        help="Build the active per-anatomy fracture raw dataset (default Dataset538).",
+    )
+    p_bicm.add_argument("--dataset", type=int, default=538)
+    p_bicm.add_argument("--force", action="store_true")
+    p_bicm.add_argument("--v5-input", choices=V5_INPUT_VARIANTS, default="ct_lut")
+    p_bicm.add_argument("--v5-target-profile", choices=V5_TARGET_PROFILES, default="v5_tiny_marker")
+    p_bicm.add_argument("--v5-core-ball-radius-mm", type=float, default=2.5)
+    p_bicm.add_argument("--v5-core-body-mm", type=float, default=3.0)
+    p_bicm.add_argument("--v5-contact-band-mm", type=float, default=2.0)
+    p_bicm.add_argument("--label-mode", choices=("instance", "semantic"), default="instance")
+    p_bicm.add_argument(
+        "--case-subset",
+        nargs="*",
+        default=None,
+        help="Optional source case IDs for a smoke/subset build.",
+    )
+
     p_bfv3 = sub.add_parser(
         "build-boundary-fragment-v3-sidecars",
         help=(
@@ -1532,6 +1597,36 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    if args.cmd == "build-anatomy":
+        count = build_anatomy_semantic_dataset(
+            ds_id=int(args.dataset),
+            force=bool(args.force),
+            case_subset=args.case_subset,
+        )
+        print(json.dumps({
+            "dataset_id": int(args.dataset),
+            "cases": count,
+            "output_dir": str(NN_RAW / DATASETS[int(args.dataset)]["name"]),
+        }, indent=2))
+        return 0
+    if args.cmd == "build-bicm-v5":
+        count = build_bicm_v5_dataset(
+            ds_id=int(args.dataset),
+            force=bool(args.force),
+            v5_input=args.v5_input,
+            v5_target_profile=args.v5_target_profile,
+            v5_core_ball_radius_mm=float(args.v5_core_ball_radius_mm),
+            v5_core_body_mm=float(args.v5_core_body_mm),
+            v5_contact_band_mm=float(args.v5_contact_band_mm),
+            label_mode=args.label_mode,
+            case_subset=args.case_subset,
+        )
+        print(json.dumps({
+            "dataset_id": int(args.dataset),
+            "samples": count,
+            "output_dir": str(NN_RAW / DATASETS[int(args.dataset)]["name"]),
+        }, indent=2))
+        return 0
     if args.cmd == "build-instance-sidecars":
         result = build_bicm_v5_instance_sidecars(
             ds_id=int(args.dataset),

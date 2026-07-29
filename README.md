@@ -14,6 +14,35 @@
 
 ---
 
+## 🧪 업로드 후보 — v3.4 TotalSegmentator-init V308 (`T=0.75`)
+
+> **후보이며 아직 Active 승격 전이다.** 기존 `model_v3_0`/v3.3 hybrid router는
+> 롤백 가능한 기준 모델로 유지한다.
+
+| | |
+|---|---|
+| **Stage A** | refreshed-data scratch `V301`, fold 0, `checkpoint_best.pth` |
+| **Stage B** | `PengwinTrainerSTUNetBaseAffinityV308DeployedVal`, fold 0, TotalSegmentator `base_ep4k` backbone 초기화 |
+| **Decoder** | affinity average-linkage, validation-selected `AGGLO_T=0.75` |
+| **Router** | v3.3 hybrid family router 유지(RF confident-primary, official-rule tiebreak) |
+| **모델 번들** | `model_v3_4_totalpretrain_t075_20260728.tar.gz` |
+| **Checkpoint 상태** | Stage-B 학습은 epoch 180 완료 후 epoch 181 시작점에서 중단; 유효한 `checkpoint_best.pth` 사용 |
+
+동일한 refreshed fold-0 68-case official-aligned proxy에서:
+
+| 구성 | Fragment Dice | HD95 mm ↓ | ASSD mm ↓ | Instance F1 | Split ↓ |
+|---|---:|---:|---:|---:|---:|
+| 기존 release V301+V308 | 0.884121 | 3.857464 | 1.039815 | **0.933582** | 457 |
+| scratch V301+V308 | 0.865772 | 4.009136 | 0.927063 | 0.846223 | 537 |
+| v3.4 후보, 고정 `T=0.45` | **0.885355** | 3.422187 | 0.800181 | 0.921553 | 456 |
+| v3.4 후보, 선택 `T=0.75` | 0.882088 | **3.260951** | **0.774668** | 0.930066 | **426** |
+
+`T=0.75`는 같은 validation set에서 선택한 값이므로 challenge upload는
+일반화 확인을 위한 후보 제출이다. 기존 release 대비 F1 차이는 `-0.003516`,
+precision은 사실상 동일하며 HD95/ASSD/split은 개선됐다.
+
+---
+
 ## 🚀 현재 배포 상태 (2026-07-25, **model_v3_0** — 라우터 v3.3 HYBRID · TEST phase F1 0.898 ≈ rank 13)
 
 > **DEPLOYED Active = `model_v3_0`** = Stage-A `V301`(Ds539, 5-class) → **v3.3 하이브리드 family 라우터**
@@ -1130,25 +1159,28 @@ export nnUNet_results=<ROOT>/code_task1/result/results
 ### 8.2 데이터 & 데이터셋 빌드
 
 ```bash
-# Download
-cd <ROOT>/data && bash download_pengwin.sh && bash extract_pengwin.sh
-find <ROOT>/data/task1_2/extracted -name "label.mha" | wc -l   # → 340
+# Canonical host data/environment
+source <WORKSPACE>/PENGWIN/setup_env.sh
+python <WORKSPACE>/PENGWIN/data/validate_pengwin_data.py \
+  --data-root "$PENGWIN_DATA_ROOT" \
+  --output "$PENGWIN_DATA_ROOT/audits/dataset_audit.json"
 
 # Stage A (Ds539)
-cd <ROOT>/code_task1
-python -m preprocessing.gen_nnunet_dataset --stage anatomical          # --ds-id 539
+cd "$PENGWIN_CODE_ROOT/code_task1"
+python preprocessing.py build-anatomy --dataset 539 --force
 
-# Anatomy-prob cache (Stage-A 추론이 빌드에서 도는 유일한 곳)
-python -m preprocessing.gen_nnunet_dataset --stage generate-anatomy-prob --foundation 539
+# Stage B (Ds538, deployed CT-only/leak-free instance-label contract)
+python preprocessing.py build-bicm-v5 --dataset 538 --force \
+    --v5-input ct_lut --label-mode instance
 
-# Stage B (Ds538, leak-free instance label)
-python -m preprocessing.gen_nnunet_dataset --stage bicm_v5 \
-    --v5-input ct_lut_anat_sdf --v5-target-profile v5_core_body_contact_band
+# nnUNet integrity/fingerprint/plan, then the deployed 3D full-resolution preprocessing
+nnUNetv2_plan_and_preprocess -d 539 538 --verify_dataset_integrity \
+    --clean --no_pp -pl nnUNetPlannerResEncL
+nnUNetv2_preprocess -d 539 538 -plans_name nnUNetResEncUNetLPlans \
+    -c 3d_fullres -np 4
 
-# nnUNet plan + preprocess + sidecars
-nnUNetv2_plan_and_preprocess -d 539 --verify_dataset_integrity -pl nnUNetPlannerResEncL
-nnUNetv2_plan_and_preprocess -d 538 --verify_dataset_integrity -pl nnUNetPlannerResEncL
-python -m preprocessing.gen_sidecars --kind all --dataset 538
+# Dataset538's active V308 trainer consumes the instance-ID label directly.
+# Legacy BICM sidecars are not part of the deployed CT-only contract.
 ```
 
 ### 8.3 학습 (spawn 단일GPU — 6.4 참조)
@@ -1190,7 +1222,7 @@ python eval.py task1-abbc-eval --dataset-id 538 \
 |---|---|---|
 | `PENGWIN_DS539_TRAINER` | `...AnatomyV301` | Stage-A trainer |
 | `PENGWIN_DS539_FOLD` | `0` | Stage-A fold (`0` / `all`) |
-| `PENGWIN_DS538_TRAINER` | Dockerfile: `...AffinityV308` | Stage-B trainer |
+| `PENGWIN_DS538_TRAINER` | Dockerfile: `...AffinityV308DeployedVal` | Stage-B trainer |
 | `PENGWIN_DS538_FOLD` | Dockerfile: `0` | Stage-B fold |
 | `PENGWIN_DS538_OUT_CH` | Dockerfile: `13` | 4=ABBC / 13=ABBC+affinity |
 | `PENGWIN_TARGET_ROUTER` | Dockerfile: `1` | v2.0 target-family router 사용 |
@@ -1201,7 +1233,7 @@ python eval.py task1-abbc-eval --dataset-id 538 \
 | `PENGWIN_CONFINE_TO_MASK` | `1` | 타 해부학 영역 침범 금지 |
 | `PENGWIN_AFFINITY_DECODE` | Dockerfile: `1` | affinity avg-linkage decode (13ch 필요) |
 | `PENGWIN_FUSION_DECODE` | `0` | fusion decode (13ch 필요) |
-| `PENGWIN_AGGLO_T` | `0.45` | agglomeration merge threshold |
+| `PENGWIN_AGGLO_T` | Dockerfile: `0.75` | agglomeration merge threshold |
 | `PENGWIN_FUSION_RIDGE_VOX` | `3000` | sub-split 트리거 최소 ridge voxel |
 | `PENGWIN_MP_SPAWN` | — | mp 'spawn' 강제(학습) |
 | `PENGWIN_DELEGATE_STUNET_LOADER` | — | nnUNet 로더 위임(학습) |
