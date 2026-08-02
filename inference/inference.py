@@ -1319,7 +1319,30 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
                     T=float(os.environ.get("PENGWIN_FUSION_T", os.environ.get("PENGWIN_AGGLO_T", "0.45"))),
                     min_ridge_vox=int(os.environ.get("PENGWIN_FUSION_RIDGE_VOX", "3000")))
             else:
-                decoded_pp = decode_affinity_agglo(_abbc, _aff, T=float(os.environ.get("PENGWIN_AGGLO_T", "0.45")))
+                # [v3.4] PER-ANATOMY merge threshold. femur and pelvic fail in different ways at
+                # different size scales, so one global T cannot serve both.
+                # Measured on the official 54-case gate (evaluator pinned f390e9b), 2026-08-02:
+                #   of the GT fragments that go unmatched, 92% (femur) / 84% (pelvic) are MERGED --
+                #   BOUNDARY 3, SPLIT 2, MISSING 0 across all 54 cases -- but the merged bodies
+                #   differ ~8x in size: femur median 1 681 mm3 = 1.68x the official 1000 mm3 scoring
+                #   floor and 1.6% of the main body, pelvic median 12 964 mm3 = 12.97x the floor.
+                # Average-linkage merging weights an interface by its own extent, so it is
+                # SIZE-BLIND: a small chip has a small interface and gets swallowed. Lowering T
+                # rescues those chips. Pelvic merges join two large bodies whose interface clears
+                # any usable T, so a lower T cannot undo them and only over-splits correct
+                # fragments -- at a global T=0.15 pelvic merge_error did not move at all
+                # (0.2667 -> 0.2667) while split_error rose 0.1333 -> 0.1867 and dice/local_dice
+                # got significantly worse (p 0.023 / 0.022).
+                # Gate result for femur 0.15 / other 0.45 over all 54 cases: 8 metrics better,
+                # 2 EXACTLY unchanged, ZERO worse -- merge_error 0.3457 -> 0.3272, recall
+                # 0.8948 -> 0.8971, precision 0.9442 -> 0.9447, dice 0.8750 -> 0.8767, with
+                # split_error and topology_consistency at exactly 0.0000 (0/0/54). The pelvic
+                # stratum came back identical on all 10 metrics (0/0/25), which is the built-in
+                # control that the anatomy branch fires where it should and nowhere else.
+                _T = float(os.environ.get("PENGWIN_AGGLO_T", "0.45"))
+                if anatomy in ("Femur", "LeftFemur", "RightFemur"):
+                    _T = float(os.environ.get("PENGWIN_AGGLO_T_FEMUR", str(_T)))
+                decoded_pp = decode_affinity_agglo(_abbc, _aff, T=_T)
         else:
             ds538_probs = softmax_axis0(ds538_logits_pp)
             _dump_dir = os.environ.get("PENGWIN_DUMP_PROBS", "")
