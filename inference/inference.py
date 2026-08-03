@@ -384,7 +384,16 @@ def predict_logits_full(predictor, image_4d: np.ndarray,
     logits = _predict_custom_logits_from_preprocessed_data(
         predictor, data_tensor, output_channels=output_channels,
     )
-    logits_np = logits.detach().cpu().numpy().astype(np.float32, copy=False)
+    # [v3.6 mem] The sliding window already accumulates in torch.half; upcasting to float32 here
+    # DOUBLES a full-volume 5-channel array (0.82 GB -> 1.64 GB at 82M voxels, 1.3 GB more at 132M)
+    # and the fp16 copy is still alive while the fp32 one is built. softmax_axis0 upcasts to float32
+    # internally anyway, so handing it fp16 costs one array instead of two and changes nothing
+    # numerically -- the softmax is computed in float32 either way.
+    # PENGWIN_STAGEA_LOWMEM=0 restores the eager float32 conversion.
+    if os.environ.get("PENGWIN_STAGEA_LOWMEM", "1") == "1":
+        logits_np = logits.detach().cpu().numpy()
+    else:
+        logits_np = logits.detach().cpu().numpy().astype(np.float32, copy=False)
     return logits_np, dct["data_properties"]
 
 
@@ -732,7 +741,7 @@ def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
     return masks
 
 
-def ds539_argmax_masks(probs_full):
+def ds539_argmax_masks(probs_full, is_argmax=False):
     """Ds539 5-channel softmax → 서로 배타적인 anatomy mask + morphology cleanup.
 
     Layer 2 일부: Ds539 5-channel softmax 의 argmax 로 서로 배타적인 anatomy mask 를
@@ -745,13 +754,15 @@ def ds539_argmax_masks(probs_full):
     Sacrum/Hip mask 가 비는 식으로 자연히 disjoint 하게 갈린다).
 
     Args:
-        probs_full: (5, Z, Y, X) softmax 확률 텐서.
+        probs_full: (5, Z, Y, X) softmax 확률 텐서, 또는 is_argmax=True 이면 이미 계산된
+            (Z, Y, X) argmax 라벨맵. 후자는 [v3.6] 채널별 running-argmax 경로가 5채널 전체
+            볼륨 텐서를 아예 만들지 않기 위해 쓰는 진입점이다 (동일 결과, 메모리 1/5).
 
     Returns:
         dict[str, np.ndarray] — anatomy 별 mask (서로 disjoint 임이 보장됨).
     """
     import scipy.ndimage as ndi
-    argmax_map = np.argmax(probs_full, axis=0)  # (Z,Y,X) 0=bg,1=sacrum,2=lh,3=rh,4=femur
+    argmax_map = probs_full if is_argmax else np.argmax(probs_full, axis=0)  # (Z,Y,X) 0=bg,1=sacrum,2=lh,3=rh,4=femur
     masks = {}
     structure = np.ones((2, 2, 2), dtype=bool)
     cc_struct = np.ones((3, 3, 3), dtype=bool)
@@ -1092,33 +1103,84 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     transpose_forward = ds539_predictor.plans_manager.transpose_forward
     transpose_backward = ds539_predictor.plans_manager.transpose_backward
     original_spacing = [ds539_data_props["spacing"][i] for i in transpose_forward]
-    probs_resampled_axes = resample_data_or_seg_to_shape(
-        ds539_probs_pp,   # already float32, contiguous
-        shape_after_cropping, current_spacing, original_spacing,
-        is_seg=False, order=1, order_z=0,
-    )
-    del ds539_probs_pp   # resample made its own output; free the plan-grid probs
-    gc.collect()
     shape_before_cropping = tuple(int(s) for s in ds539_data_props["shape_before_cropping"])
     bbox_used = ds539_data_props.get("bbox_used_for_cropping", None)
-    if bbox_used is None:
-        probs_full_axes = np.asarray(probs_resampled_axes, dtype=np.float32)
-    else:
-        probs_full_axes = np.zeros((DS539_OUTPUT_CHANNELS, *shape_before_cropping), dtype=np.float32)
-        slicer = bounding_box_to_slice(bbox_used)
-        probs_full_axes[(slice(None), *slicer)] = np.asarray(probs_resampled_axes, dtype=np.float32)
-        del probs_resampled_axes
-        gc.collect()
-    # cropping bbox 바깥 영역은 fg 가 비어 있으므로 background prob 를 1 로 채워 정상화
-    fg_sum = probs_full_axes[1:].sum(axis=0)
-    bg_mask = fg_sum < 1e-6
-    if bg_mask.any():
-        probs_full_axes[0][bg_mask] = 1.0
-    probs_full = np.transpose(probs_full_axes, (0, *(int(a) + 1 for a in transpose_backward)))
-    assert probs_full.shape[1:] == img_shape, f"shape mismatch: {probs_full.shape[1:]} vs {img_shape}"
+    slicer = None if bbox_used is None else bounding_box_to_slice(bbox_used)
+    tb = tuple(int(a) for a in transpose_backward)
 
-    # === Layer 2: Ds539 5-class argmax 기반 anatomy mask 추출 (Femur 포함) ===
-    ds539_masks = ds539_argmax_masks(probs_full)
+    if os.environ.get("PENGWIN_STAGEA_LOWMEM", "1") == "1":
+        # [v3.6 mem] CHANNEL-WISE resample with a RUNNING ARGMAX.
+        #
+        # The old path allocated TWO full-volume 5-channel float32 arrays that were alive at the same
+        # instant -- `probs_full_axes` and the `probs_resampled_axes` being copied into it -- which is
+        # 2 x 5 x 4 x N bytes. On a 132M-voxel CT (the largest in training) that is 5.3 GB for this
+        # step alone, on top of ref_img, arr_clipped and the bone masks. Measured peak RSS on our
+        # largest LOCAL case (336, 81.8M voxels) was already 10.2 GB, and the v3.5 Final-Test
+        # submission was killed with "container exceeded its memory limit".
+        #
+        # The whole point of this block is ONE line downstream: `np.argmax(probs_full, axis=0)`.
+        # probs_full has no other consumer. Resampling is independent per channel, so the 5-channel
+        # tensor never has to exist: resample one channel at a time and keep a running (best, argmax)
+        # pair. That holds 1 float32 full volume + 1 uint8 label map instead of 10 float32 volumes.
+        #
+        # RESULT-IDENTICAL, and the two dropped steps are provably no-ops for argmax:
+        #   * the old code set background prob to 1 where the foreground sum was ~0 (outside the crop
+        #     bbox). Those voxels are all-zero here, and np.argmax returns the FIRST maximum, which is
+        #     channel 0 = background. Same label.
+        #   * `probs_full` was a transposed VIEW; transposing the argmax map instead is equivalent
+        #     because argmax is taken along the channel axis, which the transpose never touches.
+        # Verified byte-identical against the old path on real cases before shipping.
+        # PENGWIN_STAGEA_LOWMEM=0 restores the original code path.
+        best = None
+        argmax_axes = np.zeros(shape_before_cropping, dtype=np.uint8)
+        for ch in range(DS539_OUTPUT_CHANNELS):
+            ch_res = resample_data_or_seg_to_shape(
+                ds539_probs_pp[ch:ch + 1],
+                shape_after_cropping, current_spacing, original_spacing,
+                is_seg=False, order=1, order_z=0,
+            )
+            if slicer is None:
+                full_ch = np.asarray(ch_res, dtype=np.float32)[0]
+            else:
+                full_ch = np.zeros(shape_before_cropping, dtype=np.float32)
+                full_ch[slicer] = np.asarray(ch_res, dtype=np.float32)[0]
+            del ch_res
+            if best is None:
+                best = full_ch                      # channel 0 seeds both running arrays
+            else:
+                better = full_ch > best             # strict: ties keep the LOWER channel, as argmax does
+                best[better] = full_ch[better]
+                argmax_axes[better] = ch
+                del full_ch, better
+            gc.collect()
+        del ds539_probs_pp, best
+        gc.collect()
+        argmax_map = np.transpose(argmax_axes, tb)
+        assert argmax_map.shape == img_shape, f"shape mismatch: {argmax_map.shape} vs {img_shape}"
+        ds539_masks = ds539_argmax_masks(argmax_map, is_argmax=True)
+    else:
+        probs_resampled_axes = resample_data_or_seg_to_shape(
+            ds539_probs_pp,   # already float32, contiguous
+            shape_after_cropping, current_spacing, original_spacing,
+            is_seg=False, order=1, order_z=0,
+        )
+        del ds539_probs_pp   # resample made its own output; free the plan-grid probs
+        gc.collect()
+        if slicer is None:
+            probs_full_axes = np.asarray(probs_resampled_axes, dtype=np.float32)
+        else:
+            probs_full_axes = np.zeros((DS539_OUTPUT_CHANNELS, *shape_before_cropping), dtype=np.float32)
+            probs_full_axes[(slice(None), *slicer)] = np.asarray(probs_resampled_axes, dtype=np.float32)
+            del probs_resampled_axes
+            gc.collect()
+        # cropping bbox 바깥 영역은 fg 가 비어 있으므로 background prob 를 1 로 채워 정상화
+        fg_sum = probs_full_axes[1:].sum(axis=0)
+        bg_mask = fg_sum < 1e-6
+        if bg_mask.any():
+            probs_full_axes[0][bg_mask] = 1.0
+        probs_full = np.transpose(probs_full_axes, (0, *(a + 1 for a in tb)))
+        assert probs_full.shape[1:] == img_shape, f"shape mismatch: {probs_full.shape[1:]} vs {img_shape}"
+        ds539_masks = ds539_argmax_masks(probs_full)
     log("L2 Ds539 argmax: " + ", ".join(f"{a}={int(ds539_masks[a].sum())}" for a in ALL_ANATOMIES))
     # DIAG: Ds539 health — each anatomy's fraction of the WHOLE volume. The GC failure was
     # RightHip=73% + Sacrum 18141 CCs; a healthy case is each anatomy ~1-2% of volume.
@@ -1197,7 +1259,14 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     # Ds538 모델 로딩 전에 Ds539 관련 텐서를 해제해 GPU 메모리 확보.
     # [2026-07-22 mem] ds539_logits_pp / ds539_probs_pp / probs_resampled_axes 는 위에서 이미 조기
     # 해제됨(대용량 볼륨 OOM 방지). 남은 것만 정리한다.
-    del ds539_predictor, probs_full_axes
+    # [v3.6] probs_full_axes 는 LOWMEM 경로에서 아예 만들어지지 않는다(채널별 running argmax).
+    # 무조건 del 하면 그 경로에서 UnboundLocalError 로 케이스가 통째로 실패한다 — 실제로 그렇게
+    # 터졌고, 그 실패가 조용히 "메모리 적게 쓰고 빨리 끝난 실행"처럼 보였다.
+    # (`del locals()[...]` 로는 지워지지 않는다 — locals() 는 함수 스코프에서 스냅샷이다.)
+    del ds539_predictor
+    probs_full_axes = None
+    argmax_axes = None
+    argmax_map = None
     import torch  # gc 는 모듈 레벨
     gc.collect()
     if torch.cuda.is_available():
