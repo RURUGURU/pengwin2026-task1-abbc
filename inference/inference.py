@@ -1049,7 +1049,11 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     # === Step 1: LPS 정규화 + bone window HU clip ===
     img_lps, arr_clipped = canonicalize_and_clip_image(ref_img)
     image_npy_lps = arr_clipped.astype(np.float32, copy=False)
-    ct_lut_full = bone_lut_normalize(arr_clipped)
+    # [v3.7 mem] DEFERRED. bone_lut_normalize allocates a full-volume float32 (0.33 GB at 82M
+    # voxels, 0.53 GB at 132M) whose ONLY consumer is the Stage-B crop far below. Computing it here
+    # meant carrying it through the whole Stage-A sliding-window prediction, which is where peak RSS
+    # actually lands. Built just before the Stage-B loop instead.
+    ct_lut_full = None
     # DIAG: raw (pre-clip) HU stats — detects an OOD / mis-calibrated GC input (e.g. uint16
     # raw pixels needing rescale, or a non-HU intensity range) that would make Ds539 garbage.
     try:
@@ -1058,8 +1062,18 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
             f"mean={float(_raw.mean()):.0f} p1={float(np.percentile(_raw,1)):.0f} "
             f"p99={float(np.percentile(_raw,99)):.0f} bone(>200)={float((_raw>200).mean()):.4f} "
             f"air(<-500)={float((_raw<-500).mean()):.4f}")
+        # [v3.7 mem] FREE IT. This is a diagnostic-only full-volume copy and SimpleITK hands it back
+        # in the image's own dtype -- float64 here, i.e. 0.65 GB at 82M voxels and 1.06 GB at 132M.
+        # It was staying alive in this function's scope through the entire Stage-A prediction, which
+        # is exactly where peak RSS lands. Measured as the single largest resident object at the peak.
+        del _raw
+        gc.collect()
     except Exception as _e:
         log(f"DIAG raw-HU: failed ({_e})")
+        try:
+            del _raw
+        except NameError:
+            pass
     spacing_xyz = img_lps.GetSpacing()
     spacing_zyx = (float(spacing_xyz[2]), float(spacing_xyz[1]), float(spacing_xyz[0]))
     img_shape = image_npy_lps.shape
@@ -1271,6 +1285,12 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+    # [v3.7 mem] Stage-B's LUT-normalised input, built HERE rather than before Stage-A so it does not
+    # sit through the sliding-window prediction that dominates peak RSS. Only consumer is the
+    # per-anatomy crop below.
+    if ct_lut_full is None:
+        ct_lut_full = bone_lut_normalize(arr_clipped)
 
     # === Layer 4: anatomy 별 Ds538 추론 → ABBC decode → 전체 라벨에 paste ===
     ds538_predictor = build_predictor(
