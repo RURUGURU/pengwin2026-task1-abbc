@@ -69,7 +69,29 @@ ENV PENGWIN_ROOT=/opt/ml/model \
     PYTHONPATH=/opt/app:/opt/app/code_task1 \
     HOME=/tmp \
     MPLCONFIGDIR=/tmp/matplotlib \
-    XDG_CACHE_HOME=/tmp/.cache
+    XDG_CACHE_HOME=/tmp/.cache \
+    MALLOC_MMAP_THRESHOLD_=131072
+
+# MALLOC_MMAP_THRESHOLD_ (above) is a MEMORY fix, and the only one this investigation found that is
+# free. By default glibc raises its mmap threshold dynamically to whatever mmap'd block was freed
+# last, up to 32 MB: after the first big numpy array is released, every subsequent allocation under
+# 32 MB comes out of the brk heap and is NOT returned to the OS when freed. Pinning the threshold at
+# 128 KB keeps those mid-sized blocks (torch parameter tensors, nnUNet's duplicate checkpoint
+# state_dict, SimpleITK buffers) on mmap, so free() really is munmap() and the heap never accumulates
+# them. Measured on case 285 (131.85 Mvox, the largest local volume), /usr/bin/time -v Maximum RSS,
+# one inference at a time:
+#     baseline                        8,343,784 KB / 8,314,352 KB   (noise floor 29,432 KB)
+#     MALLOC_MMAP_THRESHOLD_=131072   8,114,364 KB                  = -214,704 KB = -0.205 GB
+# 7x the noise floor, and it still pays on top of the predictor-lifetime fix (8,095,832 ->
+# 7,905,452 KB = -0.182 GB), so the two are close to additive.
+# Isolation: MALLOC_ARENA_MAX=2 alone measured 8,314,168 KB = EXACTLY baseline (0 effect), and
+# MALLOC_TRIM_THRESHOLD_/MALLOC_TOP_PAD_ added only 25 MB on top, so the mmap threshold owns the
+# whole win and is the only variable set here. In-process malloc_trim(0) at the same free points
+# measured 0.010 GB (see the previous commit) -- this env var is not the same lever, it prevents the
+# retention rather than trying to undo it.
+# Result-identical: case 285 -> labels [151, 152], 2 fragments, volumes 2,706,885 / 429,957 (both).
+# No throughput cost observed: that run was the FASTEST of the whole series (1:31 vs 1:40 / 1:53
+# baseline), though wall clock here is noisy because other jobs shared the host.
 
 # [v2.0 = v1.5 weights + target-family router]
 # Stage-A V301 fold_0 and Stage-B V308 fold_0 stay unchanged. A lightweight
