@@ -52,6 +52,34 @@ import numpy as np
 import SimpleITK as sitk
 
 
+def _malloc_trim() -> None:
+    """Hand glibc's freed arena blocks back to the OS.
+
+    [v3.9 mem] gc.collect() only drops Python references; glibc keeps the freed chunks in its
+    arena, so RSS often does not fall at all. The Grand Challenge limit is enforced on RSS, so
+    after a large free (a retired predictor, a retired full-volume buffer) we ask glibc to
+    actually return the pages.
+
+    DEFAULT OFF, because it MEASURED ZERO where it counts. On case 285 it moves the end-to-end
+    peak by 0.4 MB (7.650 -> 7.651 GiB) against a 2 MB run-to-run noise floor. The reason is
+    structural, not tuning: /usr/bin/time's "maximum resident set size" is VmHWM, which is
+    MONOTONIC. Trimming lowers RSS *now*, but the pages come straight back at the next
+    allocation, and a peak that has already been reached can never be un-reached. Trimming can
+    only ever help by making a LATER peak smaller -- and it does the opposite, since the freed
+    arena blocks it hands back are exactly what the next phase would otherwise have reused.
+    Kept behind a switch (not deleted) because it is free to leave in and the container's
+    allocator pressure differs; do not enable it without re-measuring.
+    Best-effort by design: on any libc without malloc_trim this is a silent no-op, never an error.
+    """
+    if os.environ.get("PENGWIN_MALLOC_TRIM", "0") != "1":
+        return
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — a memory optimisation must never take the container down
+        pass
+
+
 INPUT_DIR = Path(os.environ.get("PENGWIN_INPUT_DIR", "/input/images/peripelvic-fracture-ct"))
 OUTPUT_DIR = Path(os.environ.get("PENGWIN_OUTPUT_DIR", "/output/images/peripelvic-fracture-ct-segmentation"))
 
@@ -335,6 +363,24 @@ def build_predictor(dataset: str, trainer: str, plans: str, config: str,
     # weights into the network explicitly so this is correct on ANY nnUNet version.
     if getattr(predictor, "list_of_parameters", None):
         predictor.network.load_state_dict(predictor.list_of_parameters[0])
+        # [v3.9 mem] Drop the SECOND copy of the weights. list_of_parameters is nnUNet's stash of
+        # the raw checkpoint state_dict; the line above has just copied it into predictor.network,
+        # so from here on the pipeline carries 58.2M fp32 parameters TWICE (0.217 GiB each) for the
+        # entire lifetime of the predictor -- including the Stage-B sliding window, which is where
+        # peak RSS actually lands. Measured: clearing it drops RSS by 0.229 GiB (Stage-A) /
+        # 0.381 GiB (Stage-B), with the network's own weights bit-unchanged (w0sum 1.0791e+02
+        # before and after).
+        #
+        # SAFE because our custom path never reads it again: the only other readers in nnUNet 2.5.1
+        # are predict_logits_from_preprocessed_data / perform_actual_prediction
+        # (predict_from_raw_data.py:480/496), and this pipeline calls
+        # _predict_custom_logits_from_preprocessed_data instead, which reads predictor.network.
+        # If that ever changes, nnUNet would run with a RANDOMLY initialised network -- the same
+        # ~0-score speckle signature the block above exists to prevent -- so keep the two together.
+        # PENGWIN_FREE_CKPT_STASH=0 restores the old behaviour.
+        if os.environ.get("PENGWIN_FREE_CKPT_STASH", "1") == "1":
+            predictor.list_of_parameters = []
+            gc.collect()
     # DIAG: confirm the RIGHT architecture (STUNet, not ResEnc) + non-random weights loaded.
     # A wrong/random network here is exactly the 73%-one-class / thousands-of-CC garbage signature.
     try:
@@ -1149,6 +1195,20 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     slicer = None if bbox_used is None else bounding_box_to_slice(bbox_used)
     tb = tuple(int(a) for a in transpose_backward)
 
+    # [v3.9 mem] SEQUENTIAL MODEL RESIDENCY. Stage-A's predictor has produced its logits and the
+    # four scalars above are the last things anyone reads out of it (spacing + the two transpose
+    # lists). Everything below -- the channel-wise resample, the running argmax, the anatomy mask
+    # build -- allocates full-volume buffers and needs no model at all, so retire Ds539 HERE rather
+    # than ~160 lines further down (the old del site, just before Stage-B is built). That keeps the
+    # process at ZERO resident predictors across the argmax, which the phase trace names as the
+    # single largest rise in Stage-A (5.88 -> 6.98 GiB on case 285).
+    # PENGWIN_EARLY_FREE_STAGEA=0 restores the old, late del.
+    _early_free_stagea = os.environ.get("PENGWIN_EARLY_FREE_STAGEA", "1") == "1"
+    if _early_free_stagea:
+        del ds539_predictor
+        gc.collect()
+        _malloc_trim()
+
     if os.environ.get("PENGWIN_STAGEA_LOWMEM", "1") == "1":
         # [v3.6 mem] CHANNEL-WISE resample with a RUNNING ARGMAX.
         #
@@ -1304,7 +1364,13 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     # 무조건 del 하면 그 경로에서 UnboundLocalError 로 케이스가 통째로 실패한다 — 실제로 그렇게
     # 터졌고, 그 실패가 조용히 "메모리 적게 쓰고 빨리 끝난 실행"처럼 보였다.
     # (`del locals()[...]` 로는 지워지지 않는다 — locals() 는 함수 스코프에서 스냅샷이다.)
-    del ds539_predictor
+    # [v3.9 mem] the del moved ~160 lines up (see PENGWIN_EARLY_FREE_STAGEA); keep the old,
+    # late del as the fallback path so the env switch really does restore the previous behaviour.
+    # It must stay conditional: an unconditional `del` of an already-deleted local raises
+    # NameError and takes the whole case down.
+    if not _early_free_stagea:
+        del ds539_predictor
+        gc.collect()
     probs_full_axes = None
     argmax_axes = None
     argmax_map = None
@@ -1312,6 +1378,7 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _malloc_trim()
 
     # [v3.7 mem] Stage-B's LUT-normalised input, built HERE rather than before Stage-A so it does not
     # sit through the sliding-window prediction that dominates peak RSS. Only consumer is the
