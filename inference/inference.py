@@ -1264,7 +1264,14 @@ def _install_lowmem_resample() -> None:
     if _LOWMEM_RESAMPLE_DONE:
         return
     _LOWMEM_RESAMPLE_DONE = True
-    if os.environ.get("PENGWIN_LOWMEM_RESAMPLE", "1") != "1":
+    # [v3.9] DEFAULT OFF. Measured on case 285, container entrypoint, with every other v3.9 lever
+    # applied: ON 6,987,124 / 6,998,140 kB vs OFF 6,999,544 kB — i.e. ZERO, inside the run-to-run
+    # spread. It is not free of consequences either: float32 spline interpolation moves the Ds539
+    # argmax counts by 6-26 voxels versus the stock float64 path. Zero benefit for a numeric
+    # change is a bad trade on a submission, so the shipped default reproduces v3.8's arithmetic
+    # exactly. Kept behind PENGWIN_LOWMEM_RESAMPLE=1 because it is a working lever if the
+    # resampler ever becomes the binding allocation again.
+    if os.environ.get("PENGWIN_LOWMEM_RESAMPLE", "0") != "1":
         log("lowmem-resample: disabled by env (stock float64 path)")
         return
     try:
