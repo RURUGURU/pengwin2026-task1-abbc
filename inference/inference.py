@@ -48,6 +48,18 @@ import time
 import traceback
 from pathlib import Path
 
+# [v3.9 mem] MUST run before nnU-Net (or anything that imports it) is loaded: it defers the
+# training-only libraries nnU-Net drags in at import time (matplotlib/seaborn/nibabel), each of
+# which would otherwise stay RESIDENT for the whole run and add to the peak RSS. Lazy stubs, so
+# a wrong assumption costs the memory back, never correctness. PENGWIN_LEAN_IMPORTS=0 disables.
+try:
+    import lean_imports as _lean_imports
+
+    _lean_imports.install()
+except Exception as _exc:  # noqa: BLE001 - a memory optimisation must never take the container down
+    print(f"[pengwin] lean-imports: unavailable ({_exc}); continuing with the stock import set",
+          flush=True)
+
 import numpy as np
 import SimpleITK as sitk
 
