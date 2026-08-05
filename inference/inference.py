@@ -1542,6 +1542,7 @@ def main() -> int:
         #
         # bone-skeleton 분해는 pelvic ROI fallback 으로만 쓰이므로 여기서 미리 계산해
         # 넘긴다(femur 케이스에선 자연히 비어 무시된다). spacing 기반 분류는 사용하지 않는다.
+        _img_lps_for_bone = _arr_clipped_for_bone = None
         try:
             _img_lps_for_bone, _arr_clipped_for_bone = canonicalize_and_clip_image(ref_img)
             _sp_xyz = _img_lps_for_bone.GetSpacing()
@@ -1551,9 +1552,23 @@ def main() -> int:
                 hu_threshold=BONE_HU_THRESHOLD,
                 min_component_voxels=BONE_MIN_COMPONENT_VOXELS,
             )
+            # These two are full-volume copies and nothing below reads them again, but as locals of
+            # main() they stay alive for the whole run_per_anatomy call -- which recomputes the very
+            # same pair at its own top (canonicalize_and_clip_image). So the container carries the
+            # canonicalized image and the clipped array TWICE through Stage-A and Stage-B.
+            # Measured on case 285 (512x435x592, 132M voxels): 0.53 GB for the sitk image plus
+            # 0.53 GB for the float32 array = 1.06 GB of pure duplication at the peak.
+            # Dropping the references is result-identical by construction; run_per_anatomy builds
+            # its own copies from ref_img and never sees these.
         except Exception as bone_exc:  # noqa: BLE001
             log(f"bone-skeleton preroute failed ({bone_exc}); proceeding without fallback masks")
             prerouted_bone_masks = None
+        finally:
+            # Rebinding, not `del`: the names may be unbound if canonicalize_and_clip_image itself
+            # raised, and `del locals()[...]` does NOT free a function local in CPython.
+            _img_lps_for_bone = None
+            _arr_clipped_for_bone = None
+            gc.collect()
 
         out_path = output_path(image_path)
         # anatomies=None -> v2.0 target-family router when enabled, otherwise Ds539 volume route.
