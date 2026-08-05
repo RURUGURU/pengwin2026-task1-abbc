@@ -1025,6 +1025,32 @@ def route_from_target_family_router(image_path: Path,
 # ---------------------------------------------------------------------------
 # anatomy 별 Ds538 추론 파이프라인 (메인 로직).
 # ---------------------------------------------------------------------------
+_LOWMEM_RESAMPLE_DONE = False
+
+
+def _install_lowmem_resample() -> None:
+    """Switch nnUNet's resampling to float32 once, at the first prediction.
+
+    Installed here rather than at import time because nnunetv2 is imported lazily by
+    build_predictor, and here rather than in main() because the dev harness
+    (code_task1/experiments/eval_e2e.py) calls run_per_anatomy directly — patching in main() only
+    would mean every local memory measurement described a different pipeline than the container.
+    """
+    global _LOWMEM_RESAMPLE_DONE
+    if _LOWMEM_RESAMPLE_DONE:
+        return
+    _LOWMEM_RESAMPLE_DONE = True
+    if os.environ.get("PENGWIN_LOWMEM_RESAMPLE", "1") != "1":
+        log("lowmem-resample: disabled by env (stock float64 path)")
+        return
+    try:
+        import lowmem_resample
+        lowmem_resample.install(log=log)
+    except Exception as exc:  # noqa: BLE001
+        # Never let a memory optimisation take the container down; float64 merely costs RSS.
+        log(f"lowmem-resample: install failed ({exc}); continuing on the stock float64 path")
+
+
 def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
                     prerouted_bone_masks: dict | None = None,
                     anatomies: tuple[str, ...] | None = None) -> np.ndarray:
@@ -1045,6 +1071,7 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
     """
     import time
     t_start = time.time()
+    _install_lowmem_resample()
 
     # === Step 1: LPS 정규화 + bone window HU clip ===
     img_lps, arr_clipped = canonicalize_and_clip_image(ref_img)
