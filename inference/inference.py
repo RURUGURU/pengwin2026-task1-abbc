@@ -688,6 +688,107 @@ def resample_label_map_to_original(
 
 
 # ---------------------------------------------------------------------------
+# [v3.9 mem] SHARED anatomy label map instead of N full-volume boolean masks.
+#
+# Both anatomy decompositions used to return a dict of DENSE full-volume bool arrays, one per
+# anatomy, and both dicts stay alive as locals of run_per_anatomy for the whole run -- through
+# Stage-A prediction and the Stage-B predictor build, which is exactly where peak RSS lands.
+#   bone_skeleton_anatomy_decomposition : Sacrum / LeftHip / RightHip  = 3 bool volumes
+#   ds539_argmax_masks                  : Sacrum / LeftHip / RightHip / Femur = 4 bool volumes
+# At 132M voxels (case 285) a bool volume is 0.123 GiB, so that is 0.86 GiB of resident memory
+# holding 7 mutually EXCLUSIVE indicator arrays.
+#
+# They are disjoint by construction:
+#   * the bone masks are three DISTINCT connected components of one ndi.label output;
+#   * the Ds539 masks are `argmax_map == ch` (one label per voxel) further eroded by an opening
+#     and a small-CC drop, and erosion of disjoint sets keeps them disjoint.
+# So one uint8 code map carries the same information in 0.123 GiB total. The masks become lazy
+# views over that shared map; `.sum()` / `.any()` answer from a precomputed count without
+# materialising anything, and anything that genuinely needs an ndarray (bbox, ndi.label, the
+# Stage-B crop) gets a real bool array via np.asarray exactly as before -- one at a time.
+#
+# PENGWIN_MASK_LABELMAP=0 restores the old dense-bool behaviour verbatim.
+# ---------------------------------------------------------------------------
+def _mask_labelmap_enabled() -> bool:
+    return os.environ.get("PENGWIN_MASK_LABELMAP", "1") == "1"
+
+
+class LabelMapMaskView:
+    """A boolean full-volume mask stored as ONE code inside a shared uint8 label map.
+
+    Implements just enough of the ndarray surface that the pipeline's mask consumers keep
+    working unchanged: `np.asarray(view)` / `np.asarray(view, dtype=bool)` materialise the
+    bool array on demand, `.sum()` and `.any()` are O(1) from the precomputed voxel count,
+    and `view[slices]` crops without materialising the whole volume.
+    """
+
+    __slots__ = ("_lbl", "_code", "_count")
+
+    def __init__(self, lbl: np.ndarray, code: int, count: int):
+        self._lbl = lbl
+        self._code = int(code)
+        self._count = int(count)
+
+    # --- ndarray-ish metadata -------------------------------------------------
+    @property
+    def shape(self):
+        return self._lbl.shape
+
+    @property
+    def ndim(self):
+        return self._lbl.ndim
+
+    @property
+    def size(self):
+        return self._lbl.size
+
+    @property
+    def dtype(self):
+        return np.dtype(bool)
+
+    # --- materialisation ------------------------------------------------------
+    def __array__(self, dtype=None, *args, **kwargs):
+        arr = (self._lbl == self._code)
+        if dtype is not None and np.dtype(dtype) != np.dtype(bool):
+            arr = arr.astype(dtype, copy=False)
+        return arr
+
+    def astype(self, dtype, **kwargs):
+        return np.asarray(self).astype(dtype, **kwargs)
+
+    def __getitem__(self, idx):
+        return self._lbl[idx] == self._code
+
+    # --- cheap reductions (the reason this class exists) ----------------------
+    # The O(1) shortcut is only valid for a WHOLE-ARRAY reduction. If a caller ever asks for a
+    # reduction along an axis (or into an `out=`), fall back to the real numpy call on a
+    # materialised array -- a wrong answer here would be silent, and silence is the failure mode
+    # this whole memory workstream keeps getting burned by.
+    def sum(self, axis=None, *args, **kwargs):
+        if axis is None and not args and not kwargs:
+            return self._count
+        return np.asarray(self).sum(axis, *args, **kwargs)
+
+    def any(self, axis=None, *args, **kwargs):
+        if axis is None and not args and not kwargs:
+            return self._count > 0
+        return np.asarray(self).any(axis, *args, **kwargs)
+
+    def __bool__(self):
+        # `if mask:` on a real ndarray raises; keep that contract rather than silently
+        # answering something different from numpy.
+        raise ValueError("truth value of a LabelMapMaskView is ambiguous; use .any()")
+
+    def __repr__(self):
+        return f"<LabelMapMaskView code={self._code} count={self._count} shape={self._lbl.shape}>"
+
+
+def _as_bool_array(mask) -> np.ndarray:
+    """Real bool ndarray for `mask`, no copy when it already is one."""
+    return np.asarray(mask, dtype=bool)
+
+
+# ---------------------------------------------------------------------------
 # V0.3 견고화된 anatomy ROI 추출 헬퍼 (4-layer 파이프라인용).
 # ---------------------------------------------------------------------------
 def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
@@ -788,13 +889,26 @@ def bone_skeleton_anatomy_decomposition(arr_clipped, spacing_zyx,
     else:
         lefthip_cc = righthip_cc = None
 
-    masks = {}
-    if sacrum_cc is not None:
-        masks['Sacrum'] = (labels == sacrum_cc['cc_id'])
-    if lefthip_cc is not None:
-        masks['LeftHip'] = (labels == lefthip_cc['cc_id'])
-    if righthip_cc is not None:
-        masks['RightHip'] = (labels == righthip_cc['cc_id'])
+    picked = [(name, cc) for name, cc in (('Sacrum', sacrum_cc),
+                                          ('LeftHip', lefthip_cc),
+                                          ('RightHip', righthip_cc)) if cc is not None]
+    if _mask_labelmap_enabled():
+        # [v3.9 mem] ONE uint8 code map instead of up to three full-volume bool masks.
+        # The three cc_ids are distinct by construction (sacrum is removed from `remaining`
+        # before the hips are picked), so a LUT over `labels` cannot make them overlap: every
+        # voxel gets exactly one code. Sizes are already known from `sizes` above, so the views
+        # answer .sum()/.any() without ever touching the volume.
+        lut = np.zeros(int(n_cc) + 1, dtype=np.uint8)
+        for code, (_name, cc) in enumerate(picked, start=1):
+            lut[cc['cc_id']] = code
+        anat_lbl = lut[labels]          # single uint8 full volume, no bool temporaries
+        masks = {}
+        for code, (name, cc) in enumerate(picked, start=1):
+            masks[name] = LabelMapMaskView(anat_lbl, code, int(cc['size']))
+    else:
+        masks = {}
+        for name, cc in picked:
+            masks[name] = (labels == cc['cc_id'])
     log(f"bone-skeleton: {len(masks)} anatomies extracted ({list(masks.keys())})")
     return masks
 
@@ -824,6 +938,12 @@ def ds539_argmax_masks(probs_full, is_argmax=False):
     masks = {}
     structure = np.ones((2, 2, 2), dtype=bool)
     cc_struct = np.ones((3, 3, 3), dtype=bool)
+    # [v3.9 mem] ONE shared uint8 code map for all four anatomies instead of four full-volume
+    # bool arrays (0.49 GiB at 132M voxels, of which up to three are ALL-ZERO on a single-family
+    # scan and still fully resident). Legal because `cleaned` for channel c is a subset of
+    # `argmax_map == c`, and argmax assigns each voxel exactly one channel.
+    use_labelmap = _mask_labelmap_enabled()
+    ds_lbl = np.zeros(argmax_map.shape, dtype=np.uint8) if use_labelmap else None
     for anatomy, ch_idx in DS539_PROB_CHANNEL.items():
         raw_mask = (argmax_map == ch_idx)
         # Morphology cleanup: opening 으로 얇거나 고립된 노이즈를 제거한다
@@ -844,9 +964,31 @@ def ds539_argmax_masks(probs_full, is_argmax=False):
         elif n_cc == 1:
             if int(cleaned.sum()) < MIN_DS539_CC_VOXELS:
                 cleaned = np.zeros_like(cleaned)
-        masks[anatomy] = cleaned
-        log(f"Ds539 argmax: {anatomy} raw={int(raw_mask.sum())} cleaned={int(cleaned.sum())} "
+        n_cleaned = int(cleaned.sum())
+        if use_labelmap:
+            # ch_idx is already unique per anatomy (1=Sacrum, 2=LeftHip, 3=RightHip, 4=Femur) and
+            # never 0, so it doubles as the code. Writing only where `cleaned` is True cannot
+            # clobber another anatomy: the cleaned sets are disjoint (see the note above).
+            if n_cleaned:
+                ds_lbl[cleaned] = ch_idx
+            masks[anatomy] = LabelMapMaskView(ds_lbl, ch_idx, n_cleaned)
+            del cleaned
+        else:
+            masks[anatomy] = cleaned
+        log(f"Ds539 argmax: {anatomy} raw={int(raw_mask.sum())} cleaned={n_cleaned} "
             f"({n_cc} CCs, drop<{MIN_DS539_CC_VOXELS})")
+        del raw_mask
+    if use_labelmap:
+        # Disjointness audit, log-only: if the four cleaned sets ever overlapped, a later channel
+        # would have overwritten an earlier one and the code map would hold FEWER nonzero voxels
+        # than the counts the views report. One uint8 scan, no allocation.
+        _written = int(np.count_nonzero(ds_lbl))
+        _claimed = sum(int(m.sum()) for m in masks.values())
+        if _written != _claimed:
+            log(f"WARN Ds539 label-map overlap: {_claimed - _written} voxels claimed twice "
+                f"(written={_written} claimed={_claimed}) — masks are NOT disjoint")
+        else:
+            log(f"Ds539 label-map: {_written} voxels, 4 anatomies disjoint (audit OK)")
     return masks
 
 
@@ -1353,7 +1495,7 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
                     continue  # bone-skeleton confirms this side is real -> keep
                 bmo, dma = bone_masks.get(other), ds539_masks.get(a)
                 if bmo is not None and bmo.any() and dma is not None and dma.any():
-                    inter = int(np.logical_and(dma, bmo).sum())
+                    inter = int(np.logical_and(_as_bool_array(dma), _as_bool_array(bmo)).sum())
                     if inter > 0.5 * float(dma.sum()):
                         routed.remove(a)
                         log(f"L2b -laterality: drop {a} (Ds539 mask {inter/max(1,int(dma.sum()))*100:.0f}% "
@@ -1415,7 +1557,11 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
             log(f"[{anatomy}] no usable mask, emit zero")
             continue
 
-        mask = info['mask']
+        # [v3.9 mem] `info['mask']` may be a LabelMapMaskView over the shared uint8 code map.
+        # Everything below (ndi.label, ndi.sum, bbox_from_mask, the crop) wants a real ndarray,
+        # and materialising ONCE here keeps exactly one dense bool volume alive -- the same
+        # single array the old dense-dict code held at this point.
+        mask = _as_bool_array(info['mask'])
         # Routing CC policy (ablatable via PENGWIN_ROUTE_CC_MODE; default 'largest' = deployed
         # v1.3.x behaviour). The largest-CC-only policy is a suspected recall lever: a DISPLACED
         # fracture fragment forms its own CC and is dropped before Stage-B, so its instance is lost.
@@ -1595,7 +1741,7 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
             other = np.zeros(img_shape, dtype=bool)
             for _a, _inf in merged.items():
                 if _a != anatomy and _inf.get('mask') is not None:
-                    other |= np.asarray(_inf['mask']).astype(bool)
+                    other |= _as_bool_array(_inf['mask'])
             ob = other[bbox]
             if ob.shape == write_mask.shape:
                 write_mask = write_mask & ~ob
