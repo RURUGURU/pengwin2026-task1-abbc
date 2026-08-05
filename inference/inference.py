@@ -952,10 +952,32 @@ def ds539_argmax_masks(probs_full, is_argmax=False):
                                           iterations=DS539_MORPH_OPENING_ITERS)
         else:
             cleaned = raw_mask
+        # [v3.9 mem] raw_mask is only needed for the log line below; keep the COUNT, drop the
+        # full-volume bool before ndi.label allocates an int32 volume of the same shape.
+        # (When opening is disabled `cleaned` IS `raw_mask`, so nothing can be freed there.)
+        raw_count = int(raw_mask.sum())
+        # Always drop the NAME. If `cleaned is raw_mask` (opening disabled) the array survives via
+        # `cleaned`; otherwise the full-volume bool is freed here, before ndi.label allocates an
+        # int32 volume of the same shape. Dropping the name unconditionally also means the shared
+        # label-map path below can release the last reference with its own `del cleaned`.
+        del raw_mask
         # 작은 CC 제거 (Ds539 sparse outlier)
         cc_labels, n_cc = ndi.label(cleaned, structure=cc_struct)
         if n_cc > 1:
-            sizes = ndi.sum(cleaned, cc_labels, index=np.arange(1, n_cc + 1))
+            # [v3.9 mem] chunked np.bincount instead of ndi.sum(cleaned, cc_labels, index=...).
+            # scipy's ndi.sum goes through _stats -> np.bincount on the WHOLE volume at once, which
+            # casts the int32 label volume to intp (int64, 2x) and the bool weights to float64 (8x).
+            # On case 285 (131.85 Mvox) that measured +1.474 GiB of VmHWM for a result that is a
+            # handful of integers -- it was the single largest transient in Stage-A.
+            #
+            # Bit-identical, not approximately: cc_labels comes from ndi.label(cleaned), so a voxel
+            # has a non-zero label IFF cleaned is True there. Summing the bool weights over a label
+            # region is therefore exactly counting that label's voxels, which is what bincount does.
+            # Verified np.array_equal against the ndi.sum result.
+            counts = np.zeros(n_cc + 1, dtype=np.int64)
+            for _z0 in range(0, cc_labels.shape[0], 32):
+                counts += np.bincount(cc_labels[_z0:_z0 + 32].ravel(), minlength=n_cc + 1)
+            sizes = counts[1:]
             keep_ids = np.where(sizes >= MIN_DS539_CC_VOXELS)[0] + 1
             if len(keep_ids) > 0:
                 cleaned = np.isin(cc_labels, keep_ids)
@@ -965,6 +987,9 @@ def ds539_argmax_masks(probs_full, is_argmax=False):
             if int(cleaned.sum()) < MIN_DS539_CC_VOXELS:
                 cleaned = np.zeros_like(cleaned)
         n_cleaned = int(cleaned.sum())
+        # [v3.9 mem] the int32 label volume (0.491 GiB on 285) is dead here; without this it stays
+        # alive through the NEXT anatomy's raw_mask + binary_opening + ndi.label.
+        del cc_labels
         if use_labelmap:
             # ch_idx is already unique per anatomy (1=Sacrum, 2=LeftHip, 3=RightHip, 4=Femur) and
             # never 0, so it doubles as the code. Writing only where `cleaned` is True cannot
@@ -975,9 +1000,8 @@ def ds539_argmax_masks(probs_full, is_argmax=False):
             del cleaned
         else:
             masks[anatomy] = cleaned
-        log(f"Ds539 argmax: {anatomy} raw={int(raw_mask.sum())} cleaned={n_cleaned} "
+        log(f"Ds539 argmax: {anatomy} raw={raw_count} cleaned={n_cleaned} "
             f"({n_cc} CCs, drop<{MIN_DS539_CC_VOXELS})")
-        del raw_mask
     if use_labelmap:
         # Disjointness audit, log-only: if the four cleaned sets ever overlapped, a later channel
         # would have overwritten an earlier one and the code map would hold FEWER nonzero voxels
@@ -1386,29 +1410,45 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         #     because argmax is taken along the channel axis, which the transpose never touches.
         # Verified byte-identical against the old path on real cases before shipping.
         # PENGWIN_STAGEA_LOWMEM=0 restores the original code path.
+        # [v3.9 mem] The running argmax now lives on the CROP grid, and the per-channel compare is
+        # slab-wise. Two changes, both provably result-identical:
+        #   * The old loop pasted every resampled channel into a full-volume float32 zeros array
+        #     (`full_ch`) so it could be compared against a full-volume `best`. But outside the crop
+        #     bbox all five channels are exactly 0.0, `>` is strict, and argmax_axes starts at 0, so
+        #     those voxels can only ever come out as channel 0 = background -- which is what the
+        #     comment above already argues. Comparing on the crop grid and leaving the rest of
+        #     argmax_axes at its initial 0 gives the same label map, while never allocating the
+        #     full-volume float32 paste buffer (0.491 GiB on case 285) nor holding it alongside the
+        #     resampler's own output.
+        #   * `better = full_ch > best; best[better] = full_ch[better]; argmax_axes[better] = ch`
+        #     allocated a full-volume bool (0.123 GiB) PLUS two fancy-index gathers whose size is
+        #     data-dependent (up to another full volume). np.copyto(..., where=) over 32-slice slabs
+        #     copies exactly the same elements with slab-sized temporaries.
         best = None
         argmax_axes = np.zeros(shape_before_cropping, dtype=np.uint8)
+        argmax_crop = argmax_axes if slicer is None else argmax_axes[slicer]  # basic slicing -> VIEW
         for ch in range(DS539_OUTPUT_CHANNELS):
             ch_res = resample_data_or_seg_to_shape(
                 ds539_probs_pp[ch:ch + 1],
                 shape_after_cropping, current_spacing, original_spacing,
                 is_seg=False, order=1, order_z=0,
             )
-            if slicer is None:
-                full_ch = np.asarray(ch_res, dtype=np.float32)[0]
-            else:
-                full_ch = np.zeros(shape_before_cropping, dtype=np.float32)
-                full_ch[slicer] = np.asarray(ch_res, dtype=np.float32)[0]
+            cur = np.asarray(ch_res, dtype=np.float32)[0]
             del ch_res
             if best is None:
-                best = full_ch                      # channel 0 seeds both running arrays
+                best = cur                          # channel 0 seeds the running max
+                assert best.shape == argmax_crop.shape, f"{best.shape} vs {argmax_crop.shape}"
             else:
-                better = full_ch > best             # strict: ties keep the LOWER channel, as argmax does
-                best[better] = full_ch[better]
-                argmax_axes[better] = ch
-                del full_ch, better
+                for _z0 in range(0, best.shape[0], 32):
+                    _sl = slice(_z0, _z0 + 32)
+                    _b, _c = best[_sl], cur[_sl]
+                    _better = _c > _b               # strict: ties keep the LOWER channel, as argmax does
+                    np.copyto(_b, _c, where=_better)
+                    np.copyto(argmax_crop[_sl], np.uint8(ch), where=_better)
+                    del _b, _c, _better
+                del cur
             gc.collect()
-        del ds539_probs_pp, best
+        del ds539_probs_pp, best, argmax_crop
         gc.collect()
         argmax_map = np.transpose(argmax_axes, tb)
         assert argmax_map.shape == img_shape, f"shape mismatch: {argmax_map.shape} vs {img_shape}"
