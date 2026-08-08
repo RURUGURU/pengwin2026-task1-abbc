@@ -141,6 +141,21 @@ DS538_PLANS = "nnUNetResEncUNetLPlans"
 DS538_CONFIG = "3d_fullres"
 DS538_FOLD = os.environ.get("PENGWIN_DS538_FOLD", "0")  # int-string or "all" (fold_all); default "0" = v1.5
 DS538_OUTPUT_CHANNELS = int(os.environ.get("PENGWIN_DS538_OUT_CH", "4"))  # ABBC 4ch (V302); 13 for V307 affinity head (4 ABBC + 9 affinity)
+# [v3.10 port] Per-anatomy Stage-B specialists, from a teammate's v3.5 package. DEFAULT-NEUTRAL: the
+# comprehension filters on trainer.strip(), so with none of these set this is {} and the .get() below
+# degenerates to the single deployed DS538_TRAINER -- byte-identical to v3.9's single-build path.
+# Their experts share one V308 checkpoint with the encoder frozen and only the decoder + ABBC/affinity
+# heads tuned for 1-3 epochs, so the architecture is identical and the ordinary loader takes them.
+DS538_EXPERT_TRAINERS = {
+    anatomy: trainer
+    for anatomy, trainer in {
+        "Sacrum": os.environ.get("PENGWIN_DS538_TRAINER_SACRUM", ""),
+        "LeftHip": os.environ.get("PENGWIN_DS538_TRAINER_HIP", ""),
+        "RightHip": os.environ.get("PENGWIN_DS538_TRAINER_HIP", ""),
+        "Femur": os.environ.get("PENGWIN_DS538_TRAINER_FEMUR", ""),
+    }.items()
+    if trainer.strip()
+}
 CHECKPOINT_NAME = "checkpoint_best.pth"
 
 # --- anatomy contract (anatomy_registry 와 일치).
@@ -1588,9 +1603,12 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         ct_lut_full = bone_lut_normalize(arr_clipped)
 
     # === Layer 4: anatomy 별 Ds538 추론 → ABBC decode → 전체 라벨에 paste ===
-    ds538_predictor = build_predictor(
-        DS538_DATASET, DS538_TRAINER, DS538_PLANS, DS538_CONFIG, DS538_FOLD,
-    )
+    # [v3.10 port] Built lazily so a routed anatomy can request its specialist. With no expert env
+    # set this resolves to DS538_TRAINER on the first anatomy and is reused for the rest, i.e. the
+    # single build v3.9 did -- only later, after the per-anatomy time-budget check rather than before
+    # it, which shifts a few seconds of model-load time out of the first anatomy's 480 s budget.
+    ds538_predictor = None
+    active_ds538_trainer = None
 
     full_label = np.zeros(img_shape, dtype=np.uint16)
     for anatomy in anatomies:
@@ -1621,13 +1639,33 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
             cc_labels, n_cc = ndi.label(mask, structure=np.ones((3,3,3), dtype=bool))
             if n_cc > 1:
                 sizes = ndi.sum(mask, cc_labels, index=np.arange(1, n_cc+1))
+                largest_id = int(np.argmax(sizes)) + 1
                 if _cc_mode == "floor":
                     min_vox = int(os.environ.get("PENGWIN_ROUTE_CC_MIN_VOX", str(MIN_COMPONENT_VOXELS)))
-                    keep = [i + 1 for i, s in enumerate(sizes) if s >= min_vox] or [int(np.argmax(sizes)) + 1]
+                    keep = [i + 1 for i, s in enumerate(sizes) if s >= min_vox] or [largest_id]
                     mask = np.isin(cc_labels, keep)
+                elif _cc_mode == "dynamic":
+                    # [v3.10 port] The teammate's completeness gate. Keep the largest component, and
+                    # additionally keep a disconnected one only when BOTH its physical volume and its
+                    # ratio to the largest are plausible for a fragment the scorer would evaluate.
+                    # Two conditions rather than one because a voxel floor alone is not spacing-aware:
+                    # it admits noise on fine grids and rejects real fragments on coarse ones.
+                    # Thresholds are their pre-registered defaults.
+                    _mm3 = float(os.environ.get("PENGWIN_COMPLETENESS_MIN_CC_MM3", "500"))
+                    _ratio = float(os.environ.get("PENGWIN_COMPLETENESS_MIN_CC_RATIO", "0.002"))
+                    _vox_mm3 = float(np.prod(np.asarray(spacing_zyx, dtype=np.float64)))
+                    _largest = float(sizes[largest_id - 1])
+                    keep = [largest_id]
+                    for _i, _s in enumerate(sizes, start=1):
+                        if _i == largest_id:
+                            continue
+                        if float(_s) * _vox_mm3 >= _mm3 and float(_s) / max(_largest, 1.0) >= _ratio:
+                            keep.append(_i)
+                    keep.sort()
+                    mask = np.isin(cc_labels, keep)
+                    log(f"[{anatomy}] completeness gate: {n_cc} CCs -> kept {len(keep)}")
                 else:  # 'largest' (default)
-                    keep_idx = int(np.argmax(sizes)) + 1
-                    mask = (cc_labels == keep_idx)
+                    mask = (cc_labels == largest_id)
         # 'union' leaves the multi-CC mask untouched so bbox_from_mask spans every fragment.
 
         bbox = bbox_from_mask(mask, pad_vox=ROI_PAD_VOX)
@@ -1658,6 +1696,22 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
         # Stage-A anatomy probability into Stage-B. The bbox above still uses the Ds539 prob for
         # localization (cascade routing), but the model input is now pure CT.
         ct_lut_crop = ct_lut_full[bbox]
+        desired_ds538_trainer = DS538_EXPERT_TRAINERS.get(anatomy, DS538_TRAINER)
+        if desired_ds538_trainer != active_ds538_trainer:
+            # Exactly ONE Stage-B network resident at a time. Anatomies are processed sequentially,
+            # so holding three 334 MB specialists at once would buy nothing and would reintroduce the
+            # memory pressure this release exists to remove.
+            if ds538_predictor is not None:
+                del ds538_predictor
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            ds538_predictor = build_predictor(
+                DS538_DATASET, desired_ds538_trainer, DS538_PLANS, DS538_CONFIG, DS538_FOLD,
+            )
+            active_ds538_trainer = desired_ds538_trainer
+            log(f"[{anatomy}] Stage-B trainer -> {desired_ds538_trainer}")
+
         ds538_image_4d = ct_lut_crop[None]  # (1, Z, Y, X)
         ds538_props = {"spacing": list(spacing_zyx)}
 

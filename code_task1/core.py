@@ -2160,4 +2160,30 @@ class PengwinTrainerSTUNetBaseAffinityV308(PengwinTrainerSTUNetBaseABBCPhase1V30
         # per-epoch instance proxy + shape-check use the ABBC channels only; affinity decode is offline.
         return logits[:, :4]
 
+# --- teammate v3.5 anatomy specialists: INFERENCE ALIASES ONLY ---------------
+# 팀원의 expert 는 같은 V308 체크포인트에서 encoder 를 얼리고 decoder + ABBC/affinity 헤드만
+# 1~3에폭 튜닝한 것이라 **아키텍처가 V308 과 바이트 동일**하다(13채널, deep supervision off).
+# nnU-Net predictor 는 `build_network_architecture` 를 호출할 클래스가 존재하기만 하면 되므로,
+# 아무것도 더하지 않는 서브클래스로 그들의 가중치를 로드하는 것이 충분하고 정확하다.
+# 그들의 학습 로직(frozen-encoder SGD, 부위별 케이스 필터링)은 여기 재현하지 않는다 —
+# 재학습할 때만 의미가 있고, 우리는 그들의 **체크포인트를 평가/배포**하는 것이다.
+# 실측: 세 expert 는 서로 decoder |w| 합의 6번째 소수자리에서만 다르다
+# (1.473213 / 1.473209 / 1.473229 e+05) — 1~3에폭 decoder-only 튜닝과 일치한다.
+#
+# 🔴 이 클래스들이 없으면 `pengwin_trainers_shim` 이 이름을 re-export 하지 못해
+#    nnU-Net 의 trainer discovery 가 실패하고 컨테이너가 로드 단계에서 죽는다.
+#    정본(`code_task1/core/stage2_fracture.py:417-433`)에는 있었으나 배포 미러에는 빠져 있었다.
+class PengwinTrainerSTUNetBaseAffinityV308DeployedVal(PengwinTrainerSTUNetBaseAffinityV308):
+    """팀원의 unified V308 fallback 체크포인트 로딩용 별칭."""
 
+
+class PengwinTrainerSTUNetBaseAffinityV308SacrumExpertDeployedVal(PengwinTrainerSTUNetBaseAffinityV308):
+    """팀원의 Sacrum 전문가 로딩용 별칭."""
+
+
+class PengwinTrainerSTUNetBaseAffinityV308HipExpertDeployedVal(PengwinTrainerSTUNetBaseAffinityV308):
+    """팀원의 Left/Right Hip 공용 전문가 로딩용 별칭."""
+
+
+class PengwinTrainerSTUNetBaseAffinityV308FemurExpertDeployedVal(PengwinTrainerSTUNetBaseAffinityV308):
+    """팀원의 Femur 전문가 로딩용 별칭."""

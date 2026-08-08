@@ -41,6 +41,10 @@ RUN pip install --upgrade pip && \
 COPY inference /opt/app/inference
 COPY code_task1 /opt/app/code_task1
 
+# 빌드 컨텍스트가 호스트의 빡빡한 권한(예: 0600)을 그대로 보존할 수 있다. GC 이미지는 비root
+# 서비스 사용자로 돌아가므로, 체크아웃 umask 에 의존하지 말고 복사된 소스 권한을 정규화한다.
+RUN chmod -R a+rX /opt/app/inference /opt/app/code_task1
+
 # --- nnUNet trainer-discovery shim -----------------------------------------
 # nnUNet v2 discovers trainer classes by walking
 # `nnunetv2/training/nnUNetTrainer/`. Our PengwinTrainer*ABBCV291 lives in
@@ -100,15 +104,39 @@ ENV PENGWIN_ROOT=/opt/ml/model \
 # be present at /opt/ml/model/stage1_router/stage1_target_router_fold0.joblib.
 # PENGWIN_TARGET_ROUTER=1 fails fast if the artifact is missing, which avoids a
 # silent fallback to the older Ds539 volume-ratio route.
-ENV PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308 \
+# [v3.11 = v3.9 메모리 경로 + 팀원 v3.5 의 always-expert 런타임 설정]
+#
+# 이 ENV 는 GC Final Test 에서 **MP 13.6 (팀 3위)** 를 실제로 낸 구성이다
+# (`submission_task1/teammate_v35_package/MODEL_MANIFEST.json` 의 `runtime` 블록과 동일).
+# 우리 v3.6 배포(PENGWIN_AGGLO_T=0.45 / femur 0.15, unified Stage-B)는 같은 보드에서 16.4 였다.
+#
+# 바뀌는 것은 **가중치 선택과 T 뿐**이고 코드 경로는 v3.9 그대로다:
+#   · Stage-B 를 부위별 전문가로 (Sacrum / 좌우Hip 공용 / Femur, 전부 v3.4 TotalSegmentator-base
+#     V308 에서 encoder 를 얼리고 decoder+헤드만 1~3에폭 튜닝한 것)
+#   · AGGLO_T 0.45 → 0.75, femur override 제거 (팀원은 부위 구분 없이 0.75 하나)
+#   · RF family 라우터 유지 + confidence margin 0.15
+#
+# ⚠️ model.tar.gz 는 반드시 팀원 번들이어야 한다 —
+#    sha256 049c38ea4abf1629a4d5f79a68a27918fd4103941fbf4f500b76211e93192919 (1,409,476,486 B).
+#    우리 v3_0 번들에는 expert 체크포인트가 없어서 로드에 실패한다.
+# ⚠️ 아래 fallback(`...V308DeployedVal`)은 4개 부위가 전부 전문가로 매핑되므로 도달하지 않는다.
+#    도달하면 그 이름의 체크포인트가 번들에 없어 실패하므로, 로그에서 부위별 트레이너 이름을 확인할 것.
+ENV PENGWIN_DS539_TRAINER=PengwinTrainerSTUNetBaseAnatomyV301 \
+    PENGWIN_DS539_FOLD=0 \
+    PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308DeployedVal \
+    PENGWIN_DS538_TRAINER_SACRUM=PengwinTrainerSTUNetBaseAffinityV308SacrumExpertDeployedVal \
+    PENGWIN_DS538_TRAINER_HIP=PengwinTrainerSTUNetBaseAffinityV308HipExpertDeployedVal \
+    PENGWIN_DS538_TRAINER_FEMUR=PengwinTrainerSTUNetBaseAffinityV308FemurExpertDeployedVal \
     PENGWIN_DS538_FOLD=0 \
     PENGWIN_DS538_OUT_CH=13 \
     PENGWIN_AFFINITY_DECODE=1 \
-    PENGWIN_AGGLO_T=0.45 \
-    PENGWIN_AGGLO_T_FEMUR=0.15 \
+    PENGWIN_AGGLO_T=0.75 \
     PENGWIN_FUSION_DECODE=0 \
     PENGWIN_STAGEA_BONE_RECONCILE=0 \
+    PENGWIN_ROUTE_CC_MODE=largest \
+    PENGWIN_CLICK_INJECT=0 \
     PENGWIN_TARGET_ROUTER=1 \
+    PENGWIN_RF_CONF_MARGIN=0.15 \
     PENGWIN_TARGET_ROUTER_PATH=/opt/ml/model/stage1_router/stage1_target_router_fold0.joblib
 
 # Grand Challenge security policy: container must not run as root.
