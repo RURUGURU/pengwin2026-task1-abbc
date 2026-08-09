@@ -1785,6 +1785,43 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
                 if anatomy in ("Femur", "LeftFemur", "RightFemur"):
                     _T = float(os.environ.get("PENGWIN_AGGLO_T_FEMUR", str(_T)))
                 decoded_pp = decode_affinity_agglo(_abbc, _aff, T=_T)
+
+                # [2026-08-09] 적응형 대퇴골 T — **조건부 2차 디코드**, 전역 되돌림이 아니다.
+                #
+                # 왜: GC 케이스별 실측에서 v3.6 -> v3.11 이 대퇴골 3건을 파괴했다
+                #     497  0.564 -> 0.000   483  0.724 -> 0.463   438  0.707 -> 0.508  (얻은 건 0건)
+                # v3.11 은 `PENGWIN_AGGLO_T_FEMUR=0.15` 를 **삭제**해서 대퇴골 T 가 0.15 -> 0.75 로
+                # 뛰었다(0.45->0.75 가 아니다). 그런데 T 를 통째로 되돌리면 split 5위·topology 1위를
+                # 잃어 **MP 15.60 -> 19.60 (+4.0 악화)** 다. 되돌리면 안 된다.
+                # 그래서 0.75 를 1차로 유지하고, 그 결과가 **의심스러울 때만** 낮은 T 로 다시 디코드해
+                # 더 나은 쪽을 쓴다. 조건이 안 걸리면 바이트 단위로 기존 동작과 같다.
+                #
+                # 의심 기준 두 가지 (실측된 두 실패 모드에 각각 대응):
+                #   (a) 인스턴스 0개      -> 497 류 통째 실패. evaluator 의 빈-출력 페널티 경로에 빠진다
+                #       (dice=0 인 79행 전부가 assd == hd95/2 를 정확히 만족, dice>0 인 10,087행 중 0건)
+                #   (b) 인스턴스 1개인데 전경이 크다 -> 483/438 류 과병합. 큰 대퇴골 덩어리가 통으로 남았다
+                _fa = os.environ.get("PENGWIN_FEMUR_ADAPTIVE_T", "")
+                if _fa and anatomy in ("Femur", "LeftFemur", "RightFemur"):
+                    try:
+                        _n = len(set(int(v) for v in np.unique(decoded_pp)) - {0})
+                        _fg = int((decoded_pp > 0).sum())
+                        _big = int(os.environ.get("PENGWIN_FEMUR_ADAPTIVE_MINVOX", "150000"))
+                        _susp = (_n == 0) or (_n == 1 and _fg >= _big)
+                        if _susp:
+                            _T2 = float(_fa)
+                            _alt = decode_affinity_agglo(_abbc, _aff, T=_T2)
+                            _n2 = len(set(int(v) for v in np.unique(_alt)) - {0})
+                            # 더 나은 쪽만 채택한다. 재디코드가 여전히 비었으면 원본을 지킨다.
+                            if _n2 > _n:
+                                decoded_pp = _alt
+                                log(f"[femur-adaptive:{anatomy}] T {_T}->{_T2} 채택 "
+                                    f"(인스턴스 {_n}->{_n2}, 전경 {_fg}vox)")
+                            else:
+                                log(f"[femur-adaptive:{anatomy}] T {_T2} 재디코드가 개선 없음 "
+                                    f"({_n}->{_n2}) -> 원본 유지")
+                        # 의심 아님 -> 아무것도 하지 않는다 (기존 동작과 동일)
+                    except Exception as _e:   # 절대 파이프라인을 죽이지 않는다
+                        log(f"[femur-adaptive:{anatomy}] 실패 ({_e}) -> 원본 유지")
         else:
             ds538_probs = softmax_axis0(ds538_logits_pp)
             _dump_dir = os.environ.get("PENGWIN_DUMP_PROBS", "")
