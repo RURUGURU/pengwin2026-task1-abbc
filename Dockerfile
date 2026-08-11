@@ -139,7 +139,9 @@ ENV PENGWIN_DS539_TRAINER=PengwinTrainerSTUNetBaseAnatomyV301 \
     PENGWIN_CLICK_INJECT=0 \
     PENGWIN_TARGET_ROUTER=1 \
     PENGWIN_RF_CONF_MARGIN=0.15 \
-    PENGWIN_TARGET_ROUTER_PATH=/opt/ml/model/stage1_router/stage1_target_router_fold0.joblib
+    PENGWIN_TARGET_ROUTER_PATH=/opt/ml/model/stage1_router/stage1_target_router_fold0.joblib \
+    PENGWIN_AGGLO_SEED_FEMUR=ridge \
+    PENGWIN_AGGLO_SEED_RIDGE_T=0.20
 
 # Grand Challenge security policy: container must not run as root.
 # Create a service user with no shell, no password, no home write permissions

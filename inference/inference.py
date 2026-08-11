@@ -1784,7 +1784,7 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
                 _T = float(os.environ.get("PENGWIN_AGGLO_T", "0.45"))
                 if anatomy in ("Femur", "LeftFemur", "RightFemur"):
                     _T = float(os.environ.get("PENGWIN_AGGLO_T_FEMUR", str(_T)))
-                decoded_pp = decode_affinity_agglo(_abbc, _aff, T=_T)
+                decoded_pp = decode_affinity_agglo(_abbc, _aff, T=_T, anatomy=anatomy)
 
                 # [2026-08-09] 적응형 대퇴골 T — **조건부 2차 디코드**, 전역 되돌림이 아니다.
                 #
@@ -1809,7 +1809,7 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
                         _susp = (_n == 0) or (_n == 1 and _fg >= _big)
                         if _susp:
                             _T2 = float(_fa)
-                            _alt = decode_affinity_agglo(_abbc, _aff, T=_T2)
+                            _alt = decode_affinity_agglo(_abbc, _aff, T=_T2, anatomy=anatomy)
                             _n2 = len(set(int(v) for v in np.unique(_alt)) - {0})
                             # 더 나은 쪽만 채택한다. 재디코드가 여전히 비었으면 원본을 지킨다.
                             if _n2 > _n:
