@@ -77,6 +77,17 @@ for t in ("PengwinTrainerSTUNetBaseV5SacrumW","PengwinTrainerSTUNetBaseV5HipW","
     print(f"  ✔ {t:34s} 로드·순전파 OK · 14채널")
 PY
 
+
+# 3.5) 🔴 자족성 검사 — 심링크가 있으면 GC 가 tar 추출을 거부한다
+#      (2026-08-14: 게이트가 번들 안에 /home/ljg/... 절대 심링크를 만들어 제출이 실패했다)
+_ln=$(find "$OUT" -type l | wc -l)
+if [ "$_ln" -ne 0 ]; then
+  echo "🔴 번들에 심링크 $_ln 개가 있다 — GC 는 이걸 못 푼다:"
+  find "$OUT" -type l -printf "   %p -> %l\n"
+  exit 1
+fi
+echo "  ✔ 심링크 0개 (자족적)"
+
 echo "번들 크기: $(du -sh "$OUT" | cut -f1)"
 if [ -n "$TAR" ]; then
   tar -czf "$TAR" -C "$OUT" .
