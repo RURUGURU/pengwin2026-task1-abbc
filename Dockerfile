@@ -129,6 +129,8 @@ ENV PENGWIN_ROOT=/opt/ml/model \
 # ⚠️ model.tar.gz 는 **이 버전 전용 번들**이어야 한다 — 팀원 번들(sha256 049c38ea…)에는
 #    아래 V5 트레이너 이름의 체크포인트가 없어서 로드에 실패한다.
 #    제작: scripts/build_v314_payload.sh (Ds539·라우터는 팀원 번들 것을 그대로 쓴다)
+#    v3.14 번들 sha256 a1ea1c10ff8538404a1f091d380a5965c4ae237a6d4d81144249a38034f2cbfc
+#                      (1,079,297,049 B — 옵티마이저 상태를 벗겨 팀원 번들 대비 -29%)
 # ⚠️ 아래 fallback(`...V5FemurFT`)은 4개 부위가 전부 전문가로 매핑되므로 도달하지 않는다.
 #    도달하면 로그에서 부위별 트레이너 이름을 확인할 것.
 ENV PENGWIN_DS539_TRAINER=PengwinTrainerSTUNetBaseAnatomyV301 \
