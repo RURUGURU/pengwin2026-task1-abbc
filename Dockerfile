@@ -116,19 +116,30 @@ ENV PENGWIN_ROOT=/opt/ml/model \
 #   · AGGLO_T 0.45 → 0.75, femur override 제거 (팀원은 부위 구분 없이 0.75 하나)
 #   · RF family 라우터 유지 + confidence margin 0.15
 #
-# ⚠️ model.tar.gz 는 반드시 팀원 번들이어야 한다 —
-#    sha256 049c38ea4abf1629a4d5f79a68a27918fd4103941fbf4f500b76211e93192919 (1,409,476,486 B).
-#    우리 v3_0 번들에는 expert 체크포인트가 없어서 로드에 실패한다.
-# ⚠️ 아래 fallback(`...V308DeployedVal`)은 4개 부위가 전부 전문가로 매핑되므로 도달하지 않는다.
-#    도달하면 그 이름의 체크포인트가 번들에 없어 실패하므로, 로그에서 부위별 트레이너 이름을 확인할 것.
+# [v3.14] Stage-B 전문가 3종을 **우리가 직접 학습한 V5 모델**로 바꾼다.
+#   · Sacrum / Hip : V5 손실 + 해당 부위 오버샘플링(가중 2.0), 160에폭
+#   · Femur        : 위와 같이 160에폭 학습한 뒤, **femur 추출 비율 91%(가중 30)로
+#                    LR 1e-4 파인튜닝** 18에폭 (V5FemurFT)
+#   가중치 선택은 전부 **담당 부위 instance-F1** 기준이다(`checkpoint_best_anat`).
+#   nnU-Net 기본 `checkpoint_best` 는 혼합 검증 EMA(이 프로젝트는 pelvic 72.7%)로 고르는데,
+#   부위 전문가를 그 기준으로 뽑으면 엉뚱한 에폭이 나온다(§7-50 에서 실제로 게이트가 무의미해졌다.
+#   Femur 는 29에폭, Sacrum 은 71에폭이나 어긋났다). 번들에는 그렇게 고른 가중치를
+#   `checkpoint_best.pth` 이름으로 넣는다.
+#
+# ⚠️ model.tar.gz 는 **이 버전 전용 번들**이어야 한다 — 팀원 번들(sha256 049c38ea…)에는
+#    아래 V5 트레이너 이름의 체크포인트가 없어서 로드에 실패한다.
+#    제작: scripts/build_v314_payload.sh (Ds539·라우터는 팀원 번들 것을 그대로 쓴다)
+# ⚠️ 아래 fallback(`...V5FemurFT`)은 4개 부위가 전부 전문가로 매핑되므로 도달하지 않는다.
+#    도달하면 로그에서 부위별 트레이너 이름을 확인할 것.
 ENV PENGWIN_DS539_TRAINER=PengwinTrainerSTUNetBaseAnatomyV301 \
     PENGWIN_DS539_FOLD=0 \
-    PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseAffinityV308DeployedVal \
-    PENGWIN_DS538_TRAINER_SACRUM=PengwinTrainerSTUNetBaseAffinityV308SacrumExpertDeployedVal \
-    PENGWIN_DS538_TRAINER_HIP=PengwinTrainerSTUNetBaseAffinityV308HipExpertDeployedVal \
-    PENGWIN_DS538_TRAINER_FEMUR=PengwinTrainerSTUNetBaseAffinityV308FemurExpertDeployedVal \
+    PENGWIN_DS538_TRAINER=PengwinTrainerSTUNetBaseV5FemurFT \
+    PENGWIN_DS538_TRAINER_SACRUM=PengwinTrainerSTUNetBaseV5SacrumW \
+    PENGWIN_DS538_TRAINER_HIP=PengwinTrainerSTUNetBaseV5HipW \
+    PENGWIN_DS538_TRAINER_FEMUR=PengwinTrainerSTUNetBaseV5FemurFT \
     PENGWIN_DS538_FOLD=0 \
-    PENGWIN_DS538_OUT_CH=13 \
+    PENGWIN_DS538_OUT_CH=14 \
+    PENGWIN_DS538_AFF_START=5 \
     PENGWIN_AFFINITY_DECODE=1 \
     PENGWIN_AGGLO_T=0.75 \
     PENGWIN_FEMUR_ADAPTIVE_T=0.15 \

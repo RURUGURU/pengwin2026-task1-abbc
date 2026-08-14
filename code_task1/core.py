@@ -2187,3 +2187,64 @@ class PengwinTrainerSTUNetBaseAffinityV308HipExpertDeployedVal(PengwinTrainerSTU
 
 class PengwinTrainerSTUNetBaseAffinityV308FemurExpertDeployedVal(PengwinTrainerSTUNetBaseAffinityV308):
     """팀원의 Femur 전문가 로딩용 별칭."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [v3.14] 우리가 직접 학습한 Stage-B 전문가 3종 — **추론 전용 shim**.
+#
+# 컨테이너는 학습을 하지 않는다. nnU-Net 이 체크포인트를 로드할 때 쓰는 것은
+# `checkpoint['trainer_name']` 으로 찾은 클래스의 `build_network_architecture` 하나뿐이다.
+# 그래서 여기서는 **아키텍처만** 맞추고 손실·가중 샘플러·검증 훅은 옮기지 않는다
+# (정본은 개발 트리 `code_task1/core/stage2_fracture.py` 에 있다).
+#
+# 출력 채널이 V308(13)과 다르다:
+#     V308 = 4 ABBC + 9 affinity                    = 13
+#     V5   = 4 ABBC + 1 골절면 + 9 affinity          = 14
+# V5 는 골절면(분리면)을 별도 채널로 예측하고, 그 채널이 능선 seed 의 입력이 된다.
+# ⚠️ Dockerfile 의 `PENGWIN_DS538_OUT_CH=14` · `PENGWIN_DS538_AFF_START=5` 와 반드시 함께 간다.
+#    AFF_START 를 안 맞추면 골절면을 affinity[0] 으로 오인해 9방향이 한 칸씩 밀린다 —
+#    예외 없이 조용히 틀리는 종류라 세 값을 한 묶음으로 본다.
+#
+# 🔴 이 클래스들이 없으면 trainer discovery 가 실패해 컨테이너가 로드 단계에서 죽는다.
+def _v5_out_ch():
+    """V5 헤드의 출력 채널 수 = ABBC 4 + 골절면 1 + affinity K."""
+    from loss import AFFINITY_HEAD_OFFSETS
+    return 4 + 1 + len(AFFINITY_HEAD_OFFSETS)
+
+
+class PengwinTrainerSTUNetBaseV5(PengwinTrainerSTUNetBaseAffinityV308):
+    """[V5] 14채널 헤드 (ABBC 4 + 골절면 1 + affinity 9). 추론 전용."""
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name, arch_init_kwargs,
+                                   arch_init_kwargs_req_import, num_input_channels,
+                                   num_output_channels, enable_deep_supervision: bool = True):
+        return _build_stunet_from_plan(
+            "base", arch_init_kwargs, num_input_channels,
+            num_output_channels=_v5_out_ch(), enable_deep_supervision=False,
+        )
+
+    @staticmethod
+    def _val_abbc_logits(logits):
+        return logits[:, :4]
+
+
+class PengwinTrainerSTUNetBaseV5SacrumW(PengwinTrainerSTUNetBaseV5):
+    """천골 전문가 — V5 손실 + sacrum ROI 오버샘플링(2.0)으로 160에폭 학습."""
+
+
+class PengwinTrainerSTUNetBaseV5HipW(PengwinTrainerSTUNetBaseV5):
+    """좌/우 관골 공용 전문가 — V5 손실 + hip ROI 오버샘플링(2.0)으로 160에폭 학습."""
+
+
+class PengwinTrainerSTUNetBaseV5FemurW(PengwinTrainerSTUNetBaseV5):
+    """대퇴골 전문가 (160에폭). v3.14 는 아래 FT 를 쓰지만, 이름 해석용으로 남긴다."""
+
+
+class PengwinTrainerSTUNetBaseV5FemurFT(PengwinTrainerSTUNetBaseV5FemurW):
+    """대퇴골 전문가 **파인튜닝본** — 위 160에폭 뒤 femur 추출 91%(가중 30)·LR 1e-4 로 18에폭.
+
+    왜 파인튜닝했나: 가중 2.0 은 femur 추출을 24.5%→39.3% 로만 올려서 이 "전문가" 가
+    학습의 61% 를 골반에 썼다. 91% 로 올리자 조각 수가 GT 에 가까워지고(134→121, GT 113)
+    `split_error` 가 배포와 동일한 0.1235 로 돌아왔다(가중 2.0 판은 0.1420 이었다).
+    """

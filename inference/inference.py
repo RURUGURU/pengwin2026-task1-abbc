@@ -1733,8 +1733,15 @@ def run_per_anatomy(image_path: Path, ref_img: sitk.Image,
                 if _p not in _sys.path:
                     _sys.path.insert(0, _p)
             from agglo_decode import decode_affinity_agglo, decode_fusion
+            # [v3.14] affinity 가 시작하는 채널을 env 로 준다. **기본 4 = v3.13 과 동일**.
+            #   V302/V308 = 13채널 (0-3 ABBC · 4-12 affinity)          → AFF_START=4
+            #   V5        = 14채널 (0-3 ABBC · 4 골절면 · 5-13 affinity) → AFF_START=5
+            #   V5 는 골절면을 별도 채널로 예측한다. 이 값을 안 맞추면 골절면을 affinity[0] 으로
+            #   오인해 **9방향 affinity 가 한 칸씩 밀리고 능선이 통째로 틀어진다** — 조용히
+            #   틀리는 종류의 버그라 env 로 명시한다.
+            _aff0 = int(os.environ.get("PENGWIN_DS538_AFF_START", "4"))
             _abbc = softmax_axis0(ds538_logits_pp[:4])
-            _aff = 1.0 / (1.0 + np.exp(-np.asarray(ds538_logits_pp[4:], dtype=np.float32)))
+            _aff = 1.0 / (1.0 + np.exp(-np.asarray(ds538_logits_pp[_aff0:], dtype=np.float32)))
             # [13ch raw dump] 4 ABBC softmax + 9 affinity sigmoid -> enables OFFLINE decode/fusion
             # T-sweeps on CPU (no GPU re-run). Split offline as probs13[:4]/probs13[4:].
             _dump_dir = os.environ.get("PENGWIN_DUMP_PROBS", "")
