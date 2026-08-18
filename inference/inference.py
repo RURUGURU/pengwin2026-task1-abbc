@@ -1270,10 +1270,10 @@ _LOWMEM_RESAMPLE_DONE = False
 def _install_lowmem_resample() -> None:
     """Switch nnUNet's resampling to float32 once, at the first prediction.
 
-    Installed here rather than at import time because nnunetv2 is imported lazily by
-    build_predictor, and here rather than in main() because the dev harness
-    (code_task1/experiments/eval_e2e.py) calls run_per_anatomy directly — patching in main() only
-    would mean every local memory measurement described a different pipeline than the container.
+    nnunetv2는 build_predictor에서 지연 import되므로 module import 시점에는 패치할 수 없다.
+    또한 일부 검증 호출자는 main()을 거치지 않고 run_per_anatomy를 직접 호출한다. 따라서
+    main()에서만 패치하면 로컬 메모리 검증과 컨테이너 추론의 실행 경로가 달라지므로, 첫 anatomy
+    예측 직전에 한 번만 설치한다.
     """
     global _LOWMEM_RESAMPLE_DONE
     if _LOWMEM_RESAMPLE_DONE:
